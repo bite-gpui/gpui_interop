@@ -1,0 +1,22 @@
+[package]
+name = "gpui_interop"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_interop.rs"
+doctest = false
+
+[features]
+default = []
+# The cross-API bridge: the wgpu side of a producer's device, and the transports it moves.
+wgpu = ["dep:wgpu"]
+
+[dependencies]
+gpui.workspace = true
+wgpu = { workspace = true, optional = true }
