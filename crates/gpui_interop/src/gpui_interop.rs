@@ -43,7 +43,7 @@
 //! # Provisional
 //!
 //! The crate is provisional and deliberately incomplete, and its API may change. Only the platform
-//! arms that are implemented today are exposed; the rest arrive as they are written.
+//! backends that are implemented today are exposed; the rest arrive as they are written.
 
 mod adapter;
 mod guest;
