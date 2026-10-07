@@ -20,3 +20,25 @@ wgpu = ["dep:wgpu"]
 [dependencies]
 gpui.workspace = true
 wgpu = { workspace = true, optional = true }
+
+[build-dependencies]
+# The test binary opens a real Direct3D window, whose prompt imports `TaskDialogIndirect`. Only the
+# common-controls v6 assembly exports that symbol, and a binary reaches it through its manifest;
+# without one the loader binds System32's 5.82 `comctl32.dll` and the process never starts. `gpui`
+# carries the manifest for its own targets, which does not reach a downstream test binary.
+embed-resource = "3.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The Windows transport (`SharedSurface`, `Fence`) is Direct3D 11 + 12. The workspace `windows`
+# feature set stops at Direct3D 11; the shared-handle and shared-fence calls are Direct3D 12, so the
+# one feature is added here rather than widening every `windows` user in the workspace.
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D12"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# The cross-device test composites through GPUI's own Direct3D 11 renderer. The renderer type is
+# private to `gpui_windows`, so the test does not name it: it reaches the renderer through the
+# public `Platform`/`PlatformWindow` seams, and `gpui_windows` is only here to build the platform.
+# A dev-dependency and not a dependency: nothing in the library names it, and the facade's own
+# graph stays free of the backend crate (see the report and `path_a.rs`).
+anyhow.workspace = true
+gpui_windows.workspace = true

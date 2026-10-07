@@ -12,18 +12,18 @@
 //! repository once its shape is settled (`bite-gpui-project/spi/rendering/interop-scaffold.md`). Only
 //! what a *cleared* probe supports is written here.
 //!
-//! The shapes the unrun probes decide are deliberately absent, because a late answer is a redesign
-//! (`interop-crate.md` §4):
+//! The state of the platform modules, and the probes that gate each:
 //!
-//! - **P6 (adapter matching)** decides the API. Windows LUID matching, a caller-supplied device, or
-//!   neither — the answer fixes what [`Interop`] and [`Adapter`] must be, so the pool and its ring
-//!   are not written yet.
-//! - **P5 and P9** (the fence loop and device loss) gate the Windows module.
+//! - **P6 (adapter matching) is cleared** — a LUID match is available on real hardware — so
+//!   [`Adapter::wgpu`] resolves the window's Direct3D 11 adapter to the matching wgpu DX12 adapter.
+//! - **P5 (the fence loop) is cleared**, so the Windows module lands its Direct3D 12 → 11 transport:
+//!   [`SharedSurface`] and [`Fence`]. **P9** (device loss and re-negotiation) still gates the pool
+//!   and the recovery around them, so there is no ring here yet.
 //! - **P2** gates the macOS module.
 //! - **P3 is cleared**, so the Linux module is the one that can be built next.
 //!
-//! Each platform module lands with its probe. What is here is the part that is true today: reading
-//! the window renderer's device, and naming why that can fail.
+//! Each platform module lands with its probe. What is here is the part that is true today: matching
+//! the window renderer's device, and the Windows handle and fence exchange it feeds.
 //!
 //! [`interop-crate.md`]: https://github.com/bite-gpui/bite-gpui-project/blob/main/spi/rendering/interop-crate.md
 
@@ -37,6 +37,8 @@ mod macos;
 mod windows;
 
 pub use adapter::{Adapter, Unavailable};
+#[cfg(target_os = "windows")]
+pub use windows::{Fence, OpenedSurface, SharedSurface};
 
 use std::any::Any;
 use std::rc::Rc;
