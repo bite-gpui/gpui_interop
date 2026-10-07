@@ -4,9 +4,9 @@
 //! and hands GPUI its NT handle; GPUI opens it on its Direct3D 11 device with `OpenSharedResource1`
 //! and samples it through a shader resource view. Ordering is a shared `ID3D12Fence`, opened on the
 //! Direct3D 11 side as an `ID3D11Fence` and waited **GPU-side** with `ID3D11DeviceContext4::Wait` —
-//! never a CPU poll (`bite-gpui-project/spi/rendering/probe-p5-fence-loop.md`).
+//! never a CPU poll.
 //!
-//! Two facts the probe fixed and this code keeps:
+//! Two facts shape this code:
 //!
 //! - **A placed resource cannot be shared.** `CreateSharedHandle` on a placed resource returns
 //!   `E_INVALIDARG`; [`SharedSurface`] therefore allocates a **committed** resource on a
@@ -14,10 +14,8 @@
 //! - **The fence is ordered GPU-side**, through `ID3D11Device5::OpenSharedFence` and
 //!   `ID3D11DeviceContext4::Wait`, not `SetEventOnCompletion` plus a CPU wait.
 //!
-//! The types are the raw Direct3D transport, the same calls the packed probe made; the renderer,
-//! the ring and device-loss recovery are not here.
-//!
-//! [`probe-p5-fence-loop.md`]: https://github.com/bite-gpui/bite-gpui-project/blob/main/spi/rendering/probe-p5-fence-loop.md
+//! The types are the raw Direct3D transport; the renderer, the ring and device-loss recovery are not
+//! here.
 
 use windows::core::{Error, Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, E_POINTER, HANDLE};
@@ -36,8 +34,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
 /// `GENERIC_ALL`, the access `CreateSharedHandle` needs for a handle this process opens back.
 ///
-/// Named here rather than imported because the probe defined it the same way; the value is the
-/// documented one (WinNT.h).
+/// Named here rather than imported; the value is the documented one (WinNT.h).
 const GENERIC_ALL: u32 = 0x1000_0000;
 
 /// A committed, shareable Direct3D 12 texture — the producer's render target.
@@ -187,8 +184,7 @@ impl OpenedSurface {
 /// A shared `ID3D12Fence`, opened on a Direct3D 11 device and waited **GPU-side**.
 ///
 /// The producer signals it on its queue after committing a frame; GPUI opens the NT handle as an
-/// `ID3D11Fence` and inserts a GPU-side wait, so no CPU thread polls
-/// (`probe-p5-fence-loop.md`).
+/// `ID3D11Fence` and inserts a GPU-side wait, so no CPU thread polls.
 pub struct Fence {
     fence: ID3D12Fence,
     handle: HANDLE,
@@ -245,8 +241,7 @@ impl Fence {
 
     /// Insert a GPU-side wait on `context` for `fence` to reach `value`.
     ///
-    /// This is `ID3D11DeviceContext4::Wait`, the order the probe measured; it does not block a CPU
-    /// thread.
+    /// This is `ID3D11DeviceContext4::Wait`; it does not block a CPU thread.
     pub fn wait_gpu(
         context: &ID3D11DeviceContext,
         fence: &ID3D11Fence,

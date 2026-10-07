@@ -1,24 +1,20 @@
 //! Matching a foreign device to the window's renderer.
 //!
 //! Cross-device sharing needs the **same physical adapter**, and that is not assertable from inside
-//! either device — `bite-gpui-project/spi/rendering/probe-p6-adapter-luid.md` §1. [`Adapter`] is the
-//! producer's view of the window's device; [`Adapter::wgpu`] returns a wgpu device and queue only
-//! when one matches.
+//! either device — a Direct3D 11 device and a wgpu adapter report their identity in different terms.
+//! [`Adapter`] is the producer's view of the window's device; [`Adapter::wgpu`] returns a wgpu device
+//! and queue only when one matches.
 //!
-//! **P6 is cleared** (`probe-p6-adapter-luid.md`): on Windows the window's `ID3D11Device` names its
-//! adapter by LUID, and the same LUID identifies the wgpu DX12 adapter, so a match can be found
-//! without the caller handing over its device. The LUID — not the adapter name — is the identity,
-//! because DXGI and wgpu enumerate a *different number* of `Microsoft Basic Render Driver` entries
-//! (`probe-p6-adapter-luid.md` §2). When no adapter matches, [`Adapter::wgpu`] answers `None`; a
-//! caller-supplied device is the documented escape for a driver that hides the LUID
-//! (`interop-crate.md` §4), but it is not part of this surface yet.
+//! On Windows the window's `ID3D11Device` names its adapter by LUID, and the same LUID identifies the
+//! wgpu DX12 adapter, so a match can be found without the caller handing over its device. The LUID —
+//! not the adapter name — is the identity, because DXGI and wgpu enumerate a *different number* of
+//! `Microsoft Basic Render Driver` entries, so the names collide where the LUIDs do not. When no
+//! adapter matches, [`Adapter::wgpu`] answers `None`; a caller-supplied device is the documented
+//! escape for a driver that hides the LUID, but it is not part of this surface yet.
 //!
 //! The *interface* is universal though the *mechanism* is Windows-only: off Windows there is
 //! nothing to LUID-match (macOS's wgpu adapter *is* the `MetalRenderer`'s device; Linux is
 //! device-node selection), so [`Adapter::wgpu`] answers `None` there rather than failing a match.
-//!
-//! [`probe-p6-adapter-luid.md`]: https://github.com/bite-gpui/bite-gpui-project/blob/main/spi/rendering/probe-p6-adapter-luid.md
-//! [`interop-crate.md`]: https://github.com/bite-gpui/bite-gpui-project/blob/main/spi/rendering/interop-crate.md
 
 use std::any::Any;
 use std::rc::Rc;
@@ -30,7 +26,7 @@ use std::sync::Arc;
 pub enum Unavailable {
     /// The renderer lends no device — an offscreen or foreign renderer.
     NoDevice,
-    /// No wgpu adapter matches the window's device (**P6**).
+    /// No wgpu adapter matches the window's device.
     NoAdapter,
     /// This platform's module is not built.
     Unsupported,
@@ -53,7 +49,7 @@ impl<'a> Adapter<'a> {
     /// A wgpu device and queue the producer can render on, if one matches the window's.
     ///
     /// On Windows this reads the window renderer's Direct3D 11 adapter LUID and finds the wgpu DX12
-    /// adapter carrying the same LUID (**P6**), then requests a device and queue on it; `None` when
+    /// adapter carrying the same LUID, then requests a device and queue on it; `None` when
     /// no adapter matches or the renderer lends no Direct3D device. A window whose renderer *is*
     /// wgpu reaches its device and queue without this crate.
     #[cfg(feature = "wgpu")]
@@ -71,7 +67,7 @@ impl<'a> Adapter<'a> {
 }
 
 /// The Windows mechanism: the window's `ID3D11Device` → its adapter LUID → the wgpu DX12 adapter with
-/// the same LUID (`probe-p6-adapter-luid.md` §2).
+/// the same LUID.
 #[cfg(all(target_os = "windows", feature = "wgpu"))]
 mod matched {
     use std::any::Any;
@@ -153,7 +149,7 @@ mod matched {
     }
 
     /// `enumerate_adapters` is async but resolves without parking, so a no-op waker and a yield loop
-    /// suffice — the same executor the probe used.
+    /// suffice — no async runtime is needed.
     fn block_on<F: Future>(future: F) -> F::Output {
         struct NoopWake;
         impl Wake for NoopWake {

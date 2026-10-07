@@ -2,12 +2,12 @@
 //! The cross-device arm, end to end: a **Direct3D 12** producer's shareable texture, opened on
 //! GPUI's **Direct3D 11** renderer and composited byte for byte.
 //!
-//! This is the arm that matters, and the one the same-device `path_a` example cannot exercise. The
+//! This is the cross-device case, and the one the built-in same-device path cannot exercise. The
 //! producer renders into a committed texture on a `D3D12_HEAP_FLAG_SHARED` heap, hands over its NT
 //! handle, and GPUI's Direct3D 11 device opens it with `OpenSharedResource1` and samples it through
 //! a shader resource view (`gpui_interop::SharedSurface`). The two queues are ordered by a shared
 //! `ID3D12Fence`, signalled on the producer's queue after the clear and waited **GPU-side** on
-//! GPUI's device (`ID3D11DeviceContext4::Wait`) — never a CPU poll (`probe-p5-fence-loop.md`).
+//! GPUI's device (`ID3D11DeviceContext4::Wait`) — never a CPU poll.
 //!
 //! # Why the test lives here, and not in `gpui_windows`
 //!

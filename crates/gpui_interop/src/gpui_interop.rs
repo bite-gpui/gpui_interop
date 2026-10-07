@@ -1,31 +1,49 @@
-//! `gpui-interop`: the downstream bridge between a foreign producer and GPUI's renderer.
+//! `gpui-interop`: composite pixels produced outside GPUI's renderer into a GPUI scene.
 //!
-//! A producer whose device is **not** the window renderer's — another API, another adapter, another
-//! process — renders a frame and hands it to the scene through `surface()`, with no CPU copy. The
-//! same-device case needs none of this; this crate is the "other device" row of
-//! `bite-gpui-project/spi/rendering/surfaces.md` §2 — the OS-surface trinity, *match the adapter,
-//! move a handle, order the queues*, in each platform's clothes.
+//! A producer whose graphics device is **not** the window renderer's — another API, another adapter,
+//! another process — renders a frame and hands it to the scene through the `surface()` element,
+//! without a CPU copy of the pixels. When the producer can render directly on the window's own
+//! device, go through GPUI's built-in same-device path instead. Reach for this crate when the pixels
+//! come from somewhere the window renderer cannot draw itself, and must still land in the scene
+//! without a round trip through the CPU.
 //!
-//! # Provisional, and deliberately incomplete
+//! # The shape of the bridge
 //!
-//! The crate is being built **in the fork** so it can iterate quickly; it will move to its own
-//! repository once its shape is settled (`bite-gpui-project/spi/rendering/interop-scaffold.md`). Only
-//! what a *cleared* probe supports is written here.
+//! [`attach`] takes a [`gpui::Window`] and yields an [`Interop`], or [`Unavailable`] when the window
+//! lends no device to bridge to — an offscreen or foreign renderer. From there:
 //!
-//! The state of the platform modules, and the probes that gate each:
+//! - [`Interop::adapter`] returns an [`Adapter`], the producer's view of the window's device.
+//! - With the `wgpu` feature, `Adapter::wgpu` returns a wgpu `Device` and `Queue` on the adapter that
+//!   matches the window's device, or `None` when none does. Rendering with those puts the producer's
+//!   pixels on the same physical GPU as the window.
+//! - On Windows, [`SharedSurface`] / [`OpenedSurface`] / [`Fence`] are the raw Direct3D transport: a
+//!   Direct3D 12 producer renders into a shared texture and hands GPUI its NT handle, which GPUI
+//!   opens on its Direct3D 11 device, with a shared fence ordering the two queues.
 //!
-//! - **P6 (adapter matching) is cleared** — a LUID match is available on real hardware — so
-//!   [`Adapter::wgpu`] resolves the window's Direct3D 11 adapter to the matching wgpu DX12 adapter.
-//! - **P5 (the fence loop) is cleared**, so the Windows module lands its Direct3D 12 → 11 transport:
-//!   [`SharedSurface`] and [`Fence`]. **P9** (device loss and re-negotiation) still gates the pool
-//!   and the recovery around them, so there is no ring here yet.
-//! - **P2** gates the macOS module.
-//! - **P3 is cleared**, so the Linux module is the one that can be built next.
+//! # Sketch
 //!
-//! Each platform module lands with its probe. What is here is the part that is true today: matching
-//! the window renderer's device, and the Windows handle and fence exchange it feeds.
+//! ```rust
+//! use gpui_interop::{attach, Unavailable};
 //!
-//! [`interop-crate.md`]: https://github.com/bite-gpui/bite-gpui-project/blob/main/spi/rendering/interop-crate.md
+//! fn bridge(window: &gpui::Window) -> Result<(), Unavailable> {
+//!     // Negotiate with the window's renderer.
+//!     let interop = attach(window)?;
+//!
+//!     // With the `wgpu` feature, this gives a device and queue on a matching adapter.
+//!     let (device, queue) = interop.adapter().wgpu().expect("no matching adapter");
+//!
+//!     // Render the frame on `device`, then hand its surface to the scene through `surface()`.
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The `wgpu` line requires the `wgpu` feature; without it, `Adapter::wgpu` is not compiled in, and
+//! only the Windows handle transport is available.
+//!
+//! # Provisional
+//!
+//! The crate is provisional and deliberately incomplete, and its API may change. Only the platform
+//! arms that are implemented today are exposed; the rest arrive as they are written.
 
 mod adapter;
 mod guest;
@@ -45,10 +63,10 @@ use std::rc::Rc;
 
 /// Negotiate with `window`'s renderer.
 ///
-/// Fails when there is nothing to bridge *to*: a renderer that lends no device — an offscreen or a
-/// foreign one — leaves nothing for a producer to render on, and that is [`Unavailable::NoDevice`],
-/// not a panic. This is the accessor the surface work adds
-/// (`Window::device_any`), and it is the *only* thing this crate needs from core.
+/// Returns [`Unavailable::NoDevice`] when there is nothing to bridge *to*: a renderer that lends no
+/// device — an offscreen or a foreign one — leaves nothing for a producer to render on, so this is a
+/// recoverable error rather than a panic. The window renderer's device is read through
+/// `Window::device_any`.
 pub fn attach(window: &gpui::Window) -> Result<Interop, Unavailable> {
     let device = window.device_any().ok_or(Unavailable::NoDevice)?;
     Ok(Interop { device })

@@ -39,6 +39,6 @@ windows = { workspace = true, features = ["Win32_Graphics_Direct3D12"] }
 # private to `gpui_windows`, so the test does not name it: it reaches the renderer through the
 # public `Platform`/`PlatformWindow` seams, and `gpui_windows` is only here to build the platform.
 # A dev-dependency and not a dependency: nothing in the library names it, and the facade's own
-# graph stays free of the backend crate (see the report and `path_a.rs`).
+# graph stays free of the backend crate.
 anyhow.workspace = true
 gpui_windows.workspace = true
