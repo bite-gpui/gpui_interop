@@ -11,15 +11,10 @@
 //!
 //! # Why the test lives here, and not in `gpui_windows`
 //!
-//! The renderer is `directx_renderer::DirectXRenderer`, which is `pub(crate)`: an integration test
-//! cannot name it, and the test module that models this one is inside the crate
-//! (`crates/gpui_windows/src/directx_renderer.rs`). What *is* public is the renderer seam the whole
-//! application uses — `Platform`, `PlatformWindow`, and `SceneRenderer` — all of which `gpui`
-//! re-exports for every target. So the test builds GPUI's platform with `gpui_windows` (a
-//! Windows-only dev-dependency; `gpui_windows` depends on neither `gpui_interop` nor `gpui`, so
-//! there is no cycle), opens a hidden window, and reaches the Direct3D 11 renderer through
-//! `PlatformWindow::with_renderer` and `PlatformWindow::device_any`. It never names the private
-//! renderer type.
+//! The renderer is `directx_renderer::DirectXRenderer`, which is now public, but the test still
+//! reaches it the way the whole application does — through the renderer seam the window lends:
+//! `PlatformWindow::with_renderer`, downcast with `SceneRenderer::as_renderer`, and read with
+//! `GpuRenderer::device`.
 //!
 //! The producer's own half is raw Direct3D 12 through the `windows` crate, which `gpui_interop`
 //! already depends on for `SharedSurface` and `Fence`.
@@ -34,14 +29,15 @@ use std::mem::ManuallyDrop;
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    Bounds, ContentMask, DevicePixels, DirectXSource, PaintSurface, Platform, PlatformWindow, Point,
-    Scene, Size, SurfaceSource, TitlebarOptions, WindowId, WindowKind, WindowParams, point, px,
-    size,
+    Bounds, ContentMask, DevicePixels, DirectXSource, GpuRenderer, PaintSurface, Platform,
+    PlatformWindow, Point, Scene, SharedDirectXFence, SharedDirectXSurface, Size, SurfaceSource,
+    TitlebarOptions, WindowId, WindowKind, WindowParams, point, px, size,
 };
 use gpui_interop::{Fence, SharedSurface};
+use gpui_windows::DirectXRenderer;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12CreateDevice, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
     D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
@@ -231,7 +227,7 @@ fn hidden_window() -> Option<Box<dyn PlatformWindow>> {
 }
 
 /// A scene whose only primitive is a surface covering the whole target, carrying the producer's
-/// view. This is the shape `draw_surfaces` composites (`SurfaceSource::DirectX(DirectXSource::View)`).
+/// source. This is the shape `draw_surfaces` composites (`SurfaceSource::DirectX`).
 fn surface_scene(source: DirectXSource, edge: u32) -> Scene {
     let bounds = Bounds {
         origin: Point {
@@ -287,12 +283,16 @@ fn a_shared_d3d12_surface_round_trips_through_the_d3d11_renderer() -> Result<()>
         return Ok(());
     };
 
-    // The consumer's device, reached through the window's public seam. The producer's Direct3D 12
-    // device is built on this device's adapter in `Producer::new` (via `adapter_of` below).
-    let device11 = window
-        .device_any()
-        .and_then(|device| device.downcast::<ID3D11Device>().ok())
-        .context("the window's renderer lends an ID3D11Device")?;
+    // The consumer's device, reached through the renderer seam the window lends. The producer's
+    // Direct3D 12 device is built on this device's adapter in `Producer::new` (via `adapter_of`
+    // below).
+    let mut device11 = None;
+    window.with_renderer(&mut |renderer| {
+        device11 = renderer
+            .as_renderer::<DirectXRenderer>()
+            .and_then(GpuRenderer::device);
+    });
+    let device11 = device11.context("the window's renderer lends an ID3D11Device")?;
 
     let adapter = adapter_of(&device11)?;
 
@@ -309,22 +309,21 @@ fn a_shared_d3d12_surface_round_trips_through_the_d3d11_renderer() -> Result<()>
     producer.clear()?;
     let signal = producer.signal()?;
 
-    // The consumer's half: open the producer's texture on GPUI's device, open the shared fence, and
-    // insert a GPU-side wait so the renderer's draws are ordered behind the producer's clear.
-    let opened = producer
-        .surface
-        .open(&device11)
-        .context("opening the shared texture on the Direct3D 11 device")?;
-    let fence11 = producer
-        .fence
-        .open(&device11)
-        .context("opening the shared fence on the Direct3D 11 device")?;
-    let context: ID3D11DeviceContext = unsafe { device11.GetImmediateContext() }
-        .context("the Direct3D 11 device has no immediate context")?;
-    Fence::wait_gpu(&context, &fence11, signal).context("ordering the consumer on the D3D11 queue")?;
-
-    // Composite the producer's view through the renderer, offscreen, and read it back.
-    let scene = surface_scene(DirectXSource::View(opened.view().clone()), SIZE);
+    // The consumer's half is the renderer's: hand it the producer's handles, and it opens the
+    // texture on its own device, views it, and waits the fence before the draw. The producer never
+    // needs the window's device.
+    let scene = surface_scene(
+        DirectXSource::Shared(SharedDirectXSurface {
+            texture: producer.surface.handle(),
+            fence: Some(SharedDirectXFence {
+                handle: producer.fence.handle(),
+                value: signal,
+            }),
+            width: SIZE,
+            height: SIZE,
+        }),
+        SIZE,
+    );
     let mut rendered = None;
     window.with_renderer(&mut |renderer| {
         rendered = Some(renderer.render_scene_to_image(&scene, viewport));

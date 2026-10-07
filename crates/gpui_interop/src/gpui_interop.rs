@@ -9,25 +9,29 @@
 //!
 //! # The shape of the bridge
 //!
-//! [`attach`] takes a [`gpui::Window`] and yields an [`Interop`], or [`Unavailable`] when the window
-//! lends no device to bridge to — an offscreen or foreign renderer. From there:
+//! [`attach`] takes the device a `gpu_canvas` callback lends
+//! ([`gpui::GpuCanvasContext::device`]) and yields an [`Interop`], or [`Unavailable`] when the
+//! canvas lent no device — an offscreen or foreign renderer. It is called inside the canvas, not
+//! before a frame is painted: the window's renderer, and so its device, does not exist until then.
+//! From there:
 //!
 //! - [`Interop::adapter`] returns an [`Adapter`], the producer's view of the window's device.
 //! - With the `wgpu` feature, `Adapter::wgpu` returns a wgpu `Device` and `Queue` on the adapter that
 //!   matches the window's device, or `None` when none does. Rendering with those puts the producer's
 //!   pixels on the same physical GPU as the window.
-//! - On Windows, [`SharedSurface`] / [`OpenedSurface`] / [`Fence`] are the raw Direct3D transport: a
-//!   Direct3D 12 producer renders into a shared texture and hands GPUI its NT handle, which GPUI
-//!   opens on its Direct3D 11 device, with a shared fence ordering the two queues.
+//! - On Windows, [`SharedSurface`] / [`Fence`] are the producer half of the Direct3D transport: a
+//!   Direct3D 12 producer renders into a shared texture and signals a fence, and hands GPUI the
+//!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
+//!   the shared fence ordering the two queues.
 //!
 //! # Sketch
 //!
 //! ```rust
 //! use gpui_interop::{attach, Unavailable};
 //!
-//! fn bridge(window: &gpui::Window) -> Result<(), Unavailable> {
-//!     // Negotiate with the window's renderer.
-//!     let interop = attach(window)?;
+//! fn bridge(gpu: &mut gpui::GpuCanvasContext) -> Result<(), Unavailable> {
+//!     // Negotiate with the window's renderer, inside the canvas that lends its device.
+//!     let interop = attach(gpu.try_device::<gpui::DirectXRenderer>())?;
 //!
 //!     // With the `wgpu` feature, this gives a device and queue on a matching adapter.
 //!     let (device, queue) = interop.adapter().wgpu().expect("no matching adapter");
@@ -56,20 +60,22 @@ mod windows;
 
 pub use adapter::{Adapter, Unavailable};
 #[cfg(target_os = "windows")]
-pub use windows::{Fence, OpenedSurface, SharedSurface};
+pub use windows::{Fence, SharedSurface};
 
 use std::any::Any;
 use std::rc::Rc;
 
-/// Negotiate with `window`'s renderer.
+/// Negotiate with the window renderer a `gpu_canvas` callback reaches.
 ///
-/// Returns [`Unavailable::NoDevice`] when there is nothing to bridge *to*: a renderer that lends no
-/// device — an offscreen or a foreign one — leaves nothing for a producer to render on, so this is a
-/// recoverable error rather than a panic. The window renderer's device is read through
-/// `Window::device_any`.
-pub fn attach(window: &gpui::Window) -> Result<Interop, Unavailable> {
-    let device = window.device_any().ok_or(Unavailable::NoDevice)?;
-    Ok(Interop { device })
+/// Called inside the canvas, with the device the callback lends — `gpu.device::<R>()`, or
+/// `gpu.try_device::<R>()` for the fallible form. There is nothing to attach to before a frame is
+/// painted, because the window's renderer, and its device, do not exist until then.
+///
+/// Returns [`Unavailable::NoDevice`] when the canvas lent no device — an offscreen or foreign
+/// renderer — so this is a recoverable error rather than a panic.
+pub fn attach<D: 'static>(device: Option<D>) -> Result<Interop, Unavailable> {
+    let device = device.ok_or(Unavailable::NoDevice)?;
+    Ok(Interop { device: Rc::new(device) })
 }
 
 /// A window's renderer, as a producer sees it.
