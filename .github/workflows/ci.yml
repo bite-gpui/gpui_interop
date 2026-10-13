@@ -1,9 +1,12 @@
 # gpui_interop's own CI.
 #
-# The cross-device arm runs a Direct3D 12 producer's shared texture through GPUI's Direct3D 11
-# renderer and composites it byte for byte, so it needs a device, a shared handle and a window: a
-# Windows runner, whose WARP is enough to call a pass "mechanically possible on one adapter" rather
-# than "works on hardware".
+# One arm per platform the crate produces on. Neither needs a display: the Windows arm opens a hidden
+# Direct3D window, and the Linux arm is a bare Vulkan device its tests allocate and export on.
+#
+# The Linux example (`examples/interop_linux.rs`) is deliberately not built here. Its `example`
+# feature turns on the facade's platform bundle, which compiles the windowing stack and needs the
+# system graphics libraries a bare runner does not carry; the library and its tests use none of it,
+# so keeping the example out is what lets this job run on a stock image.
 name: CI
 
 on:
@@ -13,6 +16,27 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The Linux hatch, end to end in the unit tests
+  # (`crates/gpui_interop/src/linux.rs`): a linear and a driver-tiled shareable image exported as
+  # dma-bufs, a two-plane NV12 buffer, a fence that exports a `sync_file`, and a cleared buffer.
+  #
+  # The crate builds headless -- `gpui` is taken with `default-features = false`, so no platform
+  # backend and no system graphics libraries are compiled -- and the tests reach Vulkan through
+  # `libvulkan.so.1`, which `libvulkan1` provides. `mesa-vulkan-drivers` brings lavapipe, a software
+  # device, so the tests run rather than skip; where that driver offers no dma-buf export they skip
+  # anyway, by design, so this row stays green on any image that lacks a suitable device.
+  linux-interop:
+    name: cargo test -p gpui_interop (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: steps::install_vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      - name: steps::cargo_test
+        run: cargo test -p gpui_interop
+
   # The cross-device arm, on Windows: a Direct3D 12 producer's shared texture, opened on GPUI's
   # Direct3D 11 renderer and composited byte for byte
   # (`crates/gpui_interop/tests/cross_device_surface.rs`). Debug rather than a release profile: the

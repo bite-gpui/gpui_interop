@@ -25,8 +25,8 @@
 //!   the shared fence ordering the two queues.
 //! - On Linux, [`SharedBuffer`] is the producer half of the dma-buf transport: a producer renders into
 //!   a shareable image and exports it as a dma-buf, and hands GPUI the `gpui::DmaBufHandle` the
-//!   renderer imports under its modifier. Linear and single-plane today; tiled modifiers and a fence
-//!   are the next slice.
+//!   renderer imports under its modifier. Single- or two-plane, linear or on a driver-tiled modifier
+//!   the renderer can import, and ordered by a [`Fence`] that exports the acquire `sync_file`.
 //!
 //! # Sketch
 //!
@@ -64,7 +64,7 @@ mod windows;
 
 pub use adapter::{Adapter, Unavailable};
 #[cfg(target_os = "linux")]
-pub use linux::{Fence, GpuDevice, SharedBuffer};
+pub use linux::{Fence, GpuDevice, SharedBuffer, Tiling};
 #[cfg(target_os = "windows")]
 pub use windows::{Fence, SharedSurface};
 
@@ -87,9 +87,8 @@ pub fn attach<D: 'static>(device: Option<D>) -> Result<Interop, Unavailable> {
 /// A window's renderer, as a producer sees it.
 pub struct Interop {
     /// The window renderer's device, erased. The per-platform modules downcast it to the one type
-    /// their transport needs — an `ID3D11Device`, a `WgpuContext` — which is what keeps the facade
-    /// free of the platform graphics crates.
-    #[allow(dead_code, reason = "read by the platform modules as they land")]
+    /// their transport needs — an `ID3D11Device`, a `(wgpu::Device, wgpu::Queue)` — which is what
+    /// keeps the facade free of the platform graphics crates.
     device: Rc<dyn Any>,
 }
 

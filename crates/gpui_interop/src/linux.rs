@@ -7,10 +7,10 @@
 //! samples it — so nothing here opens or waits on a buffer.
 //!
 //! Today this covers `BGRA8`/`RGBA8` and two-plane `NV12`, either linear or on a driver-tiled
-//! modifier the renderer can import (`[`Tiling`]`), exported with `vkGetMemoryFdKHR` as one dma-buf
-//! with a plane per memory plane. The acquire fence — a `sync_file` from `VK_KHR_external_fence_fd`
-//! — is the next slice, and the payload it converges on is the same
-//! [`gpui::DmaBufHandle`], so the consumer never changes.
+//! modifier the renderer can import ([`Tiling`]), exported with `vkGetMemoryFdKHR` as one dma-buf
+//! with a plane per memory plane, and ordered by a [`Fence`] that exports the acquire `sync_file`
+//! from `VK_KHR_external_fence_fd`. The payload is the same [`gpui::DmaBufHandle`] either way, so
+//! the consumer never changes.
 //!
 //! A VA-API producer does **not** use this module: `vaExportSurfaceHandle` hands it a dma-buf
 //! directly. This is for a producer that has no driver-level export — a `wgpu`/3D engine or another
@@ -44,9 +44,10 @@ pub enum Tiling {
 
 /// A Vulkan device a producer renders on and exports from.
 ///
-/// The hatch opens its own instance and device on a node that can export a dma-buf. Where a renderer's
-/// device is already known, the `adapter` module will lend it instead — matching on Linux is
-/// device-node selection, not a LUID — and this constructor stays the fallback.
+/// [`GpuDevice::open`] opens its own instance and device on a node that can export a dma-buf. Where a
+/// window's renderer is known, `Adapter::gpu_device` lends its `vk::PhysicalDevice` instead and
+/// [`GpuDevice::on`] makes a second logical device on it — the Linux counterpart of a LUID match — so
+/// the export lands on the GPU the window draws through; `open` stays the fallback.
 pub struct GpuDevice {
     // Held so an instance this value made outlives the device; `None` when the instance is the
     // renderer's, lent through the `adapter`.
@@ -195,6 +196,10 @@ impl Drop for GpuDevice {
 /// The memory behind it is what the exported fd names, so this value must outlive every use of the
 /// [`DmaBufHandle`] it handed out: dropping it frees the memory the renderer is still sampling. A
 /// producer keeps it for as long as the surface is live — a pool keeps a ring of them.
+///
+/// It also frees through the [`GpuDevice`] it was made on, so that device must outlive it — and,
+/// because Rust drops a struct's fields in declaration order, a type holding both must declare the
+/// buffers *before* the device.
 pub struct SharedBuffer {
     device: ash::Device,
     image: vk::Image,

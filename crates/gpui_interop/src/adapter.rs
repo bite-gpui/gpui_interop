@@ -12,9 +12,11 @@
 //! adapter matches, [`Adapter::wgpu`] answers `None`; a caller-supplied device is the documented
 //! escape for a driver that hides the LUID, but it is not part of this surface yet.
 //!
-//! The *interface* is universal though the *mechanism* is Windows-only: off Windows there is
-//! nothing to LUID-match (macOS's wgpu adapter *is* the `MetalRenderer`'s device; Linux is
-//! device-node selection), so [`Adapter::wgpu`] answers `None` there rather than failing a match.
+//! The *interface* is universal though the *mechanism* is platform-specific: off Windows there is no
+//! LUID to match. macOS's wgpu adapter *is* the `MetalRenderer`'s device, so [`Adapter::wgpu`] has
+//! nothing to add there and answers `None`; on Linux the renderer's device names its `vk::PhysicalDevice`,
+//! and [`Adapter::gpu_device`] — not `wgpu` — is the match, answering `None` when the renderer lends no
+//! device or is not wgpu.
 
 use std::any::Any;
 use std::rc::Rc;
