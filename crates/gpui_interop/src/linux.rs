@@ -25,10 +25,11 @@ use ash::vk;
 use gpui::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind};
 
 /// The device extensions an image needs to be exported as a dma-buf, tiled or not.
-const DEVICE_EXTENSIONS: [&str; 3] = [
+const DEVICE_EXTENSIONS: [&str; 4] = [
     "VK_KHR_external_memory_fd",
     "VK_EXT_external_memory_dma_buf",
     "VK_EXT_image_drm_format_modifier",
+    "VK_KHR_external_fence_fd",
 ];
 
 /// How the producer's image is laid out in memory.
@@ -53,7 +54,11 @@ pub struct GpuDevice {
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     external_memory_fd: ash::khr::external_memory_fd::Device,
+    external_fence_fd: ash::khr::external_fence_fd::Device,
     drm_format_modifier: ash::ext::image_drm_format_modifier::Device,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    command_pool: vk::CommandPool,
 }
 
 impl GpuDevice {
@@ -94,8 +99,17 @@ impl GpuDevice {
         .map_err(|e| anyhow!("create the Vulkan device: {e:?}"))?;
 
         let external_memory_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
+        let external_fence_fd = ash::khr::external_fence_fd::Device::new(&instance, &device);
         let drm_format_modifier =
             ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
+
+        // SAFETY: the device is live; the queue and pool belong to it and are destroyed with it.
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(queue_family_index);
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .map_err(|e| anyhow!("create the command pool: {e:?}"))?;
 
         Ok(Self {
             _entry: entry,
@@ -103,7 +117,11 @@ impl GpuDevice {
             physical_device,
             device,
             external_memory_fd,
+            external_fence_fd,
             drm_format_modifier,
+            queue,
+            queue_family_index,
+            command_pool,
         })
     }
 
@@ -127,6 +145,23 @@ impl GpuDevice {
         &self.drm_format_modifier
     }
 
+    fn external_fence_fd(&self) -> &ash::khr::external_fence_fd::Device {
+        &self.external_fence_fd
+    }
+
+    fn queue(&self) -> vk::Queue {
+        self.queue
+    }
+
+    fn command_pool(&self) -> vk::CommandPool {
+        self.command_pool
+    }
+
+    #[allow(dead_code, reason = "the fence path does not read it yet")]
+    fn queue_family_index(&self) -> u32 {
+        self.queue_family_index
+    }
+
     /// A modifier of `format` the renderer can sample and render to — the tiled choice, or `None`
     /// where the device offers none.
     fn tiled_modifier(&self, format: vk::Format, required: vk::FormatFeatureFlags) -> Option<u64> {
@@ -142,6 +177,7 @@ impl Drop for GpuDevice {
     fn drop(&mut self) {
         // SAFETY: the device and instance are this value's, and are destroyed once, in order.
         unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -290,6 +326,100 @@ impl Drop for SharedBuffer {
             self.device.free_memory(self.memory, None);
             self.device.destroy_image(self.image, None);
         }
+    }
+}
+
+/// A fence signalled when the producer's work on a buffer completes — the
+/// [`DmaBufHandle::acquire_fence`](gpui::DmaBufHandle) a recycling renderer waits on.
+///
+/// A producer that renders into a [`SharedBuffer`] signals this from its own submission and hands
+/// over [`sync_file`](Self::sync_file); a producer with no queue of its own (a decoder handing over a
+/// filled buffer) uses [`signal`](Self::signal), which submits an empty list.
+pub struct Fence {
+    device: ash::Device,
+    external_fence_fd: ash::khr::external_fence_fd::Device,
+    fence: vk::Fence,
+}
+
+impl Fence {
+    /// Create an unsignalled fence.
+    pub fn new(device: &GpuDevice) -> Result<Self> {
+        let fence = unsafe { device.device().create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(|e| anyhow!("create the fence: {e:?}"))?;
+        Ok(Self {
+            device: device.device().clone(),
+            external_fence_fd: ash::khr::external_fence_fd::Device::new(
+                device.instance(),
+                device.device(),
+            ),
+            fence,
+        })
+    }
+
+    /// Signal the fence from `device`'s queue with an empty command list — the "this buffer is ready"
+    /// a producer that has no pass of its own hands over. A producer that renders signals the fence
+    /// from the submission that did the rendering instead.
+    pub fn signal(&self, device: &GpuDevice) -> Result<()> {
+        // SAFETY: the pool, queue and fence belong to `device`; the buffer is freed on every path.
+        unsafe {
+            let allocate = vk::CommandBufferAllocateInfo::default()
+                .command_pool(device.command_pool())
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let buffers = device
+                .device()
+                .allocate_command_buffers(&allocate)
+                .map_err(|e| anyhow!("allocate a command buffer: {e:?}"))?;
+            let buffer = buffers[0];
+            let result = (|| -> Result<()> {
+                device
+                    .device()
+                    .begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())
+                    .map_err(|e| anyhow!("begin the command buffer: {e:?}"))?;
+                device
+                    .device()
+                    .end_command_buffer(buffer)
+                    .map_err(|e| anyhow!("end the command buffer: {e:?}"))?;
+                let buffers = [buffer];
+                let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+                device
+                    .device()
+                    .queue_submit(device.queue(), &[submit], self.fence)
+                    .map_err(|e| anyhow!("submit: {e:?}"))?;
+                Ok(())
+            })();
+            device.device().free_command_buffers(device.command_pool(), &buffers);
+            result
+        }
+    }
+
+    /// The `sync_file` the renderer waits on, for `DmaBufHandle::acquire_fence`.
+    ///
+    /// Export it after the submission that signals the fence: the returned fd is the one the renderer
+    /// waits on, and the fence may not be exported this way twice.
+    pub fn sync_file(&self) -> Result<OwnedFd> {
+        // SAFETY: `fence` is this value's and unsignalled; the fd it returns is owned here.
+        let fd = unsafe {
+            self.external_fence_fd.get_fence_fd(
+                &vk::FenceGetFdInfoKHR::default()
+                    .fence(self.fence)
+                    .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD),
+            )
+        }
+        .map_err(|e| anyhow!("export the fence fd: {e:?}"))?;
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// The fence itself, for a producer that submits its own work against it.
+    pub fn fence(&self) -> vk::Fence {
+        self.fence
+    }
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        // SAFETY: created by this value and destroyed once.
+        unsafe { self.device.destroy_fence(self.fence, None) };
     }
 }
 
@@ -538,6 +668,21 @@ mod tests {
             handle.planes[0].stride,
             handle.planes[1].offset,
             handle.planes[1].stride,
+        );
+    }
+
+    #[test]
+    fn a_fence_exports_a_sync_file() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let fence = Fence::new(&device).expect("create a fence");
+        fence.signal(&device).expect("signal the fence");
+        let sync_file = fence.sync_file().expect("export a sync_file");
+        assert!(
+            std::os::fd::AsRawFd::as_raw_fd(&sync_file) >= 0,
+            "a sync_file is a valid descriptor"
         );
     }
 }

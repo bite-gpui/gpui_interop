@@ -64,7 +64,7 @@ mod windows;
 
 pub use adapter::{Adapter, Unavailable};
 #[cfg(target_os = "linux")]
-pub use linux::{GpuDevice, SharedBuffer};
+pub use linux::{Fence, GpuDevice, SharedBuffer};
 #[cfg(target_os = "windows")]
 pub use windows::{Fence, SharedSurface};
 
