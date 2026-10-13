@@ -864,4 +864,19 @@ mod tests {
             "a sync_file is a valid descriptor"
         );
     }
+
+    #[test]
+    fn a_cleared_buffer_is_ready_to_hand_over() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let buffer = SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::bgra8(), Tiling::Linear)
+            .expect("allocate a shareable buffer");
+        buffer
+            .clear(&device, [0.5, 0.25, 0.125, 1.0])
+            .expect("clear the buffer");
+        // The handle is unchanged — clearing writes through the same dma-buf.
+        assert_eq!(buffer.handle().planes.len(), 1);
+    }
 }
