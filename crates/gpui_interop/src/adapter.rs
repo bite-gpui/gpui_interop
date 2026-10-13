@@ -64,6 +64,27 @@ impl<'a> Adapter<'a> {
             None
         }
     }
+
+    /// A dma-buf-capable device on the window's GPU, for a producer that renders and exports.
+    ///
+    /// Linux's answer to the Windows LUID match: the renderer's device names its physical device,
+    /// and this makes a *second* logical device on it — so a producer's queue never races the
+    /// renderer's — carrying the extensions the export needs.
+    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    pub fn gpu_device(&self) -> Option<crate::GpuDevice> {
+        use std::sync::Arc;
+
+        let (device, _queue) = self
+            .device
+            .downcast_ref::<(Arc<wgpu::Device>, Arc<wgpu::Queue>)>()?;
+        // SAFETY: the HAL device is borrowed only long enough to read the raw handles below.
+        let hal = unsafe { device.as_hal::<wgpu::hal::vulkan::Api>() }?;
+        crate::GpuDevice::on(
+            hal.shared_instance().raw_instance(),
+            hal.raw_physical_device(),
+        )
+        .ok()
+    }
 }
 
 /// The Windows mechanism: the window's `ID3D11Device` → its adapter LUID → the wgpu DX12 adapter with

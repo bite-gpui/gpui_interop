@@ -48,13 +48,15 @@ pub enum Tiling {
 /// device is already known, the `adapter` module will lend it instead — matching on Linux is
 /// device-node selection, not a LUID — and this constructor stays the fallback.
 pub struct GpuDevice {
-    // Held so the instance outlives the device it made, and the device the memory it exported.
-    _entry: ash::Entry,
+    // Held so an instance this value made outlives the device; `None` when the instance is the
+    // renderer's, lent through the `adapter`.
+    _entry: Option<ash::Entry>,
     instance: ash::Instance,
+    /// Whether the instance is this value's to destroy, or the renderer's.
+    owns_instance: bool,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     external_memory_fd: ash::khr::external_memory_fd::Device,
-    external_fence_fd: ash::khr::external_fence_fd::Device,
     drm_format_modifier: ash::ext::image_drm_format_modifier::Device,
     queue: vk::Queue,
     queue_family_index: u32,
@@ -77,29 +79,35 @@ impl GpuDevice {
         let (physical_device, queue_family_index) = pick_device(&instance)
             .ok_or_else(|| anyhow!("no Vulkan device exports a dma-buf (needs {DEVICE_EXTENSIONS:?})"))?;
 
-        let extensions: Vec<CString> = DEVICE_EXTENSIONS
-            .iter()
-            .map(|e| CString::new(*e).expect("a literal without a NUL"))
-            .collect();
-        let extension_ptrs: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
+        Self::assemble(Some(entry), instance, true, physical_device, queue_family_index)
+    }
 
-        let priorities = [1.0f32];
-        let queue_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .queue_priorities(&priorities);
-        let device = unsafe {
-            instance.create_device(
-                physical_device,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(std::slice::from_ref(&queue_info))
-                    .enabled_extension_names(&extension_ptrs),
-                None,
-            )
-        }
-        .map_err(|e| anyhow!("create the Vulkan device: {e:?}"))?;
+    /// A device on `physical_device` of the renderer's `instance` — the `adapter`'s answer on Linux,
+    /// which puts the export on the GPU the window draws on rather than whichever one `open` finds.
+    pub fn on(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Result<Self> {
+        ensure_extensions(instance, physical_device)?;
+        let queue_family_index = render_family(instance, physical_device)
+            .ok_or_else(|| anyhow!("the renderer's device has no graphics queue family"))?;
+        Self::assemble(
+            None,
+            instance.clone(),
+            false,
+            physical_device,
+            queue_family_index,
+        )
+    }
+
+    /// Build on an already-chosen physical device and queue family.
+    fn assemble(
+        entry: Option<ash::Entry>,
+        instance: ash::Instance,
+        owns_instance: bool,
+        physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+    ) -> Result<Self> {
+        let device = create_device(&instance, physical_device, queue_family_index)?;
 
         let external_memory_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
-        let external_fence_fd = ash::khr::external_fence_fd::Device::new(&instance, &device);
         let drm_format_modifier =
             ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
 
@@ -114,10 +122,10 @@ impl GpuDevice {
         Ok(Self {
             _entry: entry,
             instance,
+            owns_instance,
             physical_device,
             device,
             external_memory_fd,
-            external_fence_fd,
             drm_format_modifier,
             queue,
             queue_family_index,
@@ -143,10 +151,6 @@ impl GpuDevice {
 
     fn drm_format_modifier(&self) -> &ash::ext::image_drm_format_modifier::Device {
         &self.drm_format_modifier
-    }
-
-    fn external_fence_fd(&self) -> &ash::khr::external_fence_fd::Device {
-        &self.external_fence_fd
     }
 
     fn queue(&self) -> vk::Queue {
@@ -175,11 +179,13 @@ impl GpuDevice {
 
 impl Drop for GpuDevice {
     fn drop(&mut self) {
-        // SAFETY: the device and instance are this value's, and are destroyed once, in order.
+        // SAFETY: the pool and device were made by this value; the instance only if it is ours.
         unsafe {
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            if self.owns_instance {
+                self.instance.destroy_instance(None);
+            }
         }
     }
 }
@@ -316,6 +322,101 @@ impl SharedBuffer {
     /// The producer's own render target.
     pub fn image(&self) -> vk::Image {
         self.image
+    }
+
+    /// Clear the image to a solid `rgba`, ready to hand over — the producer's simplest render, and
+    /// enough for a demo or a fixture. Single-plane RGB formats only: a multi-plane YCbCr buffer has
+    /// no one clear colour.
+    ///
+    /// It waits for the clear on the CPU rather than handing back an acquire fence, so the buffer is
+    /// ready when this returns. A producer with real work signals a [`Fence`] from its own submission
+    /// instead.
+    pub fn clear(&self, device: &GpuDevice, rgba: [f32; 4]) -> Result<()> {
+        // SAFETY: the pool, queue and image belong to `device` and this value; the command buffer is
+        // freed on every path, and the fence is waited on and destroyed.
+        unsafe {
+            let allocate = vk::CommandBufferAllocateInfo::default()
+                .command_pool(device.command_pool())
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let buffers = device
+                .device()
+                .allocate_command_buffers(&allocate)
+                .map_err(|e| anyhow!("allocate a command buffer: {e:?}"))?;
+            let buffer = buffers[0];
+            let result = (|| -> Result<()> {
+                device
+                    .device()
+                    .begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())
+                    .map_err(|e| anyhow!("begin the command buffer: {e:?}"))?;
+                let to_transfer = image_barrier(
+                    self.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                device.device().cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                device.device().cmd_clear_color_image(
+                    buffer,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: rgba },
+                    &[vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }],
+                );
+                let to_general = image_barrier(
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                );
+                device.device().cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+                device
+                    .device()
+                    .end_command_buffer(buffer)
+                    .map_err(|e| anyhow!("end the command buffer: {e:?}"))?;
+
+                let buffers = [buffer];
+                let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+                let fence = device
+                    .device()
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .map_err(|e| anyhow!("create the clear's fence: {e:?}"))?;
+                device
+                    .device()
+                    .queue_submit(device.queue(), &[submit], fence)
+                    .map_err(|e| anyhow!("submit the clear: {e:?}"))?;
+                device
+                    .device()
+                    .wait_for_fences(&[fence], true, u64::MAX)
+                    .map_err(|e| anyhow!("wait for the clear: {e:?}"))?;
+                device.device().destroy_fence(fence, None);
+                Ok(())
+            })();
+            device
+                .device()
+                .free_command_buffers(device.command_pool(), &buffers);
+            result
+        }
     }
 }
 
@@ -468,6 +569,84 @@ fn create_image(
         }
     };
     image.map_err(|e| anyhow!("create the image: {e:?}"))
+}
+
+/// A full-image layout transition for a single-plane image.
+fn image_barrier(
+    image: vk::Image,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
+        .old_layout(from)
+        .new_layout(to)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ)
+}
+
+/// Create a device on `physical_device`'s `queue_family_index`, with the extensions the export needs.
+fn create_device(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family_index: u32,
+) -> Result<ash::Device> {
+    let extensions: Vec<CString> = DEVICE_EXTENSIONS
+        .iter()
+        .map(|e| CString::new(*e).expect("a literal without a NUL"))
+        .collect();
+    let extension_ptrs: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
+
+    let priorities = [1.0f32];
+    let queue_info = vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .queue_priorities(&priorities);
+    // SAFETY: the pointers are to locals that outlive the call.
+    unsafe {
+        instance.create_device(
+            physical_device,
+            &vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&queue_info))
+                .enabled_extension_names(&extension_ptrs),
+            None,
+        )
+    }
+    .map_err(|e| anyhow!("create the Vulkan device: {e:?}"))
+}
+
+/// Whether `physical_device` supports every extension the export needs.
+fn ensure_extensions(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Result<()> {
+    // SAFETY: the call reads the device's extension list.
+    let properties = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .map_err(|e| anyhow!("enumerate device extensions: {e:?}"))?;
+    for wanted in DEVICE_EXTENSIONS {
+        if !properties
+            .iter()
+            .any(|p| extension_name(&p.extension_name) == wanted)
+        {
+            return Err(anyhow!("the renderer's device does not support {wanted}"));
+        }
+    }
+    Ok(())
+}
+
+/// The first graphics queue family of `physical_device`.
+fn render_family(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<u32> {
+    // SAFETY: the call reads the device's families.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    families
+        .iter()
+        .position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        .map(|index| index as u32)
 }
 
 /// A device that can export a dma-buf, with a queue family that can render — or `None`.
