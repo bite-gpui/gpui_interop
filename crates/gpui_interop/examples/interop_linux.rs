@@ -4,9 +4,10 @@
 //! cargo run -p gpui_interop --example interop_linux --features example
 //! ```
 //!
-//! The window is two solid tiles. Each is a `SharedBuffer` the producer allocated on a Vulkan device
-//! and handed to `gpu_canvas(..)` as a `gpui::DmaBufHandle`; the window's renderer imports the
-//! dma-buf under its DRM modifier and samples it. The pixels never touch the CPU.
+//! The window shows two solid tiles. Each is a `SharedBuffer` — a shareable Vulkan image the producer
+//! allocated and wrote on its own device — handed to `gpu_canvas(..)` as a `gpui::DmaBufHandle`; the
+//! window's renderer imports the dma-buf under its DRM modifier and samples it into the frame. The
+//! pixels never touch the CPU.
 //!
 //! # What the crate is for
 //!

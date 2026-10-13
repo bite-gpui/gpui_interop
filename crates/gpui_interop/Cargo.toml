@@ -12,13 +12,20 @@ workspace = true
 path = "src/gpui_interop.rs"
 doctest = false
 
-# The Linux example turns the hatch into a window: a `SharedBuffer` exported as a dma-buf and
-# composited by the renderer with no CPU copy. Built only with the `example` feature, which brings
-# the facade's platform bundle and the `wgpu` bridge the device it lands on comes from.
+# The Linux example: the hatch's `SharedBuffer` -- a shareable Vulkan image -- exported as a dma-buf
+# and composited by a GPUI window, with no CPU copy. Built only with the `example` feature, which
+# brings the facade's platform bundle and the `wgpu` bridge the device it lands on comes from.
 [[example]]
 name = "interop_linux"
 path = "examples/interop_linux.rs"
 required-features = ["example"]
+
+# The read-back test needs the facade's platform bundle and `test-support` (its own feature); unlike the
+# example it needs no display, but it does drive a window, so it is opt-in.
+[[test]]
+name = "linux_dmabuf_readback"
+path = "tests/linux_dmabuf_readback.rs"
+required-features = ["readback-test"]
 
 [features]
 default = []
@@ -29,6 +36,10 @@ wgpu = ["dep:wgpu"]
 # to every test build: without the split, `cargo test` would compile the whole platform stack -- and
 # need its system graphics libraries -- for a crate whose own code uses none of it.
 example = ["wgpu", "gpui/platform"]
+# The read-back test (`tests/linux_dmabuf_readback.rs`) drives a real offscreen window, so it needs the
+# platform bundle and `gpui/test-support`'s headless harness. Kept apart from `example` so neither
+# turns the other on, and so the ordinary `cargo test` builds neither.
+readback-test = ["gpui/platform", "gpui/test-support"]
 
 [dependencies]
 gpui.workspace = true
@@ -63,8 +74,9 @@ anyhow.workspace = true
 gpui_windows.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-# The example reaches the window renderer's device by naming `gpui_wgpu::WgpuRenderer`. A
-# dev-dependency on purpose: the library names neither the renderer crate nor the platform bundle the
-# example's own `example` feature turns on, so its graph stays free of them.
-gpui_wgpu.workspace = true
+# The example names `gpui_wgpu::WgpuRenderer` and the read-back test `gpui_wgpu::WgpuHeadlessRenderer`;
+# `headless` exposes the headless renderer and the `image` crate it reads back with, without pulling in
+# `gpui/test-support`'s platform stack (the read-back test's own feature turns that on). A
+# dev-dependency on purpose: the library names neither, so its graph stays free of the renderer crate.
+gpui_wgpu = { workspace = true, features = ["headless"] }
 log = "0.4.16"
