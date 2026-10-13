@@ -24,10 +24,11 @@ redundant_clone = "deny"
 # This repo's own crate: a path for development, a version for release.
 gpui_interop = { version = "0.1.0", path = "crates/gpui_interop" }
 
-# The core this crate is built on, wired to the sibling `bite-gpui` checkout for development and
-# carrying the version a release will resolve from crates.io once the core is published there.
-gpui = { version = "0.2.2", path = "../bite-gpui/crates/gpui", default-features = false }
-gpui_windows = { version = "0.1.0", path = "../bite-gpui/crates/gpui_windows" }
+# The core this crate is built on. Development takes it from its branch; on release each `git` and
+# `branch` pair is replaced by the core's published `version = "1.23"`, which a published crate has
+# to depend on instead of a git source.
+gpui = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas", default-features = false }
+gpui_windows = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
 
 # Third-party, at the versions the core resolves to, so one graph holds one copy of each.
 anyhow = "1.0.86"

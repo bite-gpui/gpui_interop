@@ -487,6 +487,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -699,6 +700,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1254,6 +1256,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "bindgen",
  "gpui_authoring",
@@ -1265,6 +1268,7 @@ dependencies = [
 [[package]]
 name = "gpui_authoring"
 version = "0.2.2"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -1329,6 +1333,7 @@ dependencies = [
 [[package]]
 name = "gpui_engine"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "collections",
@@ -1351,6 +1356,7 @@ dependencies = [
 [[package]]
 name = "gpui_engine_default"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1379,6 +1385,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1389,6 +1396,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -1430,6 +1438,7 @@ dependencies = [
 [[package]]
 name = "gpui_runtime"
 version = "0.2.2"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "gpui_authoring",
@@ -1438,6 +1447,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "schemars",
  "serde",
@@ -1447,6 +1457,7 @@ dependencies = [
 [[package]]
 name = "gpui_types"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -1461,6 +1472,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "log",
@@ -1470,6 +1482,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -1593,6 +1606,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -2491,6 +2505,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "collections",
  "serde",
@@ -2911,6 +2926,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "derive_refineable",
 ]
@@ -3051,6 +3067,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "scheduler"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "async-task",
  "backtrace",
@@ -3352,6 +3369,7 @@ dependencies = [
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "heapless",
  "log",
@@ -3842,6 +3860,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util_macros"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "perf",
  "quote",
@@ -4517,6 +4536,7 @@ checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 [[package]]
 name = "zlog"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4533,6 +4553,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -4543,6 +4564,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
+source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 
 [[package]]
 name = "zune-core"
