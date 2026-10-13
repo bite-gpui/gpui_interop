@@ -37,8 +37,15 @@ const DEVICE_EXTENSIONS: [&str; 4] = [
 pub enum Tiling {
     /// A linear buffer: uncompressed, always importable, and the slowest to sample.
     Linear,
-    /// A driver-tiled modifier the renderer can import, when the device offers one; a linear buffer
-    /// otherwise.
+    /// A driver-tiled modifier the renderer can import — when the device offers one **and** it is the
+    /// consumer's own.
+    ///
+    /// A DRM modifier is meaningful only to the vendor that defines it: `Y_TILED` is Intel's, NVIDIA
+    /// lists its own block, llvmpipe only `LINEAR`. The modifier is picked from the *device's* list,
+    /// so tiling is sound only when that device is the one the renderer samples on — which is what
+    /// `Adapter::gpu_device` lends, and what [`GpuDevice::open`] does not. On a device the producer
+    /// opened itself the request is **refused and the buffer exported linear**, with a warning: the
+    /// alternative is a buffer the consumer wedges on rather than refuses.
     Tiled,
 }
 
@@ -55,6 +62,9 @@ pub struct GpuDevice {
     instance: ash::Instance,
     /// Whether the instance is this value's to destroy, or the renderer's.
     owns_instance: bool,
+    /// Whether this device is the renderer's own (`GpuDevice::on`) rather than one the producer
+    /// opened (`GpuDevice::open`). [`Tiling::Tiled`] is honoured only on the former.
+    renderer_bound: bool,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     external_memory_fd: ash::khr::external_memory_fd::Device,
@@ -66,6 +76,10 @@ pub struct GpuDevice {
 
 impl GpuDevice {
     /// Open a device that can export a dma-buf, or an error if none on this machine can.
+    ///
+    /// It is **not** the renderer's device, and it does not pretend to be: [`Tiling::Tiled`] is
+    /// refused on it and the buffer is exported linear, with a warning. Borrow the renderer's device
+    /// with `Adapter::gpu_device` when there is one to borrow from.
     pub fn open() -> Result<Self> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| anyhow!("load libvulkan: {e}"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
@@ -80,7 +94,14 @@ impl GpuDevice {
         let (physical_device, queue_family_index) = pick_device(&instance)
             .ok_or_else(|| anyhow!("no Vulkan device exports a dma-buf (needs {DEVICE_EXTENSIONS:?})"))?;
 
-        Self::assemble(Some(entry), instance, true, physical_device, queue_family_index)
+        Self::assemble(
+            Some(entry),
+            instance,
+            true,
+            false,
+            physical_device,
+            queue_family_index,
+        )
     }
 
     /// A device on `physical_device` of the renderer's `instance` — the `adapter`'s answer on Linux,
@@ -93,6 +114,7 @@ impl GpuDevice {
             None,
             instance.clone(),
             false,
+            true,
             physical_device,
             queue_family_index,
         )
@@ -103,6 +125,7 @@ impl GpuDevice {
         entry: Option<ash::Entry>,
         instance: ash::Instance,
         owns_instance: bool,
+        renderer_bound: bool,
         physical_device: vk::PhysicalDevice,
         queue_family_index: u32,
     ) -> Result<Self> {
@@ -124,6 +147,7 @@ impl GpuDevice {
             _entry: entry,
             instance,
             owns_instance,
+            renderer_bound,
             physical_device,
             device,
             external_memory_fd,
@@ -211,9 +235,11 @@ impl SharedBuffer {
     /// Allocate a shareable image of `width` × `height` in `format`, on `device`, with `tiling`.
     ///
     /// `format` must be a single-plane RGB format ([`SurfaceFormatKind::bgra8`] or
-    /// [`SurfaceFormatKind::rgba8`]) today; a multi-plane format is the next slice. [`Tiling::Tiled`]
-    /// asks for a driver modifier the renderer can import and falls back to linear where the device
-    /// offers none, so `handle().modifier` is what was in fact chosen.
+    /// [`SurfaceFormatKind::rgba8`]) today; a multi-plane format is the next slice.
+    /// [`Tiling::Tiled`] asks for a driver modifier the renderer can import; it is honoured only on
+    /// the renderer's **own** device and falls back to linear — with a warning — where the device
+    /// offers no such modifier or is one the producer opened itself. `handle().modifier` is what was
+    /// in fact chosen.
     pub fn new(
         device: &GpuDevice,
         width: u32,
@@ -231,7 +257,29 @@ impl SharedBuffer {
         };
         let modifier = match tiling {
             Tiling::Linear => None,
-            Tiling::Tiled => device.tiled_modifier(vk_format, required),
+            Tiling::Tiled if !device.renderer_bound => {
+                // A modifier is a claim about the memory layout of a GPU the consumer shares, and only
+                // the renderer's own device can make it truthfully — a different vendor's modifier is
+                // not importable at all. Refusing here exports a buffer the consumer can sample, where
+                // honouring it could wedge the device instead.
+                log::warn!(
+                    "gpui_interop: Tiling::Tiled needs the renderer's own device; this one was opened \
+                     by the producer, so the modifier it would pick is not known to be importable. \
+                     Exporting a linear buffer — borrow the renderer's device with \
+                     `Adapter::gpu_device` to tile."
+                );
+                None
+            }
+            Tiling::Tiled => {
+                let modifier = device.tiled_modifier(vk_format, required);
+                if modifier.is_none() {
+                    log::warn!(
+                        "gpui_interop: this device offers no {format:?} modifier the renderer can \
+                         import; exporting a linear buffer"
+                    );
+                }
+                modifier
+            }
         };
 
         let image = create_image(device, vk_format, width, height, usage, modifier)?;
@@ -805,8 +853,12 @@ mod tests {
         assert_eq!(handle.height, 64);
     }
 
+    /// A producer-opened device refuses `Tiling::Tiled`: the modifier it would pick is not known to be
+    /// importable by the consumer, so the buffer is exported linear rather than risk a buffer the
+    /// renderer wedges on. Real tiled coverage needs the renderer's own device —
+    /// `tests/linux_dmabuf_readback.rs`, behind the `readback-test` feature.
     #[test]
-    fn a_tiled_buffer_exports_a_dma_buf_under_its_modifier() {
+    fn a_producers_own_device_refuses_tiling() {
         let Ok(device) = GpuDevice::open() else {
             eprintln!("skipping: no Vulkan device exports a dma-buf");
             return;
@@ -814,18 +866,16 @@ mod tests {
         let buffer = SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::bgra8(), Tiling::Tiled)
             .expect("allocate a shareable buffer");
         let handle = buffer.handle();
-        // A device that offers no importable modifier falls back to linear, so this asserts the
-        // contract — the stride and planes are real whatever the modifier — and reports which.
-        assert_eq!(handle.planes.len(), 1);
+        assert_eq!(
+            handle.modifier,
+            DmaBufHandle::LINEAR,
+            "a device the producer opened itself must not hand out a modifier"
+        );
+        assert_eq!(handle.planes.len(), 1, "a single-plane format");
         assert!(
             handle.planes[0].stride >= 64 * 4,
-            "a tiled row is at least four bytes a pixel"
+            "a linear row is at least four bytes a pixel"
         );
-        if handle.modifier != DmaBufHandle::LINEAR {
-            eprintln!("tiled with modifier {:#x}", handle.modifier);
-        } else {
-            eprintln!("no importable modifier offered; fell back to linear");
-        }
     }
 
     #[test]

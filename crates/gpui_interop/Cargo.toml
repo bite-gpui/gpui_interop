@@ -59,6 +59,8 @@ embed-resource = "3.0"
 # extensions. `gpui_va`'s VA-API export is its own path and does not use this.
 ash = "0.38"
 anyhow.workspace = true
+# A `Tiling::Tiled` request the device cannot soundly honour is refused, not silently mistiled.
+log = "0.4.16"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The Windows transport (`SharedSurface`, `Fence`) is Direct3D 11 + 12. The workspace `windows`
@@ -81,4 +83,3 @@ gpui_windows.workspace = true
 # `gpui/test-support`'s platform stack (the read-back test's own feature turns that on). A
 # dev-dependency on purpose: the library names neither, so its graph stays free of the renderer crate.
 gpui_wgpu = { workspace = true, features = ["headless"] }
-log = "0.4.16"
