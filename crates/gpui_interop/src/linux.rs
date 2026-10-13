@@ -6,10 +6,10 @@
 //! `surface()` element takes. The consumer half is core — `gpui_wgpu` imports under the modifier and
 //! samples it — so nothing here opens or waits on a buffer.
 //!
-//! Today this is the **single-plane** slice: an uncompressed `BGRA8`/`RGBA8` image, either linear or
-//! on a driver-tiled modifier the renderer can import (`[`Tiling`]`), exported with `vkGetMemoryFdKHR`.
-//! Multi-plane YCbCr formats are the next slice, and the acquire fence a `sync_file` from
-//! `VK_KHR_external_fence_fd` the one after. The payload all three converge on is the same
+//! Today this covers `BGRA8`/`RGBA8` and two-plane `NV12`, either linear or on a driver-tiled
+//! modifier the renderer can import (`[`Tiling`]`), exported with `vkGetMemoryFdKHR` as one dma-buf
+//! with a plane per memory plane. The acquire fence — a `sync_file` from `VK_KHR_external_fence_fd`
+//! — is the next slice, and the payload it converges on is the same
 //! [`gpui::DmaBufHandle`], so the consumer never changes.
 //!
 //! A VA-API producer does **not** use this module: `vaExportSurfaceHandle` hands it a dma-buf
@@ -129,15 +129,11 @@ impl GpuDevice {
 
     /// A modifier of `format` the renderer can sample and render to — the tiled choice, or `None`
     /// where the device offers none.
-    fn tiled_modifier(&self, format: vk::Format) -> Option<u64> {
+    fn tiled_modifier(&self, format: vk::Format, required: vk::FormatFeatureFlags) -> Option<u64> {
         supported_modifiers(self, format)
             .into_iter()
             .filter(|p| p.drm_format_modifier != DmaBufHandle::LINEAR)
-            .find(|p| {
-                p.drm_format_modifier_tiling_features.contains(
-                    vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE,
-                )
-            })
+            .find(|p| p.drm_format_modifier_tiling_features.contains(required))
             .map(|p| p.drm_format_modifier)
     }
 }
@@ -178,18 +174,20 @@ impl SharedBuffer {
         format: SurfaceFormatKind,
         tiling: Tiling,
     ) -> Result<Self> {
-        if format.plane_count() != 1 {
-            return Err(anyhow!(
-                "{format:?} is not a single-plane format; the hatch exports BGRA8/RGBA8 today"
-            ));
-        }
         let vk_format = vk_format(format)?;
+        let plane_count = format.plane_count();
+        let usage = usage_for(format);
+        let required = if format.is_yuv() {
+            vk::FormatFeatureFlags::SAMPLED_IMAGE
+        } else {
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        };
         let modifier = match tiling {
             Tiling::Linear => None,
-            Tiling::Tiled => device.tiled_modifier(vk_format),
+            Tiling::Tiled => device.tiled_modifier(vk_format, required),
         };
 
-        let image = create_image(device, vk_format, width, height, modifier)?;
+        let image = create_image(device, vk_format, width, height, usage, modifier)?;
 
         let requirements = unsafe { device.device().get_image_memory_requirements(image) };
         let memory_type_index = pick_memory_type(device, requirements.memory_type_bits)?;
@@ -242,35 +240,29 @@ impl SharedBuffer {
         .map_err(|e| anyhow!("export the dma-buf fd: {e:?}"))?;
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
-        // SAFETY: `image` is live and the subresource names its only plane. A DRM-modifier image is
-        // asked about by *memory plane*, a linear one by colour aspect; anything else returns 0.
-        let aspect_mask = if drm {
-            vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
-        } else {
-            vk::ImageAspectFlags::COLOR
-        };
-        let layout = unsafe {
-            device.device().get_image_subresource_layout(
-                image,
-                vk::ImageSubresource {
-                    aspect_mask,
-                    mip_level: 0,
-                    array_layer: 0,
-                },
-            )
-        };
-
-        let plane_fd = fd
-            .try_clone()
-            .map_err(|e| anyhow!("duplicate the dma-buf fd for the plane: {e}"))?;
-        let handle = DmaBufHandle::new(
-            width,
-            height,
-            format,
-            modifier,
-            [DmaBufPlane::new(plane_fd, layout.offset, layout.row_pitch as u32)],
-            None,
-        );
+        let mut planes = Vec::with_capacity(plane_count);
+        for plane in 0..plane_count {
+            // SAFETY: `image` is live and the subresource names `plane`.
+            let layout = unsafe {
+                device.device().get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask: subresource_aspect(drm, plane, plane_count),
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            let plane_fd = fd
+                .try_clone()
+                .map_err(|e| anyhow!("duplicate the dma-buf fd for plane {plane}: {e}"))?;
+            planes.push(DmaBufPlane::new(
+                plane_fd,
+                layout.offset,
+                layout.row_pitch as u32,
+            ));
+        }
+        let handle = DmaBufHandle::new(width, height, format, modifier, planes, None);
 
         Ok(Self {
             device: device.device().clone(),
@@ -307,6 +299,7 @@ fn create_image(
     format: vk::Format,
     width: u32,
     height: u32,
+    usage: vk::ImageUsageFlags,
     modifier: Option<u64>,
 ) -> Result<vk::Image> {
     let mut external = vk::ExternalMemoryImageCreateInfo::default()
@@ -323,12 +316,7 @@ fn create_image(
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .usage(
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::TRANSFER_SRC,
-        )
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut external);
@@ -426,12 +414,44 @@ fn pick_memory_type(device: &GpuDevice, bits: u32) -> Result<u32> {
         .ok_or_else(|| anyhow!("no device-local memory type for the image"))
 }
 
-/// The Vulkan format a single-plane [`SurfaceFormatKind`] maps to.
+/// The Vulkan format a [`SurfaceFormatKind`] maps to.
 fn vk_format(format: SurfaceFormatKind) -> Result<vk::Format> {
     match format {
         SurfaceFormatKind::Bgra8(_) => Ok(vk::Format::B8G8R8A8_UNORM),
         SurfaceFormatKind::Rgba8(_) => Ok(vk::Format::R8G8B8A8_UNORM),
+        SurfaceFormatKind::Nv12(_) => Ok(vk::Format::G8_B8R8_2PLANE_420_UNORM),
         other => Err(anyhow!("{other:?} has no Vulkan format in the dma-buf hatch yet")),
+    }
+}
+
+/// The usage an image of `format` is made with: a YCbCr format is sampled and copied, an RGB one can
+/// also be rendered to.
+fn usage_for(format: SurfaceFormatKind) -> vk::ImageUsageFlags {
+    let base = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::TRANSFER_DST;
+    if format.is_yuv() {
+        base
+    } else {
+        base | vk::ImageUsageFlags::COLOR_ATTACHMENT
+    }
+}
+
+/// The aspect a subresource of `plane` is named by: a DRM-modifier image is asked about by *memory
+/// plane*, a linear one by colour aspect (or by plane, if the format has more than one).
+fn subresource_aspect(drm: bool, plane: usize, plane_count: usize) -> vk::ImageAspectFlags {
+    if drm {
+        if plane == 0 {
+            vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
+        } else {
+            vk::ImageAspectFlags::MEMORY_PLANE_1_EXT
+        }
+    } else if plane_count == 1 {
+        vk::ImageAspectFlags::COLOR
+    } else if plane == 0 {
+        vk::ImageAspectFlags::PLANE_0
+    } else {
+        vk::ImageAspectFlags::PLANE_1
     }
 }
 
@@ -487,5 +507,37 @@ mod tests {
         } else {
             eprintln!("no importable modifier offered; fell back to linear");
         }
+    }
+
+    #[test]
+    fn a_two_plane_nv12_buffer_exports_two_planes() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let buffer =
+            SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::nv12(), Tiling::Linear)
+                .expect("allocate a shareable buffer");
+        let handle = buffer.handle();
+        assert_eq!(handle.planes.len(), 2, "NV12 is two planes");
+        assert!(
+            handle.planes[0].stride >= 64,
+            "a luma row is at least a byte a pixel"
+        );
+        assert!(
+            handle.planes[1].stride >= 32,
+            "a chroma row is at least a byte every two pixels"
+        );
+        assert!(
+            handle.planes[1].offset >= handle.planes[0].stride as u64 * 64,
+            "the chroma plane follows the luma plane"
+        );
+        eprintln!(
+            "nv12: luma offset {} stride {}, chroma offset {} stride {}",
+            handle.planes[0].offset,
+            handle.planes[0].stride,
+            handle.planes[1].offset,
+            handle.planes[1].stride,
+        );
     }
 }
