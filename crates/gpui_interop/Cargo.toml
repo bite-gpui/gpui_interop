@@ -20,8 +20,9 @@ name = "interop_linux"
 path = "examples/interop_linux.rs"
 required-features = ["example"]
 
-# The read-back test needs the facade's platform bundle and `test-support` (its own feature); unlike the
-# example it needs no display, but it does drive a window, so it is opt-in.
+# The read-back test needs the facade's platform bundle and `test-support` (its own feature), and
+# builds its buffers on the renderer's device through `Adapter::gpu_device`, so it is opt-in and its
+# own feature. Unlike the example it needs no display, but it does drive a window.
 [[test]]
 name = "linux_dmabuf_readback"
 path = "tests/linux_dmabuf_readback.rs"
@@ -36,10 +37,11 @@ wgpu = ["dep:wgpu"]
 # to every test build: without the split, `cargo test` would compile the whole platform stack -- and
 # need its system graphics libraries -- for a crate whose own code uses none of it.
 example = ["wgpu", "gpui/platform"]
-# The read-back test (`tests/linux_dmabuf_readback.rs`) drives a real offscreen window, so it needs the
-# platform bundle and `gpui/test-support`'s headless harness. Kept apart from `example` so neither
+# The read-back test (`tests/linux_dmabuf_readback.rs`) drives a real offscreen window and builds its
+# buffers on the renderer's device through `Adapter::gpu_device`, so it needs the platform bundle,
+# `gpui/test-support`'s headless harness, and the `wgpu` bridge. Kept apart from `example` so neither
 # turns the other on, and so the ordinary `cargo test` builds neither.
-readback-test = ["gpui/platform", "gpui/test-support"]
+readback-test = ["wgpu", "gpui/platform", "gpui/test-support"]
 
 [dependencies]
 gpui.workspace = true

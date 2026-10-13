@@ -241,10 +241,15 @@ impl SharedBuffer {
 
         let mut export = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // A dedicated allocation, as the two working dma-buf paths here make — `gpui_wgpu`'s importer
+        // and `gpui_va`'s tiled fill. An image that is imported or exported wants one, and a driver is
+        // allowed to require it.
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index)
-            .push_next(&mut export);
+            .push_next(&mut export)
+            .push_next(&mut dedicated);
 
         // SAFETY: the allocation chains a local `export`, the size and type come from the image, and
         // the memory is freed when the returned value drops.
