@@ -1,0 +1,42 @@
+# gpui_interop's own CI.
+#
+# The cross-device arm runs a Direct3D 12 producer's shared texture through GPUI's Direct3D 11
+# renderer and composites it byte for byte, so it needs a device, a shared handle and a window: a
+# Windows runner, whose WARP is enough to call a pass "mechanically possible on one adapter" rather
+# than "works on hardware".
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The cross-device arm, on Windows: a Direct3D 12 producer's shared texture, opened on GPUI's
+  # Direct3D 11 renderer and composited byte for byte
+  # (`crates/gpui_interop/tests/cross_device_surface.rs`). Debug rather than a release profile: the
+  # test adds no HLSL of its own, so there is no `fxc`-only artifact it needs, and the renderer it
+  # drives still compiles its shaders at run time from the source in the checkout.
+  #
+  # The filter is the test's own name: `cargo test`'s filter matches test names, and the file's name
+  # is a binary rather than a test, so `cross_device_surface` would match nothing. `grep` stops the
+  # gate passing vacuously if the filter ever stops matching anything.
+  #
+  # A second guard stops it passing *hollowly*. The test skips by returning `Ok(())` -- no Direct3D
+  # 12 device, no DirectComposition, no window -- and says so on stderr. `--nocapture` is what lets
+  # that message past libtest's capture, and the `! grep` turns it into a failure, so this row
+  # insists the cross-device path was genuinely exercised. That is safe to demand here and would not
+  # be on a developer's machine: a hosted Windows runner always has WARP, so a skip means the runner
+  # or the test regressed, not that the hardware is absent.
+  windows-interop:
+    name: cargo test -p gpui_interop a_shared_d3d12_surface (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p gpui_interop a_shared_d3d12_surface -- --nocapture 2>&1 | tee cross-device-surface.log
+          grep -qE "test result: ok\. [1-9][0-9]* passed" cross-device-surface.log
+          ! grep -q "skipping" cross-device-surface.log
