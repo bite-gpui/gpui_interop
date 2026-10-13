@@ -23,6 +23,10 @@
 //!   Direct3D 12 producer renders into a shared texture and signals a fence, and hands GPUI the
 //!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
 //!   the shared fence ordering the two queues.
+//! - On Linux, [`SharedBuffer`] is the producer half of the dma-buf transport: a producer renders into
+//!   a shareable image and exports it as a dma-buf, and hands GPUI the `gpui::DmaBufHandle` the
+//!   renderer imports under its modifier. Linear and single-plane today; tiled modifiers and a fence
+//!   are the next slice.
 //!
 //! # Sketch
 //!
@@ -59,6 +63,8 @@ mod macos;
 mod windows;
 
 pub use adapter::{Adapter, Unavailable};
+#[cfg(target_os = "linux")]
+pub use linux::{GpuDevice, SharedBuffer};
 #[cfg(target_os = "windows")]
 pub use windows::{Fence, SharedSurface};
 

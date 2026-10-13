@@ -28,6 +28,12 @@ wgpu = { workspace = true, optional = true }
 # carries the manifest for its own targets, which does not reach a downstream test binary.
 embed-resource = "3.0"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The Linux transport exports a shareable image as a dma-buf through Vulkan's external-memory
+# extensions. `gpui_va`'s VA-API export is its own path and does not use this.
+ash = "0.38"
+anyhow.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # The Windows transport (`SharedSurface`, `Fence`) is Direct3D 11 + 12. The workspace `windows`
 # feature set stops at Direct3D 11; the shared-handle and shared-fence calls are Direct3D 12, so the

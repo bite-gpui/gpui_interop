@@ -1375,6 +1375,7 @@ name = "gpui_interop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "embed-resource",
  "gpui",
  "gpui_windows",
