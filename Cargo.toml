@@ -28,6 +28,7 @@ gpui_interop = { version = "0.1.0", path = "crates/gpui_interop" }
 # `branch` pair is replaced by the core's published `version = "1.23"`, which a published crate has
 # to depend on instead of a git source.
 gpui = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas", default-features = false }
+gpui_engine = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
 gpui_wgpu = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
 gpui_windows = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
 

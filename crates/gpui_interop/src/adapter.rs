@@ -87,6 +87,30 @@ impl<'a> Adapter<'a> {
         )
         .ok()
     }
+
+    /// The GPU the window draws on, for a producer that owns its device — a 3D engine, a decoder, a
+    /// capture loop — and must land on the same GPU to share a dma-buf.
+    ///
+    /// Unlike [`gpu_device`](Self::gpu_device) it creates no device: it only names the renderer's
+    /// GPU, as a [`GpuId`](crate::GpuId) a producer matches from its own instance. It also
+    /// **remembers** the answer for [`gpui_interop::gpu_id`](crate::gpu_id), so a producer that runs
+    /// off the paint can read it after a canvas has run once.
+    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    pub fn gpu_id(&self) -> Option<crate::GpuId> {
+        use std::sync::Arc;
+
+        let (device, _queue) = self
+            .device
+            .downcast_ref::<(Arc<wgpu::Device>, Arc<wgpu::Queue>)>()?;
+        // SAFETY: the HAL device is borrowed only long enough to read the raw handles below.
+        let hal = unsafe { device.as_hal::<wgpu::hal::vulkan::Api>() }?;
+        let id = crate::GpuId::of(
+            hal.shared_instance().raw_instance(),
+            hal.raw_physical_device(),
+        );
+        crate::remember(id.clone());
+        Some(id)
+    }
 }
 
 /// The Windows mechanism: the window's `ID3D11Device` → its adapter LUID → the wgpu DX12 adapter with
@@ -100,10 +124,10 @@ mod matched {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
 
-    use windows::core::Interface;
     use windows::Win32::Foundation::LUID;
     use windows::Win32::Graphics::Direct3D11::ID3D11Device;
     use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
+    use windows::core::Interface;
 
     /// A wgpu device and queue on the adapter the window's Direct3D 11 device runs on, or `None`
     /// when the device lends no LUID or no DX12 adapter matches it.
@@ -114,9 +138,9 @@ mod matched {
 
         let instance = wgpu::Instance::new(dx12_instance());
         let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
-        let adapter = adapters
-            .iter()
-            .find(|adapter| wgpu_adapter_luid(adapter).is_some_and(|l| same_luid(l, window_luid)))?;
+        let adapter = adapters.iter().find(|adapter| {
+            wgpu_adapter_luid(adapter).is_some_and(|l| same_luid(l, window_luid))
+        })?;
 
         let (device, queue) = block_on(adapter.request_device(&device_descriptor(adapter))).ok()?;
         Some((Arc::new(device), Arc::new(queue)))

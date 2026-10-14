@@ -2207,6 +2207,7 @@ dependencies = [
  "ash",
  "embed-resource",
  "gpui",
+ "gpui_engine",
  "gpui_wgpu",
  "gpui_windows",
  "log",

@@ -9,8 +9,8 @@
 //! Today this covers `BGRA8`/`RGBA8` and two-plane `NV12`, either linear or on a driver-tiled
 //! modifier the renderer can import ([`Tiling`]), exported with `vkGetMemoryFdKHR` as one dma-buf
 //! with a plane per memory plane, and ordered by a [`Fence`] that exports the acquire `sync_file`
-//! from `VK_KHR_external_fence_fd`. The payload is the same [`gpui::DmaBufHandle`] either way, so
-//! the consumer never changes.
+//! from `VK_KHR_external_fence_fd`. The payload is the same [`gpui_engine::DmaBufHandle`] either way,
+//! so the consumer never changes.
 //!
 //! A VA-API producer does **not** use this module: `vaExportSurfaceHandle` hands it a dma-buf
 //! directly. This is for a producer that has no driver-level export — a `wgpu`/3D engine or another
@@ -19,10 +19,12 @@
 use std::ffi::{CStr, CString};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::raw::c_char;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 use ash::vk;
-use gpui::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind};
+use gpui_engine::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind};
 
 /// The device extensions an image needs to be exported as a dma-buf, tiled or not.
 const DEVICE_EXTENSIONS: [&str; 4] = [
@@ -31,6 +33,10 @@ const DEVICE_EXTENSIONS: [&str; 4] = [
     "VK_EXT_image_drm_format_modifier",
     "VK_KHR_external_fence_fd",
 ];
+
+/// The instance extension that names a physical device's DRM nodes. Enabled on the instance
+/// [`GpuDevice::open`] makes, and read through when the renderer's instance carries it too.
+const DRM_EXTENSION: &str = "VK_EXT_physical_device_drm";
 
 /// How the producer's image is laid out in memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +53,64 @@ pub enum Tiling {
     /// opened itself the request is **refused and the buffer exported linear**, with a warning: the
     /// alternative is a buffer the consumer wedges on rather than refuses.
     Tiled,
+}
+
+/// The GPU a window draws on, as a producer that must render or decode on the **same** GPU names it.
+///
+/// A dma-buf is importable only on the GPU it was exported from, so a producer that owns its device —
+/// a 3D engine, a VA decoder, a camera — has to land on the renderer's GPU. It cannot borrow the
+/// renderer's device to do so (a foreign API or process has its own), so what it needs is the GPU's
+/// *identity*, in terms it can match from its own instance:
+///
+/// - [`render_node`](Self::render_node), the DRM render node — what a non-Vulkan producer opens
+///   (`vaGetDisplayDRM`, a camera, `gbm`);
+/// - [`name`](Self::name), the device name Vulkan reports — what a Vulkan producer matches by.
+///
+/// Read it inside a `gpu_canvas` with `Adapter::gpu_id`, or, for a producer that runs off the paint,
+/// after a canvas has remembered it: [`gpu_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuId {
+    /// The device name Vulkan reports, e.g. `Intel(R) HD Graphics 520`.
+    pub name: String,
+    /// The DRM render node the GPU backs — `/dev/dri/renderD128` — when the driver reports one, which
+    /// is what a non-Vulkan producer opens. `None` when `VK_EXT_physical_device_drm` is unavailable.
+    pub render_node: Option<PathBuf>,
+}
+
+impl GpuId {
+    /// Read the identity of `physical_device` on `instance`.
+    pub(crate) fn of(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
+        // SAFETY: both calls only read the device; the structs are filled out and copied.
+        unsafe {
+            let properties = instance.get_physical_device_properties(physical_device);
+            let name = extension_name(&properties.device_name).to_owned();
+
+            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+            instance.get_physical_device_properties2(physical_device, &mut properties);
+            let render_node = (drm.has_render != 0)
+                .then(|| PathBuf::from(format!("/dev/dri/renderD{}", drm.render_minor)));
+
+            Self { name, render_node }
+        }
+    }
+}
+
+/// The renderer's GPU, remembered when a canvas last read it — for a producer that runs off the
+/// paint, which is every decoder and capture loop.
+static RENDERER_GPU: OnceLock<GpuId> = OnceLock::new();
+
+/// Remember `id` as the GPU the window draws on, for [`gpu_id`] to hand a producer off the paint.
+///
+/// First write wins: a process is assumed to draw through one GPU, which is what the renderer's own
+/// adapter steering assumes too.
+pub fn remember(id: GpuId) {
+    let _ = RENDERER_GPU.set(id);
+}
+
+/// The remembered GPU, or `None` until a `gpu_canvas` has read it with `Adapter::gpu_id`.
+pub fn gpu_id() -> Option<GpuId> {
+    RENDERER_GPU.get().cloned()
 }
 
 /// A Vulkan device a producer renders on and exports from.
@@ -82,17 +146,11 @@ impl GpuDevice {
     /// with `Adapter::gpu_device` when there is one to borrow from.
     pub fn open() -> Result<Self> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| anyhow!("load libvulkan: {e}"))?;
-        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app),
-                None,
-            )
-        }
-        .map_err(|e| anyhow!("create the Vulkan instance: {e:?}"))?;
+        let instance = create_instance(&entry)?;
 
-        let (physical_device, queue_family_index) = pick_device(&instance)
-            .ok_or_else(|| anyhow!("no Vulkan device exports a dma-buf (needs {DEVICE_EXTENSIONS:?})"))?;
+        let (physical_device, queue_family_index) = pick_device(&instance).ok_or_else(|| {
+            anyhow!("no Vulkan device exports a dma-buf (needs {DEVICE_EXTENSIONS:?})")
+        })?;
 
         Self::assemble(
             Some(entry),
@@ -200,6 +258,28 @@ impl GpuDevice {
             .find(|p| p.drm_format_modifier_tiling_features.contains(required))
             .map(|p| p.drm_format_modifier)
     }
+
+    /// The GPU this device is on — the identity a producer that must match the renderer's GPU reads.
+    pub fn gpu_id(&self) -> GpuId {
+        GpuId::of(&self.instance, self.physical_device)
+    }
+
+    /// The first memory type the image allows that carries every flag in `required`.
+    fn memory_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
+        // SAFETY: the call reads the physical device's memory properties.
+        let properties = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        (0..properties.memory_type_count)
+            .find(|i| {
+                bits & (1u32 << i) != 0
+                    && properties.memory_types[*i as usize]
+                        .property_flags
+                        .contains(required)
+            })
+            .ok_or_else(|| anyhow!("no memory type carrying {required:?} for the image"))
+    }
 }
 
 impl Drop for GpuDevice {
@@ -234,8 +314,10 @@ pub struct SharedBuffer {
 impl SharedBuffer {
     /// Allocate a shareable image of `width` × `height` in `format`, on `device`, with `tiling`.
     ///
-    /// `format` must be a single-plane RGB format ([`SurfaceFormatKind::bgra8`] or
-    /// [`SurfaceFormatKind::rgba8`]) today; a multi-plane format is the next slice.
+    /// `format` may be a single-plane RGB format ([`SurfaceFormatKind::bgra8`] or
+    /// [`SurfaceFormatKind::rgba8`]) or two-plane [`SurfaceFormatKind::nv12`]; a format with no
+    /// Vulkan mapping, or one the device cannot make in the chosen tiling, is refused before
+    /// `vkCreateImage` would answer a bare `VK_ERROR_FORMAT_NOT_SUPPORTED`.
     /// [`Tiling::Tiled`] asks for a driver modifier the renderer can import; it is honoured only on
     /// the renderer's **own** device and falls back to linear — with a warning — where the device
     /// offers no such modifier or is one the producer opened itself. `handle().modifier` is what was
@@ -249,12 +331,8 @@ impl SharedBuffer {
     ) -> Result<Self> {
         let vk_format = vk_format(format)?;
         let plane_count = format.plane_count();
-        let usage = usage_for(format);
-        let required = if format.is_yuv() {
-            vk::FormatFeatureFlags::SAMPLED_IMAGE
-        } else {
-            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE
-        };
+        let usage = usage_for();
+        let required = required_features(usage);
         let modifier = match tiling {
             Tiling::Linear => None,
             Tiling::Tiled if !device.renderer_bound => {
@@ -282,10 +360,15 @@ impl SharedBuffer {
             }
         };
 
+        ensure_image_supported(device, vk_format, width, height, usage, required, modifier)?;
+
         let image = create_image(device, vk_format, width, height, usage, modifier)?;
 
         let requirements = unsafe { device.device().get_image_memory_requirements(image) };
-        let memory_type_index = pick_memory_type(device, requirements.memory_type_bits)?;
+        let memory_type_index = device.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
 
         let mut export = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -384,33 +467,23 @@ impl SharedBuffer {
 
     /// Clear the image to a solid `rgba`, ready to hand over — the producer's simplest render, and
     /// enough for a demo or a fixture. Single-plane RGB formats only: a multi-plane YCbCr buffer has
-    /// no one clear colour.
+    /// no one clear colour, so [`fill`](Self::fill) is the way to write one.
     ///
     /// It waits for the clear on the CPU rather than handing back an acquire fence, so the buffer is
     /// ready when this returns. A producer with real work signals a [`Fence`] from its own submission
     /// instead.
     pub fn clear(&self, device: &GpuDevice, rgba: [f32; 4]) -> Result<()> {
-        // SAFETY: the pool, queue and image belong to `device` and this value; the command buffer is
-        // freed on every path, and the fence is waited on and destroyed.
-        unsafe {
-            let allocate = vk::CommandBufferAllocateInfo::default()
-                .command_pool(device.command_pool())
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let buffers = device
-                .device()
-                .allocate_command_buffers(&allocate)
-                .map_err(|e| anyhow!("allocate a command buffer: {e:?}"))?;
-            let buffer = buffers[0];
-            let result = (|| -> Result<()> {
-                device
-                    .device()
-                    .begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())
-                    .map_err(|e| anyhow!("begin the command buffer: {e:?}"))?;
+        let image = self.image;
+        submit_once(device, |buffer| {
+            // SAFETY: `buffer` is recording, and the image belongs to `device` and this value.
+            unsafe {
                 let to_transfer = image_barrier(
-                    self.image,
+                    image,
+                    vk::ImageAspectFlags::COLOR,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ,
                 );
                 device.device().cmd_pipeline_barrier(
                     buffer,
@@ -423,7 +496,7 @@ impl SharedBuffer {
                 );
                 device.device().cmd_clear_color_image(
                     buffer,
-                    self.image,
+                    image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &vk::ClearColorValue { float32: rgba },
                     &[vk::ImageSubresourceRange {
@@ -435,9 +508,12 @@ impl SharedBuffer {
                     }],
                 );
                 let to_general = image_barrier(
-                    self.image,
+                    image,
+                    vk::ImageAspectFlags::COLOR,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ,
                 );
                 device.device().cmd_pipeline_barrier(
                     buffer,
@@ -448,33 +524,134 @@ impl SharedBuffer {
                     &[],
                     &[to_general],
                 );
-                device
-                    .device()
-                    .end_command_buffer(buffer)
-                    .map_err(|e| anyhow!("end the command buffer: {e:?}"))?;
+            }
+        })
+    }
 
-                let buffers = [buffer];
-                let submit = vk::SubmitInfo::default().command_buffers(&buffers);
-                let fence = device
-                    .device()
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .map_err(|e| anyhow!("create the clear's fence: {e:?}"))?;
-                device
-                    .device()
-                    .queue_submit(device.queue(), &[submit], fence)
-                    .map_err(|e| anyhow!("submit the clear: {e:?}"))?;
-                device
-                    .device()
-                    .wait_for_fences(&[fence], true, u64::MAX)
-                    .map_err(|e| anyhow!("wait for the clear: {e:?}"))?;
-                device.device().destroy_fence(fence, None);
-                Ok(())
-            })();
-            device
-                .device()
-                .free_command_buffers(device.command_pool(), &buffers);
-            result
+    /// Fill the image from host `planes`, ready to hand over — the producer's render for a format
+    /// [`clear`](Self::clear) cannot write, because it has no one clear colour.
+    ///
+    /// `planes` holds one slice per plane of the format, in plane order and tightly packed at each
+    /// plane's own resolution: for [`SurfaceFormatKind::nv12`], the luma plane (`width` × `height`
+    /// bytes) then the interleaved chroma (`width/2` × `height/2` × 2 bytes). A plane of the wrong
+    /// length, or a count the format does not have, is refused. Like `clear` it waits on the CPU
+    /// rather than handing back an acquire fence, so the buffer is ready when this returns.
+    pub fn fill(&self, device: &GpuDevice, planes: &[&[u8]]) -> Result<()> {
+        let geometry = plane_geometry(self.handle.format, self.handle.width, self.handle.height);
+        if geometry.is_empty() {
+            return Err(anyhow!(
+                "{:?} has no plane geometry to fill",
+                self.handle.format
+            ));
         }
+        if geometry.len() != planes.len() {
+            return Err(anyhow!(
+                "{:?} has {} planes, but {} were given",
+                self.handle.format,
+                geometry.len(),
+                planes.len(),
+            ));
+        }
+        let mut offsets = Vec::with_capacity(geometry.len());
+        let mut total = 0u64;
+        for (plane, (bytes, _, _)) in geometry.iter().enumerate() {
+            if planes[plane].len() != *bytes {
+                return Err(anyhow!(
+                    "plane {plane} is {} bytes; {:?} at {}×{} wants {bytes}",
+                    planes[plane].len(),
+                    self.handle.format,
+                    self.handle.width,
+                    self.handle.height,
+                ));
+            }
+            offsets.push(total);
+            total += *bytes as u64;
+        }
+
+        let plane_count = geometry.len();
+        // A DRM modifier image names its planes by memory plane in a *barrier* but by plane in a
+        // *copy*; the two helpers carry that split.
+        let drm = self.handle.modifier != DmaBufHandle::LINEAR;
+        let regions: Vec<vk::BufferImageCopy> = geometry
+            .iter()
+            .enumerate()
+            .map(|(plane, &(_, width, height))| {
+                vk::BufferImageCopy::default()
+                    .buffer_offset(offsets[plane])
+                    .buffer_row_length(width)
+                    .buffer_image_height(height)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: plane_aspect(plane, plane_count),
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+            })
+            .collect();
+
+        let staging = Staging::new(device, total)?;
+        staging.write(planes)?;
+        let image = self.image;
+        submit_once(device, |buffer| {
+            // SAFETY: `buffer` is recording; the image and the staging buffer are live, and the
+            // copy's offsets and extents were checked against the image above.
+            unsafe {
+                let to_transfer: Vec<_> = (0..plane_count)
+                    .map(|plane| {
+                        image_barrier(
+                            image,
+                            subresource_aspect(drm, plane, plane_count),
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::AccessFlags::empty(),
+                            vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                    })
+                    .collect();
+                device.device().cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_transfer,
+                );
+                device.device().cmd_copy_buffer_to_image(
+                    buffer,
+                    staging.buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions,
+                );
+                let to_general: Vec<_> = (0..plane_count)
+                    .map(|plane| {
+                        image_barrier(
+                            image,
+                            subresource_aspect(drm, plane, plane_count),
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::GENERAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::SHADER_READ,
+                        )
+                    })
+                    .collect();
+                device.device().cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_general,
+                );
+            }
+        })
     }
 }
 
@@ -489,7 +666,7 @@ impl Drop for SharedBuffer {
 }
 
 /// A fence signalled when the producer's work on a buffer completes — the
-/// [`DmaBufHandle::acquire_fence`](gpui::DmaBufHandle) a recycling renderer waits on.
+/// [`DmaBufHandle::acquire_fence`](gpui_engine::DmaBufHandle) a recycling renderer waits on.
 ///
 /// A producer that renders into a [`SharedBuffer`] signals this from its own submission and hands
 /// over [`sync_file`](Self::sync_file); a producer with no queue of its own (a decoder handing over a
@@ -503,8 +680,12 @@ pub struct Fence {
 impl Fence {
     /// Create an unsignalled fence.
     pub fn new(device: &GpuDevice) -> Result<Self> {
-        let fence = unsafe { device.device().create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(|e| anyhow!("create the fence: {e:?}"))?;
+        let fence = unsafe {
+            device
+                .device()
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|e| anyhow!("create the fence: {e:?}"))?;
         Ok(Self {
             device: device.device().clone(),
             external_fence_fd: ash::khr::external_fence_fd::Device::new(
@@ -547,7 +728,9 @@ impl Fence {
                     .map_err(|e| anyhow!("submit: {e:?}"))?;
                 Ok(())
             })();
-            device.device().free_command_buffers(device.command_pool(), &buffers);
+            device
+                .device()
+                .free_command_buffers(device.command_pool(), &buffers);
             result
         }
     }
@@ -629,11 +812,154 @@ fn create_image(
     image.map_err(|e| anyhow!("create the image: {e:?}"))
 }
 
-/// A full-image layout transition for a single-plane image.
+/// Record `record` into a fresh command buffer, submit it on `device`'s queue, and wait for the GPU
+/// to finish — the one-shot submission a producer renders a buffer with, so it hands over a finished
+/// buffer rather than an acquire fence.
+fn submit_once(device: &GpuDevice, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+    // SAFETY: the command buffer is allocated from the device's pool, recorded once and freed on
+    // every path; the fence is waited on and destroyed.
+    unsafe {
+        let allocate = vk::CommandBufferAllocateInfo::default()
+            .command_pool(device.command_pool())
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let buffers = device
+            .device()
+            .allocate_command_buffers(&allocate)
+            .map_err(|error| anyhow!("allocate a command buffer: {error:?}"))?;
+        let buffer = buffers[0];
+        let result = (|| -> Result<()> {
+            device
+                .device()
+                .begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())
+                .map_err(|error| anyhow!("begin the command buffer: {error:?}"))?;
+            record(buffer);
+            device
+                .device()
+                .end_command_buffer(buffer)
+                .map_err(|error| anyhow!("end the command buffer: {error:?}"))?;
+
+            let buffers = [buffer];
+            let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+            let fence = device
+                .device()
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|error| anyhow!("create the submission's fence: {error:?}"))?;
+            device
+                .device()
+                .queue_submit(device.queue(), &[submit], fence)
+                .map_err(|error| anyhow!("submit: {error:?}"))?;
+            device
+                .device()
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|error| anyhow!("wait for the submission: {error:?}"))?;
+            device.device().destroy_fence(fence, None);
+            Ok(())
+        })();
+        device
+            .device()
+            .free_command_buffers(device.command_pool(), &buffers);
+        result
+    }
+}
+
+/// A host-visible staging buffer and the memory behind it, freed together when it drops — what a
+/// [`SharedBuffer::fill`] uploads host bytes through.
+struct Staging {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: u64,
+}
+
+impl Staging {
+    /// Allocate and bind a `size`-byte buffer the fill uploads through.
+    fn new(device: &GpuDevice, size: u64) -> Result<Self> {
+        // SAFETY: the buffer is created and bound once; every error path frees what it made.
+        unsafe {
+            let buffer = device
+                .device()
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .map_err(|error| anyhow!("create the staging buffer: {error:?}"))?;
+            let requirements = device.device().get_buffer_memory_requirements(buffer);
+            let memory = match device.memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ) {
+                Ok(memory_type_index) => device
+                    .device()
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(requirements.size)
+                            .memory_type_index(memory_type_index),
+                        None,
+                    )
+                    .map_err(|error| anyhow!("allocate the staging memory: {error:?}"))?,
+                Err(error) => {
+                    device.device().destroy_buffer(buffer, None);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = device.device().bind_buffer_memory(buffer, memory, 0) {
+                device.device().free_memory(memory, None);
+                device.device().destroy_buffer(buffer, None);
+                return Err(anyhow!("bind the staging memory: {error:?}"));
+            }
+            Ok(Self {
+                device: device.device().clone(),
+                buffer,
+                memory,
+                size,
+            })
+        }
+    }
+
+    /// Copy `planes` into the buffer, back to back.
+    fn write(&self, planes: &[&[u8]]) -> Result<()> {
+        // SAFETY: the mapping covers the whole allocation and is released before returning.
+        unsafe {
+            let mapped = self
+                .device
+                .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+                .map_err(|error| anyhow!("map the staging memory: {error:?}"))?
+                as *mut u8;
+            let mut offset = 0usize;
+            for plane in planes {
+                std::ptr::copy_nonoverlapping(plane.as_ptr(), mapped.add(offset), plane.len());
+                offset += plane.len();
+            }
+            self.device.unmap_memory(self.memory);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // SAFETY: both were made by this value and are freed once.
+        unsafe {
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// A full-image layout transition of `aspect`, from `from` to `to`, ordering `src_access` before
+/// `dst_access`. `aspect` is one plane of a multi-plane image, or the colour aspect of a single one —
+/// not a memory plane, which only the layout query names.
 fn image_barrier(
     image: vk::Image,
+    aspect: vk::ImageAspectFlags,
     from: vk::ImageLayout,
     to: vk::ImageLayout,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
 ) -> vk::ImageMemoryBarrier<'static> {
     vk::ImageMemoryBarrier::default()
         .old_layout(from)
@@ -642,14 +968,41 @@ fn image_barrier(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
             layer_count: 1,
         })
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ)
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)
+}
+
+/// Create the instance [`GpuDevice::open`] runs on, carrying `VK_EXT_physical_device_drm` when the
+/// loader offers it, so [`GpuId::of`] can name the GPU's DRM render node.
+fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
+    let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
+    // SAFETY: the call reads the loader's extension list.
+    let available = unsafe { entry.enumerate_instance_extension_properties(None) }
+        .map_err(|e| anyhow!("enumerate instance extensions: {e:?}"))?;
+    let drm = CString::new(DRM_EXTENSION).expect("a literal without a NUL");
+    let names: Vec<*const c_char> = available
+        .iter()
+        .filter(|e| extension_name(&e.extension_name) == DRM_EXTENSION)
+        .map(|_| drm.as_ptr())
+        .collect();
+
+    // SAFETY: `names` points to locals that outlive the call.
+    unsafe {
+        entry
+            .create_instance(
+                &vk::InstanceCreateInfo::default()
+                    .application_info(&app)
+                    .enabled_extension_names(&names),
+                None,
+            )
+            .map_err(|e| anyhow!("create the Vulkan instance: {e:?}"))
+    }
 }
 
 /// Create a device on `physical_device`'s `queue_family_index`, with the extensions the export needs.
@@ -738,15 +1091,19 @@ fn pick_device(instance: &ash::Instance) -> Option<(vk::PhysicalDevice, u32)> {
 }
 
 /// Every DRM format modifier `format` supports, with the features each carries.
-fn supported_modifiers(device: &GpuDevice, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+fn supported_modifiers(
+    device: &GpuDevice,
+    format: vk::Format,
+) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
     // SAFETY: both calls read; the list is filled into a buffer sized from the first call's count.
     unsafe {
         let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-        let mut properties =
-            vk::FormatProperties2::default().push_next(&mut list);
-        device
-            .instance()
-            .get_physical_device_format_properties2(device.physical_device(), format, &mut properties);
+        let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+        device.instance().get_physical_device_format_properties2(
+            device.physical_device(),
+            format,
+            &mut properties,
+        );
 
         let count = list.drm_format_modifier_count as usize;
         if count == 0 {
@@ -756,29 +1113,94 @@ fn supported_modifiers(device: &GpuDevice, format: vk::Format) -> Vec<vk::DrmFor
         let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
             .drm_format_modifier_properties(&mut modifiers);
         let mut properties = vk::FormatProperties2::default().push_next(&mut list);
-        device
-            .instance()
-            .get_physical_device_format_properties2(device.physical_device(), format, &mut properties);
+        device.instance().get_physical_device_format_properties2(
+            device.physical_device(),
+            format,
+            &mut properties,
+        );
         modifiers
     }
 }
 
-/// The first memory type the image allows that is device-local.
-fn pick_memory_type(device: &GpuDevice, bits: u32) -> Result<u32> {
-    // SAFETY: the call reads the physical device's memory properties.
-    let properties = unsafe {
+/// The properties the device reports for `format` — the feature bits each tiling carries.
+fn format_properties(device: &GpuDevice, format: vk::Format) -> vk::FormatProperties {
+    // SAFETY: the call only reads; the properties are copied out.
+    unsafe {
         device
             .instance()
-            .get_physical_device_memory_properties(device.physical_device())
+            .get_physical_device_format_properties(device.physical_device(), format)
+    }
+}
+
+/// Refuse, before `vkCreateImage` would, a format the device cannot make in the chosen tiling — the
+/// feature bits that tiling carries, and the extent the device caps it at.
+///
+/// `vkCreateImage` answers an unsupported request with a bare `VK_ERROR_FORMAT_NOT_SUPPORTED`, which
+/// names neither the format nor what is missing. This names both, so a caller can pick another format
+/// or tiling instead of guessing.
+fn ensure_image_supported(
+    device: &GpuDevice,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    usage: vk::ImageUsageFlags,
+    required: vk::FormatFeatureFlags,
+    modifier: Option<u64>,
+) -> Result<()> {
+    let tiling = match modifier {
+        Some(_) => vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+        None => vk::ImageTiling::LINEAR,
     };
-    (0..properties.memory_type_count)
-        .find(|i| {
-            bits & (1u32 << i) != 0
-                && properties.memory_types[*i as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        })
-        .ok_or_else(|| anyhow!("no device-local memory type for the image"))
+    let features = match modifier {
+        None => format_properties(device, format).linear_tiling_features,
+        Some(modifier) => supported_modifiers(device, format)
+            .into_iter()
+            .find(|properties| properties.drm_format_modifier == modifier)
+            .map(|properties| properties.drm_format_modifier_tiling_features)
+            .ok_or_else(|| {
+                anyhow!("the device lists no DRM modifier {modifier:#x} for {format:?}")
+            })?,
+    };
+    if !features.contains(required) {
+        return Err(anyhow!(
+            "the device cannot make a {tiling:?} {format:?} image: it needs {required:?}, and the \
+             format carries {features:?}"
+        ));
+    }
+
+    // SAFETY: the calls only read; `info` chains a local that outlives the call.
+    let max_extent = unsafe {
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier.unwrap_or(0));
+        let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(tiling)
+            .usage(usage);
+        if modifier.is_some() {
+            info = info.push_next(&mut drm);
+        }
+        let mut properties = vk::ImageFormatProperties2::default();
+        device
+            .instance()
+            .get_physical_device_image_format_properties2(
+                device.physical_device(),
+                &info,
+                &mut properties,
+            )
+            .map_err(|error| {
+                anyhow!("ask the device for its {tiling:?} {format:?} limits: {error:?}")
+            })?;
+        properties.image_format_properties.max_extent
+    };
+    if width > max_extent.width || height > max_extent.height {
+        return Err(anyhow!(
+            "the device's {format:?} images cap at {}×{}, asked for {width}×{height}",
+            max_extent.width,
+            max_extent.height,
+        ));
+    }
+    Ok(())
 }
 
 /// The Vulkan format a [`SurfaceFormatKind`] maps to.
@@ -787,20 +1209,68 @@ fn vk_format(format: SurfaceFormatKind) -> Result<vk::Format> {
         SurfaceFormatKind::Bgra8(_) => Ok(vk::Format::B8G8R8A8_UNORM),
         SurfaceFormatKind::Rgba8(_) => Ok(vk::Format::R8G8B8A8_UNORM),
         SurfaceFormatKind::Nv12(_) => Ok(vk::Format::G8_B8R8_2PLANE_420_UNORM),
-        other => Err(anyhow!("{other:?} has no Vulkan format in the dma-buf hatch yet")),
+        other => Err(anyhow!(
+            "{other:?} has no Vulkan format in the dma-buf hatch yet"
+        )),
     }
 }
 
-/// The usage an image of `format` is made with: a YCbCr format is sampled and copied, an RGB one can
-/// also be rendered to.
-fn usage_for(format: SurfaceFormatKind) -> vk::ImageUsageFlags {
-    let base = vk::ImageUsageFlags::SAMPLED
+/// The usage the hatch makes of an image: the producer writes it with transfers ([`clear`] and
+/// [`fill`]) and the consumer samples it. No format is rendered to, so none asks for
+/// `COLOR_ATTACHMENT` — which linear tiling does not support, and which the crate offers no pipeline
+/// to use anyway.
+///
+/// [`clear`]: SharedBuffer::clear
+/// [`fill`]: SharedBuffer::fill
+fn usage_for() -> vk::ImageUsageFlags {
+    vk::ImageUsageFlags::SAMPLED
         | vk::ImageUsageFlags::TRANSFER_SRC
-        | vk::ImageUsageFlags::TRANSFER_DST;
-    if format.is_yuv() {
-        base
+        | vk::ImageUsageFlags::TRANSFER_DST
+}
+
+/// The format feature bits `usage` needs, so a capability check and the image agree on what it is
+/// made for. Transfer features are guaranteed for every format, so only sampling and colour attachment
+/// carry one.
+fn required_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureFlags {
+    let mut required = vk::FormatFeatureFlags::empty();
+    if usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        required |= vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    }
+    if usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        required |= vk::FormatFeatureFlags::COLOR_ATTACHMENT;
+    }
+    required
+}
+
+/// Each plane of `format` at `width` × `height`, as `(byte length, extent width, extent height)` in
+/// plane order — the geometry [`SharedBuffer::fill`] uploads against.
+fn plane_geometry(format: SurfaceFormatKind, width: u32, height: u32) -> Vec<(usize, u32, u32)> {
+    match format {
+        SurfaceFormatKind::Bgra8(_) | SurfaceFormatKind::Rgba8(_) => {
+            vec![((width as usize * height as usize) * 4, width, height)]
+        }
+        SurfaceFormatKind::Nv12(_) => vec![
+            (width as usize * height as usize, width, height),
+            (
+                (width as usize / 2) * (height as usize / 2) * 2,
+                width / 2,
+                height / 2,
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// The aspect a `fill`'s **copy** names for `plane`: the colour aspect for a one-plane image, else
+/// that plane's own. A barrier names a DRM image's plane by memory plane instead — see
+/// [`subresource_aspect`].
+fn plane_aspect(plane: usize, plane_count: usize) -> vk::ImageAspectFlags {
+    if plane_count == 1 {
+        vk::ImageAspectFlags::COLOR
+    } else if plane == 0 {
+        vk::ImageAspectFlags::PLANE_0
     } else {
-        base | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        vk::ImageAspectFlags::PLANE_1
     }
 }
 
@@ -853,6 +1323,23 @@ mod tests {
         assert_eq!(handle.height, 64);
     }
 
+    #[test]
+    fn a_gpu_reports_the_render_node_it_backs() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let id = device.gpu_id();
+        eprintln!("gpu: {} render node {:?}", id.name, id.render_node);
+        assert!(!id.name.is_empty(), "a Vulkan device reports a name");
+        if let Some(node) = &id.render_node {
+            assert!(
+                node.to_string_lossy().contains("renderD"),
+                "a DRM render node names a render node: {node:?}"
+            );
+        }
+    }
+
     /// A producer-opened device refuses `Tiling::Tiled`: the modifier it would pick is not known to be
     /// importable by the consumer, so the buffer is exported linear rather than risk a buffer the
     /// renderer wedges on. Real tiled coverage needs the renderer's own device —
@@ -884,9 +1371,8 @@ mod tests {
             eprintln!("skipping: no Vulkan device exports a dma-buf");
             return;
         };
-        let buffer =
-            SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::nv12(), Tiling::Linear)
-                .expect("allocate a shareable buffer");
+        let buffer = SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::nv12(), Tiling::Linear)
+            .expect("allocate a shareable buffer");
         let handle = buffer.handle();
         assert_eq!(handle.planes.len(), 2, "NV12 is two planes");
         assert!(
@@ -938,5 +1424,45 @@ mod tests {
             .expect("clear the buffer");
         // The handle is unchanged — clearing writes through the same dma-buf.
         assert_eq!(buffer.handle().planes.len(), 1);
+    }
+
+    #[test]
+    fn a_filled_nv12_buffer_is_ready_to_hand_over() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let buffer = SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::nv12(), Tiling::Linear)
+            .expect("allocate a shareable buffer");
+        // A full-resolution luma plane, then a half-resolution interleaved chroma plane.
+        let luma = vec![128u8; 64 * 64];
+        let mut chroma = vec![0u8; 32 * 32 * 2];
+        for pair in chroma.as_chunks_mut::<2>().0 {
+            pair[0] = 90;
+            pair[1] = 120;
+        }
+        buffer
+            .fill(&device, &[&luma, &chroma])
+            .expect("fill the two planes");
+        assert_eq!(buffer.handle().planes.len(), 2, "NV12 stays two planes");
+    }
+
+    #[test]
+    fn a_fill_of_the_wrong_size_is_refused() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let buffer = SharedBuffer::new(&device, 64, 64, SurfaceFormatKind::nv12(), Tiling::Linear)
+            .expect("allocate a shareable buffer");
+        let luma = vec![0u8; 64 * 64];
+        let short_chroma = vec![0u8; 16];
+        let error = buffer
+            .fill(&device, &[&luma, &short_chroma])
+            .expect_err("a chroma plane of the wrong length is refused");
+        assert!(
+            error.to_string().contains("plane 1"),
+            "the error should name the plane: {error}"
+        );
     }
 }

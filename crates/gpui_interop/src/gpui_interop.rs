@@ -10,7 +10,7 @@
 //! # The shape of the bridge
 //!
 //! [`attach`] takes the device a `gpu_canvas` callback lends
-//! ([`gpui::GpuCanvasContext::device`]) and yields an [`Interop`], or [`Unavailable`] when the
+//! (`GpuCanvasContext::device`) and yields an [`Interop`], or [`Unavailable`] when the
 //! canvas lent no device — an offscreen or foreign renderer. It is called inside the canvas, not
 //! before a frame is painted: the window's renderer, and so its device, does not exist until then.
 //! From there:
@@ -64,7 +64,7 @@ mod windows;
 
 pub use adapter::{Adapter, Unavailable};
 #[cfg(target_os = "linux")]
-pub use linux::{Fence, GpuDevice, SharedBuffer, Tiling};
+pub use linux::{Fence, GpuDevice, GpuId, SharedBuffer, Tiling, gpu_id, remember};
 #[cfg(target_os = "windows")]
 pub use windows::{Fence, SharedSurface};
 
@@ -81,7 +81,9 @@ use std::rc::Rc;
 /// renderer — so this is a recoverable error rather than a panic.
 pub fn attach<D: 'static>(device: Option<D>) -> Result<Interop, Unavailable> {
     let device = device.ok_or(Unavailable::NoDevice)?;
-    Ok(Interop { device: Rc::new(device) })
+    Ok(Interop {
+        device: Rc::new(device),
+    })
 }
 
 /// A window's renderer, as a producer sees it.

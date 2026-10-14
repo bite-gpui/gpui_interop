@@ -36,15 +36,19 @@ wgpu = ["dep:wgpu"]
 # bundle. A feature and not a dev-dependency's `features`, because a dev-dependency's features apply
 # to every test build: without the split, `cargo test` would compile the whole platform stack -- and
 # need its system graphics libraries -- for a crate whose own code uses none of it.
-example = ["wgpu", "gpui/platform"]
+example = ["dep:gpui", "wgpu", "gpui/platform"]
 # The read-back test (`tests/linux_dmabuf_readback.rs`) drives a real offscreen window and builds its
 # buffers on the renderer's device through `Adapter::gpu_device`, so it needs the platform bundle,
 # `gpui/test-support`'s headless harness, and the `wgpu` bridge. Kept apart from `example` so neither
 # turns the other on, and so the ordinary `cargo test` builds neither.
-readback-test = ["wgpu", "gpui/platform", "gpui/test-support"]
+readback-test = ["dep:gpui", "wgpu", "gpui/platform", "gpui/test-support"]
 
 [dependencies]
-gpui.workspace = true
+# The facade is named only by the example and the read-back test, whose windows are its; the library
+# itself names the engine's payload types. Optional, so a producer that depends on this crate — a
+# decoder, a capture pipeline — does not inherit the authoring/runtime/platform stack the facade
+# carries.
+gpui = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 
 [build-dependencies]
@@ -55,6 +59,9 @@ wgpu = { workspace = true, optional = true }
 embed-resource = "3.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# The payload types a dma-buf producer names (`DmaBufHandle`, `DmaBufPlane`, `SurfaceFormatKind`) live
+# in the engine, so the library depends on it rather than the facade.
+gpui_engine.workspace = true
 # The Linux transport exports a shareable image as a dma-buf through Vulkan's external-memory
 # extensions. `gpui_va`'s VA-API export is its own path and does not use this.
 ash = "0.38"
