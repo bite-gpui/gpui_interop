@@ -356,7 +356,7 @@ mod demo {
             .flex()
             .flex_col()
             .gap_1()
-            .p_4()
+            .p_3()
             .rounded_lg()
             .bg(rgba(0x0a0a0fdd))
             .border_1()
@@ -371,19 +371,16 @@ mod demo {
                 div()
                     .text_sm()
                     .text_color(rgb(0xa8a8b2))
-                    .max_w(px(300.))
+                    .max_w(px(240.))
                     .child(
-                        "Drag the viewport to turn the cube — rendered by a producer that owns its \
-                         device, handed over as a dma-buf, no CPU copy. The frame is transparent, so \
-                         the tiles beneath it show through and the cube clips over them. The canvas \
-                         claims the pointer only where the cube is, so the tiles take hover and clicks \
-                         in the gaps; scroll to zoom the cube down and click one.",
+                        "Drag to turn the cube; scroll to zoom. Where the cube is not, the transparent \
+                         frame hands clicks to the tiles behind.",
                     ),
             )
             .child(div().text_xs().text_color(rgb(0x6f8fbf)).child(status))
             .child(div().text_xs().text_color(rgb(0x8fb7ff)).child(match picked {
-                Some(label) => format!("clicked through the surface: {label}"),
-                None => "no tile clicked yet".to_owned(),
+                Some(label) => format!("clicked through: {label}"),
+                None => "click a tile in the gap".to_owned(),
             }))
             .into_any_element()
     }
