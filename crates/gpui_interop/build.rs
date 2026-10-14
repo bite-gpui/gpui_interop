@@ -17,9 +17,12 @@ fn main() {
         "cargo:rerun-if-changed={}",
         resource_dir.join("gpui_interop.manifest.xml").display()
     );
-    embed_resource::compile_for_everything(rc_file, embed_resource::ParamsIncludeDirs([resource_dir]))
-        .manifest_required()
-        .unwrap();
+    embed_resource::compile_for_everything(
+        rc_file,
+        embed_resource::ParamsIncludeDirs([resource_dir]),
+    )
+    .manifest_required()
+    .unwrap();
 }
 
 #[cfg(not(windows))]
