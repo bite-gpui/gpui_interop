@@ -138,6 +138,16 @@ pub struct GpuDevice {
     command_pool: vk::CommandPool,
 }
 
+/// Serialises the Vulkan loader's **global** entry points, which only [`GpuDevice::open`] calls.
+///
+/// `vkEnumerateInstanceExtensionProperties` and its siblings are instance-independent: the loader scans
+/// and initialises the installed ICDs on the first call, and that scan is not safe to run from two
+/// threads at once. A parallel test run — several `open()`s at the same instant — has been seen to crash
+/// inside the loader on a null callee, at exactly that first call. Holding a process-wide lock across
+/// the load and the enumeration makes the first use single-threaded, which is all the loader needs;
+/// the renderer-bound [`GpuDevice::on`] creates no instance and takes no lock.
+static LOADER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl GpuDevice {
     /// Open a device that can export a dma-buf, or an error if none on this machine can.
     ///
@@ -145,6 +155,12 @@ impl GpuDevice {
     /// refused on it and the buffer is exported linear, with a warning. Borrow the renderer's device
     /// with `Adapter::gpu_device` when there is one to borrow from.
     pub fn open() -> Result<Self> {
+        // See `LOADER`: the loader's global entry points are not safe to initialise concurrently, and
+        // this is the only path that reaches them.
+        let _loading = LOADER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let entry = unsafe { ash::Entry::load() }.map_err(|e| anyhow!("load libvulkan: {e}"))?;
         let instance = create_instance(&entry)?;
 
@@ -689,10 +705,12 @@ impl SharedBuffer {
 
 impl Drop for SharedBuffer {
     fn drop(&mut self) {
-        // SAFETY: both were created by this value and are destroyed once, in the order Vulkan needs.
+        // SAFETY: both were created by this value and are destroyed once, in the order Vulkan needs —
+        // the image before the memory bound to it, since `vkFreeMemory` requires the memory no longer
+        // be bound to any image.
         unsafe {
-            self.device.free_memory(self.memory, None);
             self.device.destroy_image(self.image, None);
+            self.device.free_memory(self.memory, None);
         }
     }
 }
