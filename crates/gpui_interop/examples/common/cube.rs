@@ -55,6 +55,15 @@ pub const OPAQUE: [f32; 4] = [0.055, 0.06, 0.08, 1.0];
 /// mean anything, which the `surfaces` pipeline does under the window's alpha mode.
 pub const TRANSPARENT: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
+/// Where the eye sits from the cube's centre, in world units, before anything zooms. At this distance
+/// the cube fills a little under half the viewport.
+const DEFAULT_DISTANCE: f32 = 5.0;
+
+/// How near and how far the eye may be pushed. Near enough that the cube fills the viewport; far
+/// enough that it is a small thing in the middle of one, which is what shows the layer behind it.
+const MIN_DISTANCE: f32 = 2.5;
+const MAX_DISTANCE: f32 = 12.0;
+
 /// The depth format. A depth-stencil attachment the cube tests against, and which every Vulkan
 /// implementation this example targets can make.
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -107,6 +116,9 @@ pub struct Cube {
     /// The colour each frame is cleared to before the cube is drawn: [`OPAQUE`] for the surface's own
     /// backdrop, [`TRANSPARENT`] to let what is behind it show through.
     background: [f32; 4],
+    /// The eye's distance from the cube's centre, in world units. Larger is a smaller cube — this is
+    /// the zoom.
+    distance: f32,
     /// How far the cube has turned about Y, in radians.
     yaw: f32,
     /// How far it has turned about X, in radians.
@@ -146,6 +158,7 @@ impl Cube {
             device,
             gpu: name,
             background,
+            distance: DEFAULT_DISTANCE,
             yaw: 0.0,
             pitch: 0.0,
             last: None,
@@ -160,10 +173,17 @@ impl Cube {
         self.pitch += pitch;
     }
 
-    /// Return the cube to its starting orientation.
+    /// Return the cube to its starting orientation and distance.
     pub fn reset(&mut self) {
         self.yaw = 0.0;
         self.pitch = 0.0;
+        self.distance = DEFAULT_DISTANCE;
+    }
+
+    /// Zoom: move the eye `factor` times as far from the cube, so a factor below one brings it nearer
+    /// and makes the cube larger. Clamped to the range the projection stays sane over.
+    pub fn zoom(&mut self, factor: f32) {
+        self.distance = (self.distance * factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
     /// The GPU the cube was built on, in Vulkan's name for it.
@@ -237,10 +257,11 @@ impl Cube {
     }
 
     /// The cube's model-view-projection. The projection is the y-up, zero-to-one-depth one a `wgpu`
-    /// shader is written against; `naga` flips Y for Vulkan, so the cube is upright.
+    /// shader is written against; `naga` flips Y for Vulkan, so the cube is upright. The eye looks at
+    /// the origin from `distance` away, which is what the zoom moves.
     fn mvp(&self) -> [f32; 16] {
         let projection = perspective_rh(45f32.to_radians(), 1.0, 0.1, 100.0);
-        let view = look_at_rh([0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let view = look_at_rh([0.0, 0.0, self.distance], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
         let model = mul(&rotation_y(self.yaw), &rotation_x(self.pitch));
         mul(&projection, &mul(&view, &model))
     }

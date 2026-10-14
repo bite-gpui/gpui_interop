@@ -7,7 +7,8 @@
 //! The window is a 3D viewport — a cube a producer renders with its own Vulkan pipeline and hands over
 //! as a dma-buf, no CPU copy — with GPUI drawn **both under and over** it. Beneath the viewport sits a
 //! row of button-shaped tiles, which the transparent frame lets through and the cube clips; over it sit
-//! a panel of text and a bar of real buttons. Drag the viewport to turn the cube, or press a button.
+//! a panel of text and a bar of real buttons. Drag the viewport to turn the cube, scroll to zoom it,
+//! or press a button.
 //!
 //! # The producer sees no GPUI
 //!
@@ -16,7 +17,9 @@
 //! factor alongside, and its `SurfaceEvent` is the crate's vocabulary rather than GPUI's. A drag starts
 //! on the viewport, which founds the gateway's own drag, so the cube keeps turning while the pointer is
 //! off past the edge — and because the gateway refreshes the window after each event, the producer only
-//! has to change its own state.
+//! has to change its own state. Not every event takes that road: the wheel, which zooms the cube, is the
+//! demo's own `on_scroll_wheel`, because the gateway's vocabulary carries no scroll yet and the zoom is
+//! the view's rather than the producer's.
 //!
 //! # Three layers, and why the frame is transparent
 //!
@@ -70,12 +73,19 @@ mod demo {
     use std::rc::Rc;
 
     use gpui::{
-        AnyElement, App, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowOptions,
-        div, gpu_canvas, prelude::*, px, rgb, rgba, size,
+        AnyElement, App, Bounds, Context, IntoElement, Render, ScrollDelta, Window, WindowBounds,
+        WindowOptions, div, gpu_canvas, prelude::*, px, rgb, rgba, size,
     };
     use gpui_interop::{SurfaceEvent, SurfaceInput, SurfacePoint, surface_input};
 
     use crate::cube::{Cube, TRANSPARENT};
+
+    /// How far the eye moves per notch of the wheel, as a factor: below one brings the cube nearer and
+    /// makes it larger. Geometric, so a notch feels the same wherever the zoom is.
+    const ZOOM_PER_NOTCH: f32 = 0.9;
+
+    /// What a line of wheel notches is taken to be, for a mouse that reports pixels instead.
+    const PIXELS_PER_LINE: f32 = 40.0;
 
     /// The edge the producer renders at. The viewport is a square as tall as the window, so at a typical
     /// window height this is within a whisker of one texel a pixel.
@@ -195,6 +205,7 @@ mod demo {
         spinning: Rc<Cell<bool>>,
     ) -> AnyElement {
         let drawing = cube.clone();
+        let zooming = cube.clone();
         let surface = gpu_canvas(move |gpu| {
             let mut cube = drawing.borrow_mut();
             if cube.is_none() {
@@ -214,6 +225,23 @@ mod demo {
             if let Some(handle) = cube.frame() {
                 gpu.paint_surface(handle);
             }
+        })
+        // The wheel zooms the *cube*, so it is the demo's own gpui handler and not the gateway's: the
+        // gateway's vocabulary carries no scroll yet, and the zoom is the view's rather than the
+        // producer's. One notch moves the eye by a fixed proportion, so zooming out to see the layer
+        // behind the cube and zooming back in feel the same at either end.
+        .on_scroll_wheel(move |event, window, _cx| {
+            let notches = match event.delta {
+                ScrollDelta::Lines(lines) => lines.y,
+                ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / PIXELS_PER_LINE,
+            };
+            let mut cube = zooming.borrow_mut();
+            let Some(cube) = cube.as_mut() else {
+                // Nothing to zoom before the first paint has built the cube.
+                return;
+            };
+            cube.zoom(ZOOM_PER_NOTCH.powf(notches));
+            window.refresh();
         })
         // No background of its own: the surface is composited over the layer beneath it, and where
         // the producer left the frame transparent that layer shows through.
@@ -317,7 +345,8 @@ mod demo {
                     .child(
                         "Drag the viewport to turn the cube — rendered by a producer that owns its \
                          device, handed over as a dma-buf, no CPU copy. The frame is transparent, so \
-                         the tiles beneath it show through and the cube clips over them.",
+                         the tiles beneath it show through and the cube clips over them; scroll to \
+                         zoom the cube down and see more of them.",
                     ),
             )
             .child(div().text_xs().text_color(rgb(0x6f8fbf)).child(status))
