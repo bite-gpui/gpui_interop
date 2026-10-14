@@ -124,6 +124,9 @@ mod demo {
         /// Whether the cube turns on its own, toggled by the bar's button. Shared with the paint
         /// callback, which is what turns it.
         spinning: Rc<Cell<bool>>,
+        /// The tile of the layer under the cube last clicked — proof that a click on a transparent
+        /// pixel reaches what the surface is drawn over.
+        picked: Rc<Cell<Option<&'static str>>>,
         /// How many frames have been requested: a couple to build the cube (or give up), and one per
         /// delivered input, which the gateway asks for itself.
         requested: u32,
@@ -137,6 +140,7 @@ mod demo {
                 last: Rc::new(Cell::new(None)),
                 grab: Rc::new(Cell::new(false)),
                 spinning: Rc::new(Cell::new(false)),
+                picked: Rc::new(Cell::new(None)),
                 requested: 0,
             }
         }
@@ -182,15 +186,21 @@ mod demo {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(div().h_full().aspect_square().child(under()).child(canvas(
-                            self.cube.clone(),
-                            self.error.clone(),
-                            self.last.clone(),
-                            self.grab.clone(),
-                            self.spinning.clone(),
-                        ))),
+                        .child(
+                            div()
+                                .h_full()
+                                .aspect_square()
+                                .child(under(self.picked.clone()))
+                                .child(canvas(
+                                    self.cube.clone(),
+                                    self.error.clone(),
+                                    self.last.clone(),
+                                    self.grab.clone(),
+                                    self.spinning.clone(),
+                                )),
+                        ),
                 )
-                .child(panel(status))
+                .child(panel(status, self.picked.get()))
                 .child(bar(cx, self.spinning.clone()))
         }
     }
@@ -206,6 +216,7 @@ mod demo {
     ) -> AnyElement {
         let drawing = cube.clone();
         let zooming = cube.clone();
+        let covering = cube.clone();
         let surface = gpu_canvas(move |gpu| {
             let mut cube = drawing.borrow_mut();
             if cube.is_none() {
@@ -225,6 +236,16 @@ mod demo {
             if let Some(handle) = cube.frame() {
                 gpu.paint_surface(handle);
             }
+        })
+        // The canvas claims the pointer only where the cube is, so the tiles under it stay live: the
+        // hover and the click they get is the engine's hit-testing reaching past the surface. The
+        // engine and the producer ask the same predicate in the same frame — the canvas's own `0..1`,
+        // which is the frame the composited buffer is indexed by.
+        .occlude_where(move |uv| {
+            covering
+                .borrow()
+                .as_ref()
+                .is_some_and(|cube| cube.covers(uv))
         })
         // The wheel zooms the *cube*, so it is the demo's own gpui handler and not the gateway's: the
         // gateway's vocabulary carries no scroll yet, and the zoom is the view's rather than the
@@ -281,11 +302,12 @@ mod demo {
         surface_input(surface, handler).into_any_element()
     }
 
-    /// The layer the buffer is transparent over: ordinary GPUI elements the cube is seen to sit in
-    /// front of. They carry no id and no listener, so they insert no hitbox and claim nothing — the
-    /// viewport's input is untouched by them. That is the point: the surface composites *over* them and
-    /// the cube's silhouette clips them, but they are not this demo's controls. The bar is.
-    fn under() -> AnyElement {
+    /// The layer the buffer is transparent over: ordinary GPUI controls the cube is seen to sit in
+    /// front of. Each carries an id and a listener, so each inserts a hitbox and takes the pointer —
+    /// but only where the canvas declines it, which is to say where the cube is not. Over the cube the
+    /// canvas blocks, so a tile is neither hovered nor clicked; in the gaps it is, and the layer behind
+    /// the surface is live again.
+    fn under(picked: Rc<Cell<Option<&'static str>>>) -> AnyElement {
         div()
             .absolute()
             .size_full()
@@ -293,17 +315,19 @@ mod demo {
             .items_center()
             .justify_center()
             .gap_6()
-            .child(tile("Cut"))
-            .child(tile("Copy"))
-            .child(tile("Paste"))
-            .child(tile("Undo"))
-            .child(tile("Redo"))
+            .child(tile("Cut", picked.clone()))
+            .child(tile("Copy", picked.clone()))
+            .child(tile("Paste", picked.clone()))
+            .child(tile("Undo", picked.clone()))
+            .child(tile("Redo", picked))
             .into_any_element()
     }
 
-    /// A button-shaped tile of the layer under the surface.
-    fn tile(label: &'static str) -> AnyElement {
+    /// A button-shaped tile of the layer under the surface. Its id and its listener are what make it a
+    /// control: a hitbox the canvas's decline lets hit-testing through to.
+    fn tile(label: &'static str, picked: Rc<Cell<Option<&'static str>>>) -> AnyElement {
         div()
+            .id(label)
             .px_5()
             .py_3()
             .rounded_md()
@@ -312,13 +336,19 @@ mod demo {
             .border_color(rgba(0xffffff42))
             .text_sm()
             .text_color(rgb(0xe7eaf0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgba(0xffffff52)).border_color(rgb(0x8fb7ff)))
+            .on_click(move |_, window, _| {
+                picked.set(Some(label));
+                window.refresh();
+            })
             .child(label)
             .into_any_element()
     }
 
     /// A translucent panel of text, top left. It is not interactive, so a drag over it still reaches the
     /// viewport underneath — only a control should take the pointer.
-    fn panel(status: String) -> AnyElement {
+    fn panel(status: String, picked: Option<&'static str>) -> AnyElement {
         div()
             .absolute()
             .top(px(16.))
@@ -345,11 +375,16 @@ mod demo {
                     .child(
                         "Drag the viewport to turn the cube — rendered by a producer that owns its \
                          device, handed over as a dma-buf, no CPU copy. The frame is transparent, so \
-                         the tiles beneath it show through and the cube clips over them; scroll to \
-                         zoom the cube down and see more of them.",
+                         the tiles beneath it show through and the cube clips over them. The canvas \
+                         claims the pointer only where the cube is, so the tiles take hover and clicks \
+                         in the gaps; scroll to zoom the cube down and click one.",
                     ),
             )
             .child(div().text_xs().text_color(rgb(0x6f8fbf)).child(status))
+            .child(div().text_xs().text_color(rgb(0x8fb7ff)).child(match picked {
+                Some(label) => format!("clicked through the surface: {label}"),
+                None => "no tile clicked yet".to_owned(),
+            }))
             .into_any_element()
     }
 

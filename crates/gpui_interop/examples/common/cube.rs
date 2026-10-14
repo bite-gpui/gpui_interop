@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use ash::vk;
-use gpui::{DmaBufHandle, GpuCanvasContext, SurfaceFormatKind};
+use gpui::{DmaBufHandle, GpuCanvasContext, Point, SurfaceFormatKind};
 use gpui_interop::{Fence, GpuDevice, SharedBuffer, Tiling, attach};
 use gpui_wgpu::WgpuRenderer;
 
@@ -199,6 +199,45 @@ impl Cube {
     /// How many frames were skipped because no buffer was free — a drop, in the ring's terms.
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Whether `uv` — a point in the canvas's own frame, `0..1` and origin top-left — falls on the
+    /// cube's silhouette.
+    ///
+    /// A `gpu_canvas` composited over this producer's frames can hand this to
+    /// [`GpuCanvas::occlude_where`](gpui::GpuCanvas), so the canvas claims the pointer over the cube
+    /// and declines it everywhere else, and the layer drawn behind stays live in the gaps.
+    ///
+    /// The answer is the projected bounding box of the cube's eight corners — greedy at the corners,
+    /// but obviously right and cheap, and it reads nothing the producer has not already computed. The
+    /// cube is centred on its own origin and the projection is symmetric, so the box stays centred as
+    /// the cube turns and shrinks as the eye pulls back, which is when the layer behind shows through.
+    pub fn covers(&self, uv: Point<f32>) -> bool {
+        let mvp = self.mvp();
+        let (mut min_u, mut min_v) = (f32::INFINITY, f32::INFINITY);
+        let (mut max_u, mut max_v) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for x in [-1.0f32, 1.0] {
+            for y in [-1.0f32, 1.0] {
+                for z in [-1.0f32, 1.0] {
+                    let clip = transform(&mvp, [x, y, z, 1.0]);
+                    // The eye never enters the cube over the zoom's range, so every corner is in
+                    // front of it; a guard keeps a future change from turning that into a NaN.
+                    if clip[3] <= 0.0 {
+                        continue;
+                    }
+                    // The projection is the y-up one a wgpu shader is written against, and the canvas's
+                    // frame has y down; `naga` flips y for Vulkan on the way out, which is why the
+                    // rendered image agrees with this.
+                    let u = (clip[0] / clip[3] + 1.0) * 0.5;
+                    let v = (1.0 - clip[1] / clip[3]) * 0.5;
+                    min_u = min_u.min(u);
+                    max_u = max_u.max(u);
+                    min_v = min_v.min(v);
+                    max_v = max_v.max(v);
+                }
+            }
+        }
+        (min_u..=max_u).contains(&uv.x) && (min_v..=max_v).contains(&uv.y)
     }
 
     /// Render the next frame of the cube, at its current orientation, into a free buffer and return
@@ -1180,6 +1219,15 @@ fn mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
             }
             out[column * 4 + row] = sum;
         }
+    }
+    out
+}
+
+/// A column-major 4×4 matrix applied to a column vector.
+fn transform(m: &[f32; 16], v: [f32; 4]) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for row in 0..4 {
+        out[row] = (0..4).map(|k| m[k * 4 + row] * v[k]).sum();
     }
     out
 }
