@@ -55,6 +55,8 @@
 
 mod adapter;
 mod guest;
+#[cfg(feature = "gpui")]
+mod input;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -63,6 +65,10 @@ mod macos;
 mod windows;
 
 pub use adapter::{Adapter, Unavailable};
+#[cfg(feature = "gpui")]
+pub use input::{
+    SurfaceButton, SurfaceEvent, SurfaceInput, SurfaceModifiers, SurfacePoint, surface_input,
+};
 #[cfg(target_os = "linux")]
 pub use linux::{Fence, GpuDevice, GpuId, SharedBuffer, Tiling, gpu_id, remember};
 #[cfg(target_os = "windows")]

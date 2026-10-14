@@ -28,6 +28,13 @@ name = "interop_cube"
 path = "examples/interop_cube.rs"
 required-features = ["example"]
 
+# The input example: the same cube, but turned by dragging rather than by a clock, through the input
+# gateway. A second example rather than a mode of the first, because the point here is the events.
+[[example]]
+name = "interop_cube_drag"
+path = "examples/interop_cube_drag.rs"
+required-features = ["example"]
+
 # The read-back test needs the facade's platform bundle and `test-support` (its own feature), and
 # builds its buffers on the renderer's device through `Adapter::gpu_device`, so it is opt-in and its
 # own feature. Unlike the example it needs no display, but it does drive a window.
@@ -36,20 +43,39 @@ name = "linux_dmabuf_readback"
 path = "tests/linux_dmabuf_readback.rs"
 required-features = ["readback-test"]
 
+# The input gateway's test drives a headless window and simulates pointer input through the normal
+# dispatch path, so it needs the facade's `test-support` harness -- but no GPU and no platform
+# backend, unlike the read-back test. Its own feature for the same reason: `cargo test` should not
+# build the harness for a crate that does not use it.
+[[test]]
+name = "surface_input"
+path = "tests/surface_input.rs"
+required-features = ["input-test"]
+
 [features]
 default = []
 # The cross-API bridge: the wgpu side of a producer's device, and the transports it moves.
 wgpu = ["dep:wgpu"]
-# The Linux example opens a window with the wgpu renderer, so it turns on the facade's platform
-# bundle. A feature and not a dev-dependency's `features`, because a dev-dependency's features apply
-# to every test build: without the split, `cargo test` would compile the whole platform stack -- and
-# need its system graphics libraries -- for a crate whose own code uses none of it.
-example = ["dep:gpui", "wgpu", "gpui/platform"]
+# The facade. The input gateway is the element side of a surface — it subscribes GPUI's pointer
+# handlers and adapts them for a producer — so it names GPUI's element traits and events, and nothing
+# below the facade. Kept separate from `example` so the gateway is a library API, not an
+# example-only one; a producer that wants it (and not the windowing stack) turns on just this.
+gpui = ["dep:gpui"]
+# The Linux examples open a window with the wgpu renderer, so they turn on the facade's platform
+# bundle, on top of the gateway's own facade dependency. A feature and not a dev-dependency's
+# `features`, because a dev-dependency's features apply to every test build: without the split,
+# `cargo test` would compile the whole platform stack -- and need its system graphics libraries -- for
+# a crate whose own code uses none of it.
+example = ["gpui", "wgpu", "gpui/platform"]
 # The read-back test (`tests/linux_dmabuf_readback.rs`) drives a real offscreen window and builds its
 # buffers on the renderer's device through `Adapter::gpu_device`, so it needs the platform bundle,
 # `gpui/test-support`'s headless harness, and the `wgpu` bridge. Kept apart from `example` so neither
 # turns the other on, and so the ordinary `cargo test` builds neither.
-readback-test = ["dep:gpui", "wgpu", "gpui/platform", "gpui/test-support"]
+readback-test = ["gpui", "wgpu", "gpui/platform", "gpui/test-support"]
+# The input gateway's test (`tests/surface_input.rs`) drives a headless window and simulates pointer
+# input, so it needs "test-support"'s harness — and the gateway's own facade dependency, but neither
+# the platform bundle nor a GPU. Kept on its own so the ordinary `cargo test` builds none of it.
+input-test = ["gpui", "gpui/test-support"]
 
 [dependencies]
 # The facade is named only by the example and the read-back test, whose windows are its; the library
