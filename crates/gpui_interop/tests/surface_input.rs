@@ -528,3 +528,68 @@ fn a_drag_from_the_surface_keeps_arriving_over_a_control(cx: &mut TestAppContext
     );
     assert_eq!(clicks.get(), 0, "and the button did not get the drag");
 }
+
+/// A view with the surface **over** a control: the control is painted first, so the surface is in front
+/// of it, and nothing occludes.
+struct Behind {
+    events: Rc<RefCell<Vec<SurfaceEvent>>>,
+    clicks: Rc<Cell<usize>>,
+}
+
+impl Render for Behind {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let events = self.events.clone();
+        let clicks = self.clicks.clone();
+        div()
+            .relative()
+            .size_full()
+            // The control, painted first — so the surface at the end is in front of it.
+            .child(
+                div()
+                    .id("under-the-surface")
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(100.))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+            )
+            // The surface over it. `surface_input` subscribes to pointer events; it does not `occlude`,
+            // so the control's rectangle is not taken from it.
+            .child(surface_input(div().size_full(), move |input| {
+                events.borrow_mut().push(input.event)
+            }))
+    }
+}
+
+#[gpui::test]
+fn a_control_under_the_surface_still_gets_the_click(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let clicks = Rc::new(Cell::new(0));
+    let (events_for_view, clicks_for_view) = (events.clone(), clicks.clone());
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Behind {
+        events: events_for_view,
+        clicks: clicks_for_view,
+    }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A click over the control, which sits *under* the surface's rectangle. Hit-testing collects both
+    // hitboxes and, nothing blocking, treats both as hovered — so the click is the control's as well as
+    // the surface's, with no pixel test in between.
+    cx.simulate_click(point(px(100.), px(50.)), Modifiers::none());
+
+    assert_eq!(
+        clicks.get(),
+        1,
+        "the control under the surface is hovered too, because the surface does not occlude",
+    );
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, SurfaceEvent::PointerDown { .. })),
+        "and the surface sees the same click: {:?}",
+        events.borrow(),
+    );
+}
