@@ -20,6 +20,14 @@ name = "interop_linux"
 path = "examples/interop_linux.rs"
 required-features = ["example"]
 
+# The foreign-viewport example: a producer that owns its device renders a spinning cube into a
+# `SharedBuffer` with its own Vulkan pipeline and hands the frame over, no CPU copy. The `example`
+# feature again, since it too opens a wgpu window and reaches the renderer's device through `attach`.
+[[example]]
+name = "interop_cube"
+path = "examples/interop_cube.rs"
+required-features = ["example"]
+
 # The read-back test needs the facade's platform bundle and `test-support` (its own feature), and
 # builds its buffers on the renderer's device through `Adapter::gpu_device`, so it is opt-in and its
 # own feature. Unlike the example it needs no display, but it does drive a window.
@@ -90,3 +98,10 @@ gpui_windows.workspace = true
 # `gpui/test-support`'s platform stack (the read-back test's own feature turns that on). A
 # dev-dependency on purpose: the library names neither, so its graph stays free of the renderer crate.
 gpui_wgpu = { workspace = true, features = ["headless"] }
+# The cube example compiles its WGSL to SPIR-V at run time with `naga` -- the frontend and backend
+# `wgpu` itself uses -- so the demo needs no offline shader compiler (`glslc`, `glslangValidator`).
+# Dev-dependencies: only the example names a shader, and the shared `naga` picks the features up.
+naga = { version = "29.0.4", features = ["wgsl-in", "spv-out"] }
+# The cube example's zero-copy ring waits on the consumer's `eventfd` release with a non-blocking
+# `poll`, and makes that descriptor itself; `gpui_va` recycles its frames with the same two calls.
+libc = "0.2"

@@ -216,7 +216,9 @@ impl GpuDevice {
         })
     }
 
-    fn device(&self) -> &ash::Device {
+    /// The Vulkan device a producer builds its pipelines on and submits to — the renderer's own GPU,
+    /// a second logical device on it so the producer's queue never races the renderer's.
+    pub fn device(&self) -> &ash::Device {
         &self.device
     }
 
@@ -236,7 +238,8 @@ impl GpuDevice {
         &self.drm_format_modifier
     }
 
-    fn queue(&self) -> vk::Queue {
+    /// The queue [`device`](Self::device) submits on.
+    pub fn queue(&self) -> vk::Queue {
         self.queue
     }
 
@@ -244,8 +247,8 @@ impl GpuDevice {
         self.command_pool
     }
 
-    #[allow(dead_code, reason = "the fence path does not read it yet")]
-    fn queue_family_index(&self) -> u32 {
+    /// The queue family [`queue`](Self::queue) belongs to.
+    pub fn queue_family_index(&self) -> u32 {
         self.queue_family_index
     }
 
@@ -264,8 +267,9 @@ impl GpuDevice {
         GpuId::of(&self.instance, self.physical_device)
     }
 
-    /// The first memory type the image allows that carries every flag in `required`.
-    fn memory_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
+    /// The first memory type the image allows that carries every flag in `required` — for a producer
+    /// allocating its own buffers and attachments on this device.
+    pub fn memory_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
         // SAFETY: the call reads the physical device's memory properties.
         let properties = unsafe {
             self.instance
@@ -329,9 +333,37 @@ impl SharedBuffer {
         format: SurfaceFormatKind,
         tiling: Tiling,
     ) -> Result<Self> {
+        Self::allocate(device, width, height, format, tiling, false)
+    }
+
+    /// Allocate a shareable image a producer **renders into** — [`new`](Self::new) with
+    /// `COLOR_ATTACHMENT` added, which a pipeline needs and a linear image cannot carry.
+    ///
+    /// Because linear tiling cannot be rendered to, a rendered buffer must be [`Tiling::Tiled`]; where
+    /// the device offers no importable modifier this is refused rather than falling back to a linear
+    /// image that cannot be drawn into.
+    pub fn render_target(
+        device: &GpuDevice,
+        width: u32,
+        height: u32,
+        format: SurfaceFormatKind,
+        tiling: Tiling,
+    ) -> Result<Self> {
+        Self::allocate(device, width, height, format, tiling, true)
+    }
+
+    /// Allocate the shareable image; `rendered` adds `COLOR_ATTACHMENT` to the usage.
+    fn allocate(
+        device: &GpuDevice,
+        width: u32,
+        height: u32,
+        format: SurfaceFormatKind,
+        tiling: Tiling,
+        rendered: bool,
+    ) -> Result<Self> {
         let vk_format = vk_format(format)?;
         let plane_count = format.plane_count();
-        let usage = usage_for();
+        let usage = usage_for(rendered);
         let required = required_features(usage);
         let modifier = match tiling {
             Tiling::Linear => None,
@@ -1216,16 +1248,20 @@ fn vk_format(format: SurfaceFormatKind) -> Result<vk::Format> {
 }
 
 /// The usage the hatch makes of an image: the producer writes it with transfers ([`clear`] and
-/// [`fill`]) and the consumer samples it. No format is rendered to, so none asks for
-/// `COLOR_ATTACHMENT` — which linear tiling does not support, and which the crate offers no pipeline
-/// to use anyway.
+/// [`fill`]) and the consumer samples it. `rendered` adds `COLOR_ATTACHMENT`, which only
+/// [`SharedBuffer::render_target`] asks for — a linear image cannot carry it, so the check refuses one.
 ///
 /// [`clear`]: SharedBuffer::clear
 /// [`fill`]: SharedBuffer::fill
-fn usage_for() -> vk::ImageUsageFlags {
-    vk::ImageUsageFlags::SAMPLED
+fn usage_for(rendered: bool) -> vk::ImageUsageFlags {
+    let base = vk::ImageUsageFlags::SAMPLED
         | vk::ImageUsageFlags::TRANSFER_SRC
-        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::TRANSFER_DST;
+    if rendered {
+        base | vk::ImageUsageFlags::COLOR_ATTACHMENT
+    } else {
+        base
+    }
 }
 
 /// The format feature bits `usage` needs, so a capability check and the image agree on what it is

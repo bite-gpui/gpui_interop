@@ -2210,7 +2210,9 @@ dependencies = [
  "gpui_engine",
  "gpui_wgpu",
  "gpui_windows",
+ "libc",
  "log",
+ "naga",
  "wgpu",
  "windows 0.62.2",
 ]
