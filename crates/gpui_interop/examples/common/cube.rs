@@ -208,14 +208,17 @@ impl Cube {
     /// [`GpuCanvas::occlude_where`](gpui::GpuCanvas), so the canvas claims the pointer over the cube
     /// and declines it everywhere else, and the layer drawn behind stays live in the gaps.
     ///
-    /// The answer is the projected bounding box of the cube's eight corners — greedy at the corners,
-    /// but obviously right and cheap, and it reads nothing the producer has not already computed. The
-    /// cube is centred on its own origin and the projection is symmetric, so the box stays centred as
-    /// the cube turns and shrinks as the eye pulls back, which is when the layer behind shows through.
+    /// The answer is the convex hull of the cube's eight projected corners, which *is* the silhouette:
+    /// a cube is the convex hull of its corners, and a projection carries a convex body to the convex
+    /// hull of the projections of its corners. So it is exact — a hexagon as the cube turns, a square
+    /// when a face is square to the eye — where the axis-aligned box around the corners would also
+    /// claim the empty wedges beside it. The cube is centred on the origin and the projection is
+    /// symmetric, so the hull stays centred as the cube turns and shrinks as the eye pulls back, which
+    /// is when the layer behind shows through.
     pub fn covers(&self, uv: Point<f32>) -> bool {
         let mvp = self.mvp();
-        let (mut min_u, mut min_v) = (f32::INFINITY, f32::INFINITY);
-        let (mut max_u, mut max_v) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let mut corners = [Point::default(); 8];
+        let mut count = 0;
         for x in [-1.0f32, 1.0] {
             for y in [-1.0f32, 1.0] {
                 for z in [-1.0f32, 1.0] {
@@ -228,16 +231,15 @@ impl Cube {
                     // The projection is the y-up one a wgpu shader is written against, and the canvas's
                     // frame has y down; `naga` flips y for Vulkan on the way out, which is why the
                     // rendered image agrees with this.
-                    let u = (clip[0] / clip[3] + 1.0) * 0.5;
-                    let v = (1.0 - clip[1] / clip[3]) * 0.5;
-                    min_u = min_u.min(u);
-                    max_u = max_u.max(u);
-                    min_v = min_v.min(v);
-                    max_v = max_v.max(v);
+                    corners[count] = Point {
+                        x: (clip[0] / clip[3] + 1.0) * 0.5,
+                        y: (1.0 - clip[1] / clip[3]) * 0.5,
+                    };
+                    count += 1;
                 }
             }
         }
-        (min_u..=max_u).contains(&uv.x) && (min_v..=max_v).contains(&uv.y)
+        point_in_convex_hull(&convex_hull(&corners[..count]), uv)
     }
 
     /// Render the next frame of the cube, at its current orientation, into a free buffer and return
@@ -1230,6 +1232,61 @@ fn transform(m: &[f32; 16], v: [f32; 4]) -> [f32; 4] {
         out[row] = (0..4).map(|k| m[k * 4 + row] * v[k]).sum();
     }
     out
+}
+
+/// The convex hull of `points`, by Andrew's monotone chain. Fewer than three points come back
+/// unchanged; the winding follows the frame's handedness, which [`point_in_convex_hull`] does not care
+/// about.
+fn convex_hull(points: &[Point<f32>]) -> Vec<Point<f32>> {
+    let mut points = points.to_vec();
+    points.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    points.dedup();
+    if points.len() < 3 {
+        return points;
+    }
+    let turn = |o: &Point<f32>, a: &Point<f32>, b: &Point<f32>| {
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    };
+    let mut hull: Vec<Point<f32>> = Vec::with_capacity(points.len() + 1);
+    for point in &points {
+        while hull.len() >= 2 && turn(&hull[hull.len() - 2], &hull[hull.len() - 1], point) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(*point);
+    }
+    // The upper chain must not unpick the lower one, so it stops popping before the lower chain and
+    // skips the point the lower chain already ended on.
+    let lower = hull.len() + 1;
+    for point in points.iter().rev().skip(1) {
+        while hull.len() >= lower
+            && turn(&hull[hull.len() - 2], &hull[hull.len() - 1], point) <= 0.0
+        {
+            hull.pop();
+        }
+        hull.push(*point);
+    }
+    hull.pop();
+    hull
+}
+
+/// Whether `p` is inside (or on the edge of) the convex polygon `hull`, by the winding test: a point of
+/// a convex polygon lies on the same side of every edge. Fewer than three points bound no area.
+fn point_in_convex_hull(hull: &[Point<f32>], p: Point<f32>) -> bool {
+    if hull.len() < 3 {
+        return false;
+    }
+    let (mut left, mut right) = (false, false);
+    for i in 0..hull.len() {
+        let a = hull[i];
+        let b = hull[(i + 1) % hull.len()];
+        let side = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        left |= side > 0.0;
+        right |= side < 0.0;
+        if left && right {
+            return false;
+        }
+    }
+    true
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
