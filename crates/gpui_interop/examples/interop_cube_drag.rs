@@ -29,11 +29,9 @@
 //! - **The text panel claims nothing.** A plain `div` of text inserts no hitbox, so the viewport under
 //!   it is still what the pointer is over — a drag across the panel turns the cube as if the panel were
 //!   not there. A rectangle is not the same as wanting the event.
-//! - **A drag that starts on the viewport reaches the viewport** while it stays over the viewport. The
-//!   engine's pointer capture, which the gateway takes on pointer-down, is meant to keep it arriving
-//!   past the viewport's edge too — but it is keyed by a hitbox id the engine renumbers every frame, so
-//!   it does not survive a redraw, and a button in the way occludes regardless. The chrome laid over the
-//!   viewport is the demo here; the capture machinery underneath is not yet something to rely on.
+//! - **A drag that starts on the viewport keeps the pointer.** The gateway captures it on pointer-down,
+//!   so the cube keeps turning even when the drag passes *under* the panel or the bar, and the buttons
+//!   under it do not fire.
 //!
 //! `interop_cube` is the same cube turned on a clock instead; see the crate's `input` module for what
 //! the gateway adapts and what it deliberately leaves to the engine.

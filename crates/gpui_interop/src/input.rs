@@ -30,13 +30,13 @@
 //!   the engine has no "declines" signal on a hit target for the gateway to relay yet.
 //!
 //! **A gesture starts where it starts.** On pointer-down the gateway captures the pointer
-//! ([`Window::capture_pointer`]) — the engine's mechanism for keeping a drag arriving once the pointer
-//! leaves the element's bounds — and the engine releases the capture on the up. Two things about that
-//! capture are the engine's and worth knowing before relying on it: it is keyed by a hitbox **id**, and
-//! the engine numbers a frame's hitboxes afresh, so a capture does not survive a redraw; and an element
-//! that **occludes** the surface ([`InteractiveElement::occlude`]) takes the events over its rectangle
-//! whether or not the surface has captured. Over anything that does not occlude, the gesture arrives as
-//! the rule says.
+//! ([`Window::capture_pointer`]), so the surface keeps receiving moves and the up *even once the pointer
+//! has left its bounds* — over another element, or out of the window's content — and the engine releases
+//! the capture on the up. The capture is keyed by a hitbox **id**, which the engine numbers by the order
+//! a frame inserted them, so an element's id is stable while the tree is; that is what lets the capture
+//! outlive the redraws a drag causes. An overlay that **occludes**
+//! ([`InteractiveElement::occlude`]) owns the events over its own rectangle before a gesture begins —
+//! but once the surface has captured, the gesture is the surface's.
 
 use std::cell::Cell;
 use std::panic::Location;

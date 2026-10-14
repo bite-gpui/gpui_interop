@@ -243,6 +243,54 @@ fn a_control_over_the_surface_takes_its_own_events(cx: &mut TestAppContext) {
     );
 }
 
+/// A view whose surface is smaller than the window, so a drag can leave it.
+struct Bounded {
+    events: Rc<RefCell<Vec<SurfaceEvent>>>,
+}
+
+impl Render for Bounded {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let events = self.events.clone();
+        div().relative().size_full().child(surface_input(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .w(px(200.))
+                .h(px(200.)),
+            move |input| events.borrow_mut().push(input.event),
+        ))
+    }
+}
+
+#[gpui::test]
+fn a_drag_that_leaves_the_surface_keeps_arriving(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let scale = cx.update(|window, _| window.scale_factor());
+
+    // A drag that starts inside the surface and leaves it, still inside the window.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(beyond, MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerMove { pressed: Some(SurfaceButton::Left), position, .. }
+                if (position.x - beyond.x.as_f32() * scale).abs() < 0.01
+                    && (position.y - beyond.y.as_f32() * scale).abs() < 0.01
+        )),
+        "the captured drag keeps arriving past the surface's bounds: {events:?}",
+    );
+}
+
 #[gpui::test]
 fn a_drag_that_starts_on_a_control_is_not_the_surfaces(cx: &mut TestAppContext) {
     let (mut cx, events, clicks) = layered(cx);
@@ -266,4 +314,27 @@ fn a_drag_that_starts_on_a_control_is_not_the_surfaces(cx: &mut TestAppContext) 
         0,
         "nor was it a click, the pointer having left the button before the up",
     );
+}
+
+#[gpui::test]
+fn a_drag_from_the_surface_keeps_arriving_over_a_control(cx: &mut TestAppContext) {
+    let (mut cx, events, clicks) = layered(cx);
+
+    // Settle on mouse input, then drag from the surface onto the button and hold still.
+    cx.simulate_mouse_move(over_surface(), None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(over_surface(), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(over_button(), MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerMove {
+                pressed: Some(SurfaceButton::Left),
+                ..
+            }
+        )),
+        "the captured drag keeps arriving where the surface would not be hovered: {events:?}",
+    );
+    assert_eq!(clicks.get(), 0, "and the button did not get the drag");
 }
