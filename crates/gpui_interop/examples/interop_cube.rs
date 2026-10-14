@@ -39,7 +39,7 @@ mod demo {
         div, gpu_canvas, prelude::*, px, rgb, size,
     };
 
-    use crate::cube::Cube;
+    use crate::cube::{Cube, OPAQUE};
 
     /// The edge of the produced surface, in pixels, and of the canvas it lands in.
     const TILE: u32 = 320;
@@ -152,7 +152,7 @@ mod demo {
                     gpu_canvas(move |gpu| {
                         let mut cube = cube.borrow_mut();
                         if cube.is_none() {
-                            match Cube::build(gpu, TILE) {
+                            match Cube::build(gpu, TILE, OPAQUE) {
                                 Ok(built) => *cube = Some(built),
                                 Err(build) => {
                                     log::error!("interop_cube: cannot build the cube: {build:#}");

@@ -1,13 +1,13 @@
-//! `interop_cube_drag`: a foreign 3D viewport under GPUI chrome, the cube turned by dragging.
+//! `interop_cube_drag`: a foreign 3D viewport between GPUI's layers, the cube turned by dragging.
 //!
 //! ```sh
 //! cargo run -p gpui_interop --example interop_cube_drag --features example
 //! ```
 //!
 //! The window is a 3D viewport — a cube a producer renders with its own Vulkan pipeline and hands over
-//! as a dma-buf, no CPU copy — with ordinary GPUI elements **over** it: a panel of text, and a bar of
-//! buttons. Drag the viewport to turn the cube, or press a button; the two do not tread on each other,
-//! which is the point of the demo.
+//! as a dma-buf, no CPU copy — with GPUI drawn **both under and over** it. Beneath the viewport sits a
+//! row of button-shaped tiles, which the transparent frame lets through and the cube clips; over it sit
+//! a panel of text and a bar of real buttons. Drag the viewport to turn the cube, or press a button.
 //!
 //! # The producer sees no GPUI
 //!
@@ -17,6 +17,16 @@
 //! on the viewport, which founds the gateway's own drag, so the cube keeps turning while the pointer is
 //! off past the edge — and because the gateway refreshes the window after each event, the producer only
 //! has to change its own state.
+//!
+//! # Three layers, and why the frame is transparent
+//!
+//! The viewport area stacks three things. At the bottom, ordinary GPUI elements — a row of button-shaped
+//! tiles — which the surface composites *over*: the producer clears its frame to transparent
+//! (`cube::TRANSPARENT`), so only the cube's own pixels occlude them and the tiles show through
+//! everywhere the cube is not. Above them the surface, and above that the chrome, drawn over the whole
+//! window. One window therefore shows both directions at once — GPUI under the surface, GPUI over it —
+//! with the cube between the two. It is what a transparent frame buys and an opaque one cannot:
+//! `interop_cube` clears to `cube::OPAQUE` and any tiles under it would be hidden.
 //!
 //! # How the chrome and the viewport stay out of each other's way
 //!
@@ -65,7 +75,7 @@ mod demo {
     };
     use gpui_interop::{SurfaceEvent, SurfaceInput, SurfacePoint, surface_input};
 
-    use crate::cube::Cube;
+    use crate::cube::{Cube, TRANSPARENT};
 
     /// The edge the producer renders at. The viewport is a square as tall as the window, so at a typical
     /// window height this is within a whisker of one texel a pixel.
@@ -152,16 +162,17 @@ mod demo {
                 .size_full()
                 .overflow_hidden()
                 .bg(rgb(0x0b0b0f))
-                // The viewport, as large as the window's shorter side allows and square, so the
-                // producer's square buffer is not stretched. The chrome floats over the whole window,
-                // not only over the square.
+                // The viewport: a square as large as the window's shorter side allows, so the
+                // producer's square buffer is not stretched, and holding the two layers the
+                // transparency is here to show — GPUI's own elements, and the surface over them. The
+                // chrome floats over the whole window, not only over the square.
                 .child(
                     div()
                         .size_full()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(div().h_full().aspect_square().child(canvas(
+                        .child(div().h_full().aspect_square().child(under()).child(canvas(
                             self.cube.clone(),
                             self.error.clone(),
                             self.last.clone(),
@@ -187,7 +198,7 @@ mod demo {
         let surface = gpu_canvas(move |gpu| {
             let mut cube = drawing.borrow_mut();
             if cube.is_none() {
-                match Cube::build(gpu, TILE) {
+                match Cube::build(gpu, TILE, TRANSPARENT) {
                     Ok(built) => *cube = Some(built),
                     Err(build) => {
                         log::error!("interop_cube_drag: cannot build the cube: {build:#}");
@@ -204,7 +215,9 @@ mod demo {
                 gpu.paint_surface(handle);
             }
         })
-        .bg(rgb(0x121218))
+        // No background of its own: the surface is composited over the layer beneath it, and where
+        // the producer left the frame transparent that layer shows through.
+        .absolute()
         .size_full();
 
         let handler = move |input: SurfaceInput| {
@@ -240,6 +253,41 @@ mod demo {
         surface_input(surface, handler).into_any_element()
     }
 
+    /// The layer the buffer is transparent over: ordinary GPUI elements the cube is seen to sit in
+    /// front of. They carry no id and no listener, so they insert no hitbox and claim nothing — the
+    /// viewport's input is untouched by them. That is the point: the surface composites *over* them and
+    /// the cube's silhouette clips them, but they are not this demo's controls. The bar is.
+    fn under() -> AnyElement {
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_6()
+            .child(tile("Cut"))
+            .child(tile("Copy"))
+            .child(tile("Paste"))
+            .child(tile("Undo"))
+            .child(tile("Redo"))
+            .into_any_element()
+    }
+
+    /// A button-shaped tile of the layer under the surface.
+    fn tile(label: &'static str) -> AnyElement {
+        div()
+            .px_5()
+            .py_3()
+            .rounded_md()
+            .bg(rgba(0xffffff2e))
+            .border_1()
+            .border_color(rgba(0xffffff42))
+            .text_sm()
+            .text_color(rgb(0xe7eaf0))
+            .child(label)
+            .into_any_element()
+    }
+
     /// A translucent panel of text, top left. It is not interactive, so a drag over it still reaches the
     /// viewport underneath — only a control should take the pointer.
     fn panel(status: String) -> AnyElement {
@@ -268,7 +316,8 @@ mod demo {
                     .max_w(px(300.))
                     .child(
                         "Drag the viewport to turn the cube — rendered by a producer that owns its \
-                         device, handed over as a dma-buf, no CPU copy.",
+                         device, handed over as a dma-buf, no CPU copy. The frame is transparent, so \
+                         the tiles beneath it show through and the cube clips over them.",
                     ),
             )
             .child(div().text_xs().text_color(rgb(0x6f8fbf)).child(status))

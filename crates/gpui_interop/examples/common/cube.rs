@@ -46,8 +46,14 @@ const SLOTS: usize = 3;
 /// rule, so a buffer the compositor never sampled does not freeze the cube for good.
 const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// The colour the frame is cleared to before the cube is drawn — the canvas behind the cube.
-const BACKGROUND: [f32; 4] = [0.055, 0.06, 0.08, 1.0];
+/// The colour the frame is cleared to before the cube is drawn — a slate backdrop the surface owns
+/// outright, so nothing behind the viewport shows through it.
+pub const OPAQUE: [f32; 4] = [0.055, 0.06, 0.08, 1.0];
+
+/// Nothing. The frame is cleared to transparent, so what GPUI drew beneath the surface shows through
+/// it and only the cube's own pixels occlude them. The consumer has to blend the surface for this to
+/// mean anything, which the `surfaces` pipeline does under the window's alpha mode.
+pub const TRANSPARENT: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
 /// The depth format. A depth-stencil attachment the cube tests against, and which every Vulkan
 /// implementation this example targets can make.
@@ -98,6 +104,9 @@ pub struct Cube {
     device: GpuDevice,
     /// The device name, for a header that wants to name it.
     gpu: String,
+    /// The colour each frame is cleared to before the cube is drawn: [`OPAQUE`] for the surface's own
+    /// backdrop, [`TRANSPARENT`] to let what is behind it show through.
+    background: [f32; 4],
     /// How far the cube has turned about Y, in radians.
     yaw: f32,
     /// How far it has turned about X, in radians.
@@ -110,7 +119,9 @@ pub struct Cube {
 }
 
 impl Cube {
-    pub fn build(gpu: &mut GpuCanvasContext, size: u32) -> Result<Self> {
+    /// Build the ring and the pipeline on `gpu`, rendering `size`×`size` frames cleared to
+    /// `background` — [`OPAQUE`] or [`TRANSPARENT`].
+    pub fn build(gpu: &mut GpuCanvasContext, size: u32, background: [f32; 4]) -> Result<Self> {
         // The cube renders into a driver-tiled image, so it has to render on the GPU the window
         // draws on; there is no linear fallback, since a linear image cannot be a colour attachment.
         let device = attach(gpu.try_device::<WgpuRenderer>())
@@ -134,6 +145,7 @@ impl Cube {
             graphics,
             device,
             gpu: name,
+            background,
             yaw: 0.0,
             pitch: 0.0,
             last: None,
@@ -208,7 +220,7 @@ impl Cube {
         write_uniform(device, slot.uniform_memory, mvp)?;
 
         let fence = Fence::new(device)?;
-        submit_cube(device, &self.graphics, slot, fence.fence())?;
+        submit_cube(device, &self.graphics, slot, self.background, fence.fence())?;
 
         let acquire = fence.sync_file()?;
         let release =
@@ -617,6 +629,7 @@ fn submit_cube(
     device: &GpuDevice,
     graphics: &Graphics,
     slot: &mut Slot,
+    background: [f32; 4],
     fence: vk::Fence,
 ) -> Result<()> {
     let raw = device.device();
@@ -629,7 +642,7 @@ fn submit_cube(
         let clears = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: BACKGROUND,
+                    float32: background,
                 },
             },
             vk::ClearValue {
