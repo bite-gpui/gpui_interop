@@ -14,9 +14,9 @@
 //! The canvas is wrapped in [`surface_input`], the input gateway, and the handler takes [`SurfaceInput`]:
 //! each event's position is in **physical pixels from the viewport's top-left corner**, with the scale
 //! factor alongside, and its `SurfaceEvent` is the crate's vocabulary rather than GPUI's. A drag starts
-//! on the viewport, which takes the pointer, so the cube keeps turning while the pointer is off past the
-//! edge — and because the gateway refreshes the window after each event, the producer only has to change
-//! its own state.
+//! on the viewport, which founds the gateway's own drag, so the cube keeps turning while the pointer is
+//! off past the edge — and because the gateway refreshes the window after each event, the producer only
+//! has to change its own state.
 //!
 //! # How the chrome and the viewport stay out of each other's way
 //!
@@ -29,9 +29,10 @@
 //! - **The text panel claims nothing.** A plain `div` of text inserts no hitbox, so the viewport under
 //!   it is still what the pointer is over — a drag across the panel turns the cube as if the panel were
 //!   not there. A rectangle is not the same as wanting the event.
-//! - **A drag that starts on the viewport keeps the pointer.** The gateway captures it on pointer-down,
-//!   so the cube keeps turning even when the drag passes *under* the panel or the bar, and the buttons
-//!   under it do not fire.
+//! - **A drag that starts on the viewport keeps arriving.** The gateway founds an engine drag on it, so
+//!   the cube keeps turning even when the drag passes *under* the panel or the bar, and the buttons
+//!   under it do not fire. The handler pairs the down and the up itself, so a gesture that merely
+//!   passes over the viewport — a drag begun on a button — does not turn it.
 //!
 //! `interop_cube` is the same cube turned on a clock instead; see the crate's `input` module for what
 //! the gateway adapts and what it deliberately leaves to the engine.
@@ -97,6 +98,9 @@ mod demo {
         /// The pointer's last surface-local position, so a move becomes the delta a drag turns by. Held
         /// across frames, since the element tree is rebuilt every render.
         last: Rc<Cell<Option<SurfacePoint>>>,
+        /// Whether the viewport's own gesture is in progress — the down it saw and has not seen the up
+        /// of. A gesture that only passes over the viewport has no down, so it does not turn the cube.
+        grab: Rc<Cell<bool>>,
         /// Whether the cube turns on its own, toggled by the bar's button. Shared with the paint
         /// callback, which is what turns it.
         spinning: Rc<Cell<bool>>,
@@ -111,6 +115,7 @@ mod demo {
                 cube: Rc::new(RefCell::new(None)),
                 error: Rc::new(RefCell::new(None)),
                 last: Rc::new(Cell::new(None)),
+                grab: Rc::new(Cell::new(false)),
                 spinning: Rc::new(Cell::new(false)),
                 requested: 0,
             }
@@ -160,6 +165,7 @@ mod demo {
                             self.cube.clone(),
                             self.error.clone(),
                             self.last.clone(),
+                            self.grab.clone(),
                             self.spinning.clone(),
                         ))),
                 )
@@ -174,6 +180,7 @@ mod demo {
         cube: Rc<RefCell<Option<Cube>>>,
         error: Rc<RefCell<Option<String>>>,
         last: Rc<Cell<Option<SurfacePoint>>>,
+        grab: Rc<Cell<bool>>,
         spinning: Rc<Cell<bool>>,
     ) -> AnyElement {
         let drawing = cube.clone();
@@ -206,21 +213,27 @@ mod demo {
                 return;
             };
             match input.event {
-                SurfaceEvent::PointerDown { position, .. } => last.set(Some(position)),
-                SurfaceEvent::PointerMove {
-                    position, pressed, ..
-                } => {
-                    let previous = last.replace(Some(position));
-                    if pressed.is_some()
-                        && let Some(previous) = previous
-                    {
+                // The gesture is the viewport's from here until the up, whether or not it has yet
+                // become a drag — the engine starts the drag only past its own threshold.
+                SurfaceEvent::PointerDown { position, .. } => {
+                    grab.set(true);
+                    last.set(Some(position));
+                }
+                // A held move *only* turns the cube when this viewport founded the gesture; a drag that
+                // merely passes over it has no down here, so it is reported and ignored.
+                SurfaceEvent::PointerMove { position, .. } if grab.get() => {
+                    if let Some(previous) = last.replace(Some(position)) {
                         cube.turn(
                             (position.x - previous.x) * SENSITIVITY,
                             (position.y - previous.y) * SENSITIVITY,
                         );
                     }
                 }
-                SurfaceEvent::PointerUp { .. } => last.set(None),
+                SurfaceEvent::PointerMove { .. } => {}
+                SurfaceEvent::PointerUp { .. } => {
+                    grab.set(false);
+                    last.set(None);
+                }
             }
         };
 

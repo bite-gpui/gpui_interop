@@ -21,7 +21,7 @@ use gpui::{
     AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext,
     VisualTestContext, Window, div, point, prelude::*, px,
 };
-use gpui_interop::{SurfaceButton, SurfaceEvent, SurfaceInput, surface_input};
+use gpui_interop::{SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, surface_input};
 
 /// The surface's edge, and the padding that insets it in the window.
 const EDGE: f32 = 50.0;
@@ -166,14 +166,15 @@ impl Render for Layered {
     }
 }
 
-/// A layered view drawn once, with the handle, the recorded events and the click count.
-fn layered(
-    cx: &mut TestAppContext,
-) -> (
+/// What [`layered`] hands back: the drawn context, the surface's events, and the button's clicks.
+type LayeredHarness = (
     VisualTestContext,
     Rc<RefCell<Vec<SurfaceEvent>>>,
     Rc<Cell<usize>>,
-) {
+);
+
+/// A layered view drawn once, with the handle, the recorded events and the click count.
+fn layered(cx: &mut TestAppContext) -> LayeredHarness {
     let events = Rc::new(RefCell::new(Vec::new()));
     let clicks = Rc::new(Cell::new(0));
     let (events_for_view, clicks_for_view) = (events.clone(), clicks.clone());
@@ -287,7 +288,196 @@ fn a_drag_that_leaves_the_surface_keeps_arriving(cx: &mut TestAppContext) {
                 if (position.x - beyond.x.as_f32() * scale).abs() < 0.01
                     && (position.y - beyond.y.as_f32() * scale).abs() < 0.01
         )),
-        "the captured drag keeps arriving past the surface's bounds: {events:?}",
+        "the surface's drag keeps arriving past its bounds: {events:?}",
+    );
+}
+
+#[gpui::test]
+fn a_drag_that_leaves_the_surface_and_returns_keeps_arriving(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let scale = cx.update(|window, _| window.scale_factor());
+
+    // Out past the surface, further out, and back in — the returns and the far moves all arrive, so a
+    // producer that reads the position sees a gesture and not a series of teleports.
+    let inside = point(px(100.), px(100.));
+    let out = point(px(300.), px(250.));
+    let further = point(px(380.), px(320.));
+    let back = point(px(150.), px(120.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(out, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(further, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(back, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(back, MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    let moved_to = |window_position: gpui::Point<gpui::Pixels>| {
+        let expected = SurfacePoint {
+            x: window_position.x.as_f32() * scale,
+            y: window_position.y.as_f32() * scale,
+        };
+        events.iter().any(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerMove { pressed: Some(SurfaceButton::Left), position, .. }
+                    if (position.x - expected.x).abs() < 0.01
+                        && (position.y - expected.y).abs() < 0.01
+            )
+        })
+    };
+    assert!(
+        moved_to(further),
+        "a far move belongs to the drag: {events:?}"
+    );
+    assert!(moved_to(back), "and so does the return: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SurfaceEvent::PointerUp { .. })),
+        "the gesture still ends with an up: {events:?}",
+    );
+}
+
+#[gpui::test]
+fn the_up_of_a_drag_that_left_the_surface_arrives(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let scale = cx.update(|window, _| window.scale_factor());
+
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(beyond, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerUp { position, button: SurfaceButton::Left, .. }
+                if (position.x - beyond.x.as_f32() * scale).abs() < 0.01
+                    && (position.y - beyond.y.as_f32() * scale).abs() < 0.01
+        )),
+        "the up lands where the pointer was, off the surface: {events:?}",
+    );
+}
+
+/// Two surfaces side by side, each named, so a drag started on one says which.
+struct Pair {
+    left: Rc<RefCell<Vec<SurfaceEvent>>>,
+    right: Rc<RefCell<Vec<SurfaceEvent>>>,
+}
+
+impl Render for Pair {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let left = self.left.clone();
+        let right = self.right.clone();
+        div()
+            .relative()
+            .size_full()
+            .child(surface_input(
+                div()
+                    .id("left")
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(100.)),
+                move |input| left.borrow_mut().push(input.event),
+            ))
+            .child(surface_input(
+                div()
+                    .id("right")
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(100.)),
+                move |input| right.borrow_mut().push(input.event),
+            ))
+    }
+}
+
+#[gpui::test]
+fn each_surface_carries_only_its_own_drag(cx: &mut TestAppContext) {
+    let left = Rc::new(RefCell::new(Vec::new()));
+    let right = Rc::new(RefCell::new(Vec::new()));
+    let (left_for_view, right_for_view) = (left.clone(), right.clone());
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Pair {
+        left: left_for_view,
+        right: right_for_view,
+    }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A drag founded on the left surface, then moved well clear of *both* — if the drag were matched
+    // by its type alone, the right surface's `on_drag_move` would report it too.
+    let inside = point(px(100.), px(50.));
+    let away = point(px(350.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(away, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        point(px(380.), px(300.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+
+    assert!(
+        left.borrow().iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerMove {
+                pressed: Some(SurfaceButton::Left),
+                ..
+            }
+        )),
+        "the left surface carries its own drag: {:?}",
+        left.borrow(),
+    );
+    assert!(
+        right.borrow().is_empty(),
+        "and the right one sees nothing of it: {:?}",
+        right.borrow(),
+    );
+}
+
+#[gpui::test]
+fn a_gesture_that_started_elsewhere_passes_over_the_surface_without_a_down(
+    cx: &mut TestAppContext,
+) {
+    let (mut cx, events, _) = layered(cx);
+
+    // The gesture begins on the button — which occludes, so the surface is not its — and passes over
+    // the surface still held. The surface sees the move, but never the down that founded it, which is
+    // how a producer tells its own gesture from one merely passing across.
+    cx.simulate_mouse_move(over_button(), None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(over_button(), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(over_surface(), MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SurfaceEvent::PointerDown { .. })),
+        "the gesture was not the surface's: {events:?}",
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerMove {
+                pressed: Some(SurfaceButton::Left),
+                ..
+            }
+        )),
+        "but its move over the surface is reported, held: {events:?}",
     );
 }
 
@@ -334,7 +524,7 @@ fn a_drag_from_the_surface_keeps_arriving_over_a_control(cx: &mut TestAppContext
                 ..
             }
         )),
-        "the captured drag keeps arriving where the surface would not be hovered: {events:?}",
+        "the surface's drag keeps arriving where the surface would not be hovered: {events:?}",
     );
     assert_eq!(clicks.get(), 0, "and the button did not get the drag");
 }

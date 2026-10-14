@@ -29,23 +29,58 @@
 //!   GPUI element under the surface's rectangle still receives it — is the producer's to answer, and
 //!   the engine has no "declines" signal on a hit target for the gateway to relay yet.
 //!
-//! **A gesture starts where it starts.** On pointer-down the gateway captures the pointer
-//! ([`Window::capture_pointer`]), so the surface keeps receiving moves and the up *even once the pointer
-//! has left its bounds* — over another element, or out of the window's content — and the engine releases
-//! the capture on the up. The capture is keyed by a hitbox **id**, which the engine numbers by the order
-//! a frame inserted them, so an element's id is stable while the tree is; that is what lets the capture
-//! outlive the redraws a drag causes. An overlay that **occludes**
-//! ([`InteractiveElement::occlude`]) owns the events over its own rectangle before a gesture begins —
-//! but once the surface has captured, the gesture is the surface's.
+//! # The gesture is the engine's drag, not a capture of our own
+//!
+//! A gesture that starts on the surface has to keep arriving once the pointer has left its bounds —
+//! otherwise a drag turns only while the cursor is over the viewport, which is not what a drag is.
+//! GPUI already carries such a gesture: a *drag*, started by [`StatefulInteractiveElement::on_drag`]
+//! once a pointer-down is followed by a move past the engine's threshold, held on the `App` rather
+//! than in any element so it survives the redraws it causes, and delivered to every
+//! [`InteractiveElement::on_drag_move`] whose type it matches. The gateway uses it rather than
+//! capturing the pointer itself, and so keeps no gesture state of its own across a frame:
+//!
+//! - It registers an `on_drag` on the wrapped element whose value is the surface's own, with an empty
+//!   preview — the producer paints the surface, so there is nothing to draw under the cursor.
+//! - It registers an `on_drag_move` that forwards each move, **wherever the pointer is**, as a
+//!   [`SurfaceEvent::PointerMove`]. Every surface's `on_drag_move` sees every gateway drag, so the
+//!   value carries the *origin surface's id* and each surface forwards only the drag it started.
+//! - The move that crossed the threshold is consumed by the drag's own activation, so the constructor
+//!   reports it; without that the producer would never see the first off-bounds position.
+//! - The pointer-**up** is read from that same event: the engine releases the drag on it, so the
+//!   surface's own drag reports the up wherever the pointer is (`on_mouse_up_out`), and an ordinary
+//!   gesture reports it from the hovered handler as before.
+//!
+//! # The one authoring consequence: an id
+//!
+//! The drag model keys an element's state by an `ElementId`, so the surface element must have one.
+//! [`surface_input`] names an element the caller left unnamed, so a lone surface needs nothing — but
+//! two children of one parent may not share an id, so a caller with more than one surface under a
+//! parent names them (`gpu_canvas(..).id("pane-3")`), and the name is what picks that surface's drag
+//! out of the ones passing over it.
+//!
+//! # Pairing down and up is the producer's
+//!
+//! The gateway reports what GPUI routes to the surface's bounds: a move *over* the surface arrives
+//! even while another element holds the gesture, with `pressed` set. A producer that wants only its
+//! own gesture therefore tracks whether it saw the [`SurfaceEvent::PointerDown`] — the gateway does
+//! not, because it holds no state across a frame. The one asymmetry is the up of a gesture that began
+//! elsewhere and ended over the surface, which arrives without a matching down.
 
 use std::cell::Cell;
 use std::panic::Location;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, Element, ElementId, GlobalElementId, Hitbox, HitboxId, InteractiveElement,
-    IntoElement, LayoutId, Modifiers, MouseButton, Pixels, Point, Window,
+    App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, GlobalElementId,
+    Hitbox, InteractiveElement, IntoElement, LayoutId, Modifiers, MouseButton, Pixels, Point,
+    Stateful, StatefulInteractiveElement, Window,
 };
+
+/// The id a surface is named with when its element carried none.
+///
+/// Two surfaces under one parent may not share an id, so this name is enough for the common case and
+/// a caller with several surfaces names each of them — see the module docs.
+const DEFAULT_ID: &str = "gpui_interop::surface";
 
 /// Where a pointer is on the surface, in physical pixels from its top-left corner.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -91,8 +126,9 @@ pub enum SurfaceEvent {
         button: SurfaceButton,
         modifiers: SurfaceModifiers,
     },
-    /// The pointer moved over the surface — while a button is held (`pressed`), while the surface has
-    /// captured the pointer, or merely hovering.
+    /// The pointer moved over the surface — while a button is held (`pressed`) or merely hovering.
+    /// Once the surface's own gesture has begun the position may be *outside* its bounds, since the
+    /// engine's drag keeps delivering it wherever the pointer goes.
     PointerMove {
         position: SurfacePoint,
         pressed: Option<SurfaceButton>,
@@ -123,41 +159,66 @@ pub struct SurfaceInput {
 /// event routed to it, in surface-local physical pixels. The window is marked for redraw after each
 /// event, since a surface that handled input has almost certainly changed what it draws.
 ///
-/// The element keeps the sizing, styling and painting it had; the gateway only adds the input
-/// subscription, and reads the element's bounds from its own prepaint so the producer's coordinates are
-/// surface-local without the caller plumbing them.
+/// The element keeps the sizing, styling and painting it had; the gateway adds the input
+/// subscription, reads the element's bounds from its own prepaint so the producer's coordinates are
+/// surface-local without the caller plumbing them, and names the element if the caller did not (the
+/// drag model needs an id — see the module docs).
 pub fn surface_input<E>(element: E, handler: impl Fn(SurfaceInput) + 'static) -> impl IntoElement
 where
     E: InteractiveElement + Element<PrepaintState = Option<Hitbox>> + 'static,
 {
+    // Kept if the caller named the element, so a caller with several surfaces under one parent can
+    // pick each one's drag; given a default otherwise.
+    let id = Element::id(&element).unwrap_or_else(|| ElementId::from(DEFAULT_ID));
     let surface = Rc::new(Surface {
-        hitbox: Cell::new(None),
+        bounds: Cell::new(None),
         handler: Rc::new(handler),
     });
-    let inner = attach(element, &surface);
+    let inner = attach(element.id(id.clone()), &surface, id);
     SurfaceInputElement { inner, surface }
 }
 
-/// The state the listeners and the element share: the last hitbox, and the producer's handler.
+/// The state the listeners and the element share.
+///
+/// It lives for one paint, not across frames: the gesture's own continuity is the engine's drag's,
+/// held on the `App`, so nothing here has to survive a redraw.
 struct Surface {
-    /// The element's hitbox from the last prepaint. Its bounds are the surface-local origin, and its id
-    /// is what a pointer-down captures.
-    hitbox: Cell<Option<(Bounds<Pixels>, HitboxId)>>,
+    /// The element's bounds from the last prepaint — the origin a window position is made
+    /// surface-local against, and (for a drag) evidence of where the surface was.
+    bounds: Cell<Option<Bounds<Pixels>>>,
     handler: Rc<dyn Fn(SurfaceInput)>,
 }
 
+/// The value a surface's drag carries.
+///
+/// `on_drag_move` matches a drag by its value's type alone, so the type has to be the gateway's own
+/// and has to say *which* surface started it — every surface sees every gateway drag, and the id is
+/// what tells them apart.
+struct SurfaceDrag {
+    origin: ElementId,
+}
+
+/// The gateway drag in flight, if one is.
+fn drag(cx: &App) -> Option<&SurfaceDrag> {
+    cx.active_drag_value::<SurfaceDrag>()
+}
+
 /// Subscribe GPUI's pointer handlers on `element`, translating each to a [`SurfaceInput`] through
-/// `surface`.
-fn attach<E: InteractiveElement>(element: E, surface: &Rc<Surface>) -> E {
+/// `surface`. `id` is the element's, which the surface's own drag carries so each surface forwards
+/// only its own.
+fn attach<E>(element: Stateful<E>, surface: &Rc<Surface>, id: ElementId) -> Stateful<E>
+where
+    E: InteractiveElement + Element<PrepaintState = Option<Hitbox>> + 'static,
+{
     let down = surface.clone();
     let element = element.on_any_mouse_down(move |event, window, _cx| {
-        // Keep the gesture with the surface, so its moves and up arrive even off its bounds.
-        if let Some((_, id)) = down.hitbox.get() {
-            window.capture_pointer(id);
-        }
+        let Some(bounds) = down.bounds.get() else {
+            return;
+        };
         let button = button(event.button);
         let modifiers = modifiers(event.modifiers);
-        emit(&down, window, event.position, |position| {
+        let position = local(window.scale_factor(), bounds.origin, event.position);
+        deliver(&down, window, position, |position| {
             SurfaceEvent::PointerDown {
                 position,
                 button,
@@ -166,11 +227,22 @@ fn attach<E: InteractiveElement>(element: E, surface: &Rc<Surface>) -> E {
         });
     });
 
-    let moved = surface.clone();
-    let element = element.on_mouse_move(move |event, window, _cx| {
+    // The plain move: hovering, or the sub-threshold part of a gesture. While this surface's own drag
+    // is in flight its moves arrive through `on_drag_move` — which fires wherever the pointer is —
+    // so reporting them here too would double each one.
+    let hover = surface.clone();
+    let own = id.clone();
+    let element = element.on_mouse_move(move |event, window, cx| {
+        if drag(cx).is_some_and(|drag| drag.origin == own) {
+            return;
+        }
+        let Some(bounds) = hover.bounds.get() else {
+            return;
+        };
         let pressed = event.pressed_button.map(button);
         let modifiers = modifiers(event.modifiers);
-        emit(&moved, window, event.position, |position| {
+        let position = local(window.scale_factor(), bounds.origin, event.position);
+        deliver(&hover, window, position, |position| {
             SurfaceEvent::PointerMove {
                 position,
                 pressed,
@@ -179,43 +251,119 @@ fn attach<E: InteractiveElement>(element: E, surface: &Rc<Surface>) -> E {
         });
     });
 
+    // The surface's drag once the pointer has left its bounds, and while it is still over them.
+    let carried = surface.clone();
+    let own = id.clone();
+    let element = element.on_drag_move::<SurfaceDrag>(
+        move |event: &DragMoveEvent<SurfaceDrag>, window, cx| {
+            // Fires for every surface's drag; only the one that started it reports.
+            if event.drag(cx).origin != own {
+                return;
+            }
+            let pressed = event.event.pressed_button.map(button);
+            let modifiers = modifiers(event.event.modifiers);
+            let position = local(
+                window.scale_factor(),
+                event.bounds.origin,
+                event.event.position,
+            );
+            deliver(&carried, window, position, |position| {
+                SurfaceEvent::PointerMove {
+                    position,
+                    pressed,
+                    modifiers,
+                }
+            });
+        },
+    );
+
+    // The drag's own founding move — the one past the threshold, which the activation consumes.
+    let started = surface.clone();
+    let element = element.on_drag(
+        SurfaceDrag { origin: id.clone() },
+        move |_value, offset, window, cx| {
+            let position = local(window.scale_factor(), Point::default(), offset);
+            let modifiers = modifiers(window.modifiers());
+            deliver(&started, window, position, |position| {
+                SurfaceEvent::PointerMove {
+                    position,
+                    pressed: Some(SurfaceButton::Left),
+                    modifiers,
+                }
+            });
+            // Nothing is drawn under the cursor: a surface paints itself.
+            cx.new(|_| Empty)
+        },
+    );
+
+    // The up over the surface: the ordinary case, and a drag released where it began. Under capture
+    // phase and hovered, so it is the one that reports a plain click.
     let up = surface.clone();
-    element.capture_any_mouse_up(move |event, window, _cx| {
+    let element = element.capture_any_mouse_up(move |event, window, _cx| {
+        let Some(bounds) = up.bounds.get() else {
+            return;
+        };
         let button = button(event.button);
         let modifiers = modifiers(event.modifiers);
-        emit(&up, window, event.position, |position| {
-            SurfaceEvent::PointerUp {
-                position,
-                button,
-                modifiers,
-            }
+        let position = local(window.scale_factor(), bounds.origin, event.position);
+        deliver(&up, window, position, |position| SurfaceEvent::PointerUp {
+            position,
+            button,
+            modifiers,
         });
-    })
+    });
+
+    // The up of this surface's own drag, wherever the pointer is — the engine still holds the drag
+    // during the up's dispatch, so a surface whose drag is in flight recognizes its own.
+    let mut element = element;
+    for released_button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+        let released = surface.clone();
+        let own = id.clone();
+        element = element.on_mouse_up_out(released_button, move |event, window, cx| {
+            if drag(cx).is_none_or(|drag| drag.origin != own) {
+                return;
+            }
+            let Some(bounds) = released.bounds.get() else {
+                return;
+            };
+            let button = button(event.button);
+            let modifiers = modifiers(event.modifiers);
+            let position = local(window.scale_factor(), bounds.origin, event.position);
+            deliver(&released, window, position, |position| {
+                SurfaceEvent::PointerUp {
+                    position,
+                    button,
+                    modifiers,
+                }
+            });
+        });
+    }
+
+    element
 }
 
-/// Translate `window_position` to surface-local physical pixels and hand the built event to the
-/// producer, then ask for the redraw the handled input implies.
-fn emit(
+/// Hand the producer an event at `position`, then ask for the redraw handled input implies.
+fn deliver(
     surface: &Rc<Surface>,
     window: &mut Window,
-    window_position: Point<Pixels>,
+    position: SurfacePoint,
     event: impl FnOnce(SurfacePoint) -> SurfaceEvent,
 ) {
-    let Some((bounds, _)) = surface.hitbox.get() else {
-        // No prepaint yet — nothing has been laid out to translate against.
-        return;
-    };
     let scale = window.scale_factor();
-    let local = window_position - bounds.origin;
-    let position = SurfacePoint {
-        x: local.x.as_f32() * scale,
-        y: local.y.as_f32() * scale,
-    };
     (surface.handler)(SurfaceInput {
         event: event(position),
         scale,
     });
     window.refresh();
+}
+
+/// A window position, as physical pixels from a surface-local `origin`.
+fn local(scale: f32, origin: Point<Pixels>, position: Point<Pixels>) -> SurfacePoint {
+    let local = position - origin;
+    SurfacePoint {
+        x: local.x.as_f32() * scale,
+        y: local.y.as_f32() * scale,
+    }
 }
 
 /// The guest of a GPUI button, as a producer-facing one.
@@ -279,7 +427,7 @@ where
     ) -> Self::PrepaintState {
         let prepaint = self.inner.prepaint(id, bounds, request_layout, window, cx);
         if let Some(hitbox) = &prepaint {
-            self.surface.hitbox.set(Some((hitbox.bounds, hitbox.id)));
+            self.surface.bounds.set(Some(hitbox.bounds));
         }
         prepaint
     }
