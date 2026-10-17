@@ -357,7 +357,7 @@ impl Slot {
         let color_format = vk::Format::B8G8R8A8_UNORM;
         let view = create_view(
             device,
-            buffer.image(),
+            buffer.image().context("a render target has an image")?,
             color_format,
             vk::ImageAspectFlags::COLOR,
         )?;

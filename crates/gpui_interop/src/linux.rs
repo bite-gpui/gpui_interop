@@ -55,6 +55,48 @@ pub enum Tiling {
     Tiled,
 }
 
+/// One plane's placement in a buffer whose producer chose the layout — the offsets and strides a
+/// [`SharedBuffer::export_at`] export declares, rather than the ones the driver would have picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneLayout {
+    /// The byte offset of the plane's first row within the exported object.
+    pub offset: u64,
+    /// The bytes between the start of one row and the next — at least the row's own width.
+    pub stride: u32,
+}
+
+/// What a producer must declare and allocate for a linear buffer this device will sample: the plane
+/// layout the device laid out itself, and the size the buffer must hold.
+///
+/// Read from [`GpuDevice::linear_layout`], **before** a producer exports. [`native`](Self::native) is
+/// the answer to "where will the driver read the planes" — a driver samples only the layout it
+/// produced itself, so a producer declares *this* rather than a layout of its own choosing. On a
+/// device whose linear `NV12` is the canonical DRM layout it is that layout; on one that pads (an
+/// NVIDIA 930M puts chroma at 65536) it is the padded one, and a canonical declaration there is
+/// refused rather than sampled. [`required`](Self::required) is the size the buffer must hold for
+/// that layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearLayout {
+    /// The plane layout the device gives a plain `LINEAR` image of this format and extent — the
+    /// offsets and strides to declare. One [`PlaneLayout`] per plane, in plane order.
+    pub native: Vec<PlaneLayout>,
+    /// The bytes the device's image for [`native`](Self::native) requires: the size the exported
+    /// buffer must hold. Larger than the layout's own span where the driver pads beyond the planes.
+    pub required: u64,
+    /// The bytes the plane layouts the producer proposed (`planes`) span — how far the producer's own
+    /// idea is from [`native`](Self::native). Equal to the native span where the two agree.
+    pub declared: u64,
+}
+
+impl LinearLayout {
+    /// Whether a buffer of exactly [`declared`](Self::declared) bytes can back the device's image —
+    /// the test the renderer's importer makes. `false` means a producer must pad to
+    /// [`required`](Self::required), or declare [`native`](Self::native) if its proposal is short.
+    pub fn backed(&self) -> bool {
+        self.required <= self.declared
+    }
+}
+
 /// The GPU a window draws on, as a producer that must render or decode on the **same** GPU names it.
 ///
 /// A dma-buf is importable only on the GPU it was exported from, so a producer that owns its device —
@@ -300,6 +342,136 @@ impl GpuDevice {
             })
             .ok_or_else(|| anyhow!("no memory type carrying {required:?} for the image"))
     }
+
+    /// What a producer must declare and how big its buffer must be, **before** it exports: the plane
+    /// layout this device gives a plain `LINEAR` image, and the size the exported buffer must hold.
+    ///
+    /// [`native`](LinearLayout::native) is read from a plain `LINEAR` image — the layout the device
+    /// laid out itself, and the only one its importer will sample — and
+    /// [`required`](LinearLayout::required) is the memory the image the importer builds from that
+    /// layout needs, so the answer is what the import will meet rather than a guess. `planes` is the
+    /// layout the producer *proposed*, and [`declared`](LinearLayout::declared) its span, so a
+    /// producer can see how far its own idea is from the device's; an error is a device that will not
+    /// make such an image at all.
+    pub fn linear_layout(
+        &self,
+        format: SurfaceFormatKind,
+        width: u32,
+        height: u32,
+        planes: &[PlaneLayout],
+    ) -> Result<LinearLayout> {
+        let vk_format = vk_format(format)?;
+        let geometry = plane_geometry(format, width, height);
+        anyhow::ensure!(!geometry.is_empty(), "{format:?} has no plane layout to report on");
+        anyhow::ensure!(
+            geometry.len() == planes.len(),
+            "{format:?} has {} planes, but {} layouts were given",
+            geometry.len(),
+            planes.len(),
+        );
+        let declared = declared_span(&geometry, planes)?;
+
+        // The layout the device laid out itself — the only one its importer samples, and so what a
+        // producer must declare. Read from a plain image, not from one created with the proposal:
+        // a driver echoes an explicit declaration back, so that query could never disagree.
+        let native = self.native_plane_layouts(vk_format, width, height, geometry.len())?;
+
+        // The image the importer will build from a handle declaring `native`, so `required` is the
+        // memory the import will meet rather than a guess.
+        let layouts: Vec<vk::SubresourceLayout> = native
+            .iter()
+            .map(|plane| {
+                vk::SubresourceLayout::default()
+                    .offset(plane.offset)
+                    .row_pitch(u64::from(plane.stride))
+            })
+            .collect();
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(DmaBufHandle::LINEAR)
+            .plane_layouts(&layouts);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut explicit);
+        // SAFETY: `info` chains locals that outlive the call, and the image is destroyed below.
+        let image = unsafe { self.device.create_image(&info, None) }.map_err(|error| {
+            anyhow!("the device will not make a {format:?} image with these plane layouts: {error:?}")
+        })?;
+        // SAFETY: the image is live and bound to no memory yet.
+        let required = unsafe { self.device.get_image_memory_requirements(image) }.size;
+        unsafe { self.device.destroy_image(image, None) };
+        Ok(LinearLayout {
+            native,
+            required,
+            declared,
+        })
+    }
+
+    /// The plane layout the device gives a plain, unbound `LINEAR` image of `format` — the offsets and
+    /// strides it laid out itself, which are the only ones its importer samples.
+    ///
+    /// No memory is allocated: `vkCreateImage` binds none until `vkBindImageMemory`, so this is a
+    /// create, a query per plane, and a destroy. The aspects are a plain image's (`COLOR`, or
+    /// `PLANE_0`/`PLANE_1`), not a modifier image's memory planes — mixing them returns nonsense.
+    fn native_plane_layouts(
+        &self,
+        vk_format: vk::Format,
+        width: u32,
+        height: u32,
+        plane_count: usize,
+    ) -> Result<Vec<PlaneLayout>> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: `info` chains nothing, and the image is destroyed below.
+        let image = unsafe { self.device.create_image(&info, None) }
+            .map_err(|error| anyhow!("the device will not make a plain {vk_format:?} image: {error:?}"))?;
+        let mut native = Vec::with_capacity(plane_count);
+        for plane in 0..plane_count {
+            // SAFETY: `image` is live and bound to no memory; the call only reads its layout.
+            let layout = unsafe {
+                self.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask: plane_aspect(plane, plane_count),
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            native.push(PlaneLayout {
+                offset: layout.offset,
+                stride: layout.row_pitch as u32,
+            });
+        }
+        // SAFETY: the image was created above and is bound to no memory.
+        unsafe { self.device.destroy_image(image, None) };
+        Ok(native)
+    }
 }
 
 impl Drop for GpuDevice {
@@ -315,7 +487,8 @@ impl Drop for GpuDevice {
     }
 }
 
-/// A committed, shareable image — the producer's render target, exported as a dma-buf.
+/// A committed, shareable surface — the producer's render target, or bytes pushed at a chosen
+/// layout, exported as a dma-buf.
 ///
 /// The memory behind it is what the exported fd names, so this value must outlive every use of the
 /// [`DmaBufHandle`] it handed out: dropping it frees the memory the renderer is still sampling. A
@@ -326,9 +499,18 @@ impl Drop for GpuDevice {
 /// buffers *before* the device.
 pub struct SharedBuffer {
     device: ash::Device,
-    image: vk::Image,
+    backing: Backing,
     memory: vk::DeviceMemory,
     handle: DmaBufHandle,
+}
+
+/// What the exported memory backs: the image [`SharedBuffer::new`] and [`SharedBuffer::render_target`]
+/// allocate, which a pipeline draws into or a `fill` uploads through, or the plain buffer
+/// [`SharedBuffer::export_at`] allocates to hold bytes at a plane layout the producer declared. Only
+/// the image has a `vk::Image`; a pushed buffer is memory the consumer samples through its own view.
+enum Backing {
+    Image(vk::Image),
+    Buffer(vk::Buffer),
 }
 
 impl SharedBuffer {
@@ -366,6 +548,165 @@ impl SharedBuffer {
         tiling: Tiling,
     ) -> Result<Self> {
         Self::allocate(device, width, height, format, tiling, true)
+    }
+
+    /// Export `content` as a linear dma-buf whose planes lie at the layout **the producer declares**.
+    ///
+    /// This is the *producer-pushed* contract, the complement of [`new`](Self::new): where `new` lets
+    /// the driver choose the image's layout and reports it back in [`handle`](Self::handle), this
+    /// exports bytes the producer has already placed, and the handle carries the offsets and strides
+    /// given here. It is the shape a producer whose layout comes from somewhere other than
+    /// `vkGetImageSubresourceLayout` needs — a decoder, a capture pipeline, a canonical DRM `NV12`
+    /// layout — and the one a consumer that honours the handle reads correctly where an image the
+    /// driver laid out would not: an NVIDIA linear `NV12` pads luma to 64 KiB, so a producer placing
+    /// chroma directly after luma at 16384 would otherwise have it read from padding.
+    ///
+    /// `planes` holds one [`PlaneLayout`] per plane of `format`, in plane order; `content` is the
+    /// whole object — the plane bytes in place, gaps and all — and its length is the exported size. A
+    /// layout whose rows do not fit inside `content` is refused. The memory is device-local (a dma-buf
+    /// is the memory real frames live in) and filled by a staging copy on the GPU, since the NVIDIA
+    /// driver faults on a `HOST_VISIBLE` exportable allocation; the buffer is ready to hand over when
+    /// this returns. Unlike [`new`](Self::new) it has no image — [`image`](Self::image) is `None` — so
+    /// [`clear`](Self::clear) and [`fill`](Self::fill) do not apply.
+    pub fn export_at(
+        device: &GpuDevice,
+        width: u32,
+        height: u32,
+        format: SurfaceFormatKind,
+        planes: &[PlaneLayout],
+        content: &[u8],
+    ) -> Result<Self> {
+        let geometry = plane_geometry(format, width, height);
+        if geometry.is_empty() {
+            return Err(anyhow!("{format:?} has no plane layout to export"));
+        }
+        if geometry.len() != planes.len() {
+            return Err(anyhow!(
+                "{format:?} has {} planes, but {} layouts were given",
+                geometry.len(),
+                planes.len(),
+            ));
+        }
+        check_plane_layouts(&geometry, planes, content.len())?;
+
+        let size = content.len() as u64;
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // SAFETY: created, filled and exported once; the memory is freed when the returned value drops.
+        let buffer = unsafe {
+            device.device().create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .push_next(&mut external),
+                None,
+            )
+        }
+        .map_err(|e| anyhow!("create the exported buffer: {e:?}"))?;
+
+        let requirements = unsafe { device.device().get_buffer_memory_requirements(buffer) };
+        let properties = unsafe {
+            device
+                .instance()
+                .get_physical_device_memory_properties(device.physical_device())
+        };
+        let Some(memory_type_index) =
+            export_memory_type(&properties, requirements.memory_type_bits)
+        else {
+            unsafe { device.device().destroy_buffer(buffer, None) };
+            return Err(anyhow!("no memory type for the exported buffer"));
+        };
+
+        let mut export = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // A dedicated allocation, as the image paths and the consumer's importer make; a driver is
+        // allowed to require one, and NVIDIA needs it for a linear export to be sampled at all.
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        // SAFETY: the allocation chains locals that outlive the call, and its size and type come from
+        // the buffer.
+        let memory = match unsafe {
+            device.device().allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type_index)
+                    .push_next(&mut export)
+                    .push_next(&mut dedicated),
+                None,
+            )
+        } {
+            Ok(memory) => memory,
+            Err(e) => {
+                unsafe { device.device().destroy_buffer(buffer, None) };
+                return Err(anyhow!("allocate the exported buffer's memory: {e:?}"));
+            }
+        };
+        // SAFETY: `memory` was allocated for `buffer` (same requirements) and is bound once.
+        if let Err(e) = unsafe { device.device().bind_buffer_memory(buffer, memory, 0) } {
+            unsafe { device.device().free_memory(memory, None) };
+            unsafe { device.device().destroy_buffer(buffer, None) };
+            return Err(anyhow!("bind the exported buffer: {e:?}"));
+        }
+
+        // The bytes live in device-local memory the CPU cannot map, so they are staged and copied on
+        // the GPU rather than mapped in place. Everything after this point frees both on failure.
+        let fd = (|| -> Result<OwnedFd> {
+            let staging = Staging::new(device, size)?;
+            staging.write(&[content])?;
+            submit_once(device, |command| {
+                // SAFETY: `command` is recording, and both buffers live on `device`; the copy covers
+                // the whole of each.
+                unsafe {
+                    device.device().cmd_copy_buffer(
+                        command,
+                        staging.buffer,
+                        buffer,
+                        &[vk::BufferCopy::default().size(size)],
+                    );
+                }
+            })?;
+            // SAFETY: the fd is freshly exported for this memory, and takes ownership below.
+            let raw = unsafe {
+                device.external_memory_fd().get_memory_fd(
+                    &vk::MemoryGetFdInfoKHR::default()
+                        .memory(memory)
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+                )
+            }
+            .map_err(|e| anyhow!("export the dma-buf fd: {e:?}"))?;
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        })();
+        let fd = match fd {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe { device.device().free_memory(memory, None) };
+                unsafe { device.device().destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        };
+
+        let mut described = Vec::with_capacity(planes.len());
+        for (plane, layout) in planes.iter().enumerate() {
+            match fd.try_clone() {
+                Ok(plane_fd) => {
+                    described.push(DmaBufPlane::new(plane_fd, layout.offset, layout.stride))
+                }
+                Err(e) => {
+                    unsafe { device.device().free_memory(memory, None) };
+                    unsafe { device.device().destroy_buffer(buffer, None) };
+                    return Err(anyhow!("duplicate the dma-buf fd for plane {plane}: {e}"));
+                }
+            }
+        }
+        let handle =
+            DmaBufHandle::new(width, height, format, DmaBufHandle::LINEAR, described, None);
+
+        Ok(Self {
+            device: device.device().clone(),
+            backing: Backing::Buffer(buffer),
+            memory,
+            handle,
+        })
     }
 
     /// Allocate the shareable image; `rendered` adds `COLOR_ATTACHMENT` to the usage.
@@ -497,7 +838,7 @@ impl SharedBuffer {
 
         Ok(Self {
             device: device.device().clone(),
-            image,
+            backing: Backing::Image(image),
             memory,
             handle,
         })
@@ -508,9 +849,14 @@ impl SharedBuffer {
         self.handle.clone()
     }
 
-    /// The producer's own render target.
-    pub fn image(&self) -> vk::Image {
-        self.image
+    /// The producer's own render target, for a buffer [`new`](Self::new) or
+    /// [`render_target`](Self::render_target) made. `None` for one [`export_at`](Self::export_at)
+    /// pushed, which backs a plain buffer rather than an image.
+    pub fn image(&self) -> Option<vk::Image> {
+        match self.backing {
+            Backing::Image(image) => Some(image),
+            Backing::Buffer(_) => None,
+        }
     }
 
     /// Clear the image to a solid `rgba`, ready to hand over — the producer's simplest render, and
@@ -521,7 +867,11 @@ impl SharedBuffer {
     /// ready when this returns. A producer with real work signals a [`Fence`] from its own submission
     /// instead.
     pub fn clear(&self, device: &GpuDevice, rgba: [f32; 4]) -> Result<()> {
-        let image = self.image;
+        let Backing::Image(image) = self.backing else {
+            return Err(anyhow!(
+                "a buffer pushed with export_at is written at export; it has no image to clear"
+            ));
+        };
         submit_once(device, |buffer| {
             // SAFETY: `buffer` is recording, and the image belongs to `device` and this value.
             unsafe {
@@ -585,6 +935,11 @@ impl SharedBuffer {
     /// length, or a count the format does not have, is refused. Like `clear` it waits on the CPU
     /// rather than handing back an acquire fence, so the buffer is ready when this returns.
     pub fn fill(&self, device: &GpuDevice, planes: &[&[u8]]) -> Result<()> {
+        let Backing::Image(image) = self.backing else {
+            return Err(anyhow!(
+                "a buffer pushed with export_at is filled at export; it has no image to fill"
+            ));
+        };
         let geometry = plane_geometry(self.handle.format, self.handle.width, self.handle.height);
         if geometry.is_empty() {
             return Err(anyhow!(
@@ -644,7 +999,6 @@ impl SharedBuffer {
 
         let staging = Staging::new(device, total)?;
         staging.write(planes)?;
-        let image = self.image;
         submit_once(device, |buffer| {
             // SAFETY: `buffer` is recording; the image and the staging buffer are live, and the
             // copy's offsets and extents were checked against the image above.
@@ -705,11 +1059,14 @@ impl SharedBuffer {
 
 impl Drop for SharedBuffer {
     fn drop(&mut self) {
-        // SAFETY: both were created by this value and are destroyed once, in the order Vulkan needs —
-        // the image before the memory bound to it, since `vkFreeMemory` requires the memory no longer
-        // be bound to any image.
+        // SAFETY: the backing and the memory were created by this value and are destroyed once, in the
+        // order Vulkan needs — the image or buffer before the memory bound to it, since `vkFreeMemory`
+        // requires the memory no longer be bound to either.
         unsafe {
-            self.device.destroy_image(self.image, None);
+            match self.backing {
+                Backing::Image(image) => self.device.destroy_image(image, None),
+                Backing::Buffer(buffer) => self.device.destroy_buffer(buffer, None),
+            }
             self.device.free_memory(self.memory, None);
         }
     }
@@ -1315,6 +1672,68 @@ fn plane_geometry(format: SurfaceFormatKind, width: u32, height: u32) -> Vec<(us
     }
 }
 
+/// The first memory type in `bits` whose flags satisfy `wanted`.
+fn memory_type_index(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    wanted: impl Fn(vk::MemoryPropertyFlags) -> bool,
+) -> Option<u32> {
+    (0..properties.memory_type_count).find(|index| {
+        bits & (1u32 << index) != 0 && wanted(properties.memory_types[*index as usize].property_flags)
+    })
+}
+
+/// The memory type an exported buffer takes: device-local, preferring a heap the CPU cannot map — the
+/// shape the two working dma-buf paths here allocate with, and the one the NVIDIA driver tolerates
+/// where a `HOST_VISIBLE` exportable allocation faults.
+fn export_memory_type(properties: &vk::PhysicalDeviceMemoryProperties, bits: u32) -> Option<u32> {
+    memory_type_index(properties, bits, |flags| {
+        flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+    })
+    .or_else(|| {
+        memory_type_index(properties, bits, |flags| {
+            flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        })
+    })
+    .or_else(|| memory_type_index(properties, bits, |_| true))
+}
+
+/// The bytes `planes` span for `geometry`: how far the furthest plane's rows reach. Refuses a stride
+/// too narrow to hold a row.
+fn declared_span(geometry: &[(usize, u32, u32)], planes: &[PlaneLayout]) -> Result<u64> {
+    let mut span = 0u64;
+    for (plane, ((bytes, plane_width, plane_height), layout)) in
+        geometry.iter().zip(planes).enumerate()
+    {
+        let row_bytes = (*bytes / *plane_height as usize) as u64;
+        anyhow::ensure!(
+            u64::from(layout.stride) >= row_bytes,
+            "plane {plane} declares a stride of {}, but a {plane_width}-wide row needs {row_bytes}",
+            layout.stride,
+        );
+        span = span.max(
+            layout.offset + u64::from(layout.stride) * (u64::from(*plane_height) - 1) + row_bytes,
+        );
+    }
+    Ok(span)
+}
+
+/// Check the declared planes fit inside `content` — the shape [`SharedBuffer::export_at`] enforces
+/// before it allocates, and the same span [`GpuDevice::linear_layout`] reports.
+fn check_plane_layouts(
+    geometry: &[(usize, u32, u32)],
+    planes: &[PlaneLayout],
+    content: usize,
+) -> Result<()> {
+    let span = declared_span(geometry, planes)?;
+    anyhow::ensure!(
+        span <= content as u64,
+        "the declared plane layout spans {span} bytes, past the {content} bytes of content given",
+    );
+    Ok(())
+}
+
 /// The aspect a `fill`'s **copy** names for `plane`: the colour aspect for a one-plane image, else
 /// that plane's own. A barrier names a DRM image's plane by memory plane instead — see
 /// [`subresource_aspect`].
@@ -1357,6 +1776,206 @@ fn extension_name(raw: &[c_char]) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device on the GPU `ZED_DEVICE_ID` names, or the first that exports a dma-buf.
+    ///
+    /// [`GpuDevice::open`] reaches only the first that exports, which is the integrated GPU on a laptop
+    /// — enough for the unit tests, but a probe that must run against a *specific* GPU needs the
+    /// variable honoured, which `open` deliberately does not.
+    fn probe_device() -> Option<GpuDevice> {
+        // See `LOADER`: the loader's global entry points are not safe to initialise concurrently.
+        let _loading = LOADER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = unsafe { ash::Entry::load() }.ok()?;
+        let instance = create_instance(&entry).ok()?;
+        let wanted = std::env::var("ZED_DEVICE_ID")
+            .ok()
+            .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok());
+        let devices = unsafe { instance.enumerate_physical_devices() }.ok()?;
+        let chosen = devices.iter().copied().find(|physical| {
+            let properties = unsafe { instance.get_physical_device_properties(*physical) };
+            wanted.is_none_or(|id| properties.device_id == id)
+        })?;
+        let family = render_family(&instance, chosen)?;
+        ensure_extensions(&instance, chosen).ok()?;
+        GpuDevice::assemble(Some(entry), instance, true, false, chosen, family).ok()
+    }
+
+    /// How a linear two-plane `NV12` image is made, for the layout probe.
+    enum LinearNv12<'a> {
+        /// Plain `LINEAR` tiling: the layout the driver chooses for itself — a consumer's default read.
+        Native,
+        /// The producer's layout, carried through `ImageDrmFormatModifierExplicitCreateInfoEXT`.
+        Declared(&'a [vk::SubresourceLayout]),
+    }
+
+    /// The layout the device reports for a linear two-plane `NV12` `width`x`height` image, per plane,
+    /// with its memory requirement — created `how`, then **asked** rather than assumed.
+    fn reported_layout(
+        device: &GpuDevice,
+        width: u32,
+        height: u32,
+        how: LinearNv12<'_>,
+    ) -> Result<(vk::SubresourceLayout, vk::SubresourceLayout, u64), vk::Result> {
+        let drm = matches!(how, LinearNv12::Declared(_));
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(DmaBufHandle::LINEAR);
+        if let LinearNv12::Declared(layouts) = how {
+            explicit = explicit.plane_layouts(layouts);
+        }
+        let mut info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(if drm {
+                vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+            } else {
+                vk::ImageTiling::LINEAR
+            })
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        if drm {
+            info = info.push_next(&mut explicit);
+        }
+        // SAFETY: `info` chains locals that outlive the call, and the image is destroyed below.
+        let image = unsafe { device.device().create_image(&info, None) }?;
+        let plane = |index: usize| unsafe {
+            device.device().get_image_subresource_layout(
+                image,
+                vk::ImageSubresource {
+                    aspect_mask: subresource_aspect(drm, index, 2),
+                    mip_level: 0,
+                    array_layer: 0,
+                },
+            )
+        };
+        let luma = plane(0);
+        let chroma = plane(1);
+        // SAFETY: the image is live and bound to no memory yet.
+        let size = unsafe { device.device().get_image_memory_requirements(image) }.size;
+        unsafe { device.device().destroy_image(image, None) };
+        Ok((luma, chroma, size))
+    }
+
+    /// [`GpuDevice::linear_layout`] must report what the device actually does with a declared linear
+    /// layout — the information a producer acts on *before* it exports. The report is checked against an
+    /// independent measurement rather than trusted, and printed for the device under test: the
+    /// integrated Intel device's canonical `NV12` layout *is* the one it gives a plain image, while an
+    /// NVIDIA 930M gives chroma at 65536 and requires 128 KiB for a 6 KiB span.
+    #[test]
+    fn the_linear_layout_report_matches_the_device() {
+        let Some(device) = probe_device() else {
+            eprintln!("skipping: no Vulkan device for the layout report");
+            return;
+        };
+        let (width, height) = (64u32, 64u32);
+        let luma_bytes = u64::from(width) * u64::from(height);
+        let chroma_bytes = u64::from(width / 2) * u64::from(height / 2) * 2;
+        let span = luma_bytes + chroma_bytes;
+        // The DRM `NV12` convention: chroma directly after the luma.
+        let planes = [
+            PlaneLayout {
+                offset: 0,
+                stride: width,
+            },
+            PlaneLayout {
+                offset: luma_bytes,
+                stride: width,
+            },
+        ];
+
+        let (native_luma, native_chroma, native_memory) =
+            match reported_layout(&device, width, height, LinearNv12::Native) {
+                Ok(measured) => measured,
+                Err(error) => {
+                    eprintln!("skipping: no plain linear NV12 image ({error:?})");
+                    return;
+                }
+            };
+        eprintln!(
+            "native linear NV12: luma {}@{}, chroma {}@{}, memory {native_memory}",
+            native_luma.row_pitch,
+            native_luma.offset,
+            native_chroma.row_pitch,
+            native_chroma.offset,
+        );
+
+        let report = match device.linear_layout(SurfaceFormatKind::nv12(), width, height, &planes) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("the device will not make the declared layout: {error:#}");
+                return;
+            }
+        };
+        // What the device gives a plain image, plane by plane — the layout a producer must declare,
+        // checked against the measurement rather than trusted.
+        assert_eq!(
+            report.native,
+            vec![
+                PlaneLayout {
+                    offset: native_luma.offset,
+                    stride: native_luma.row_pitch as u32,
+                },
+                PlaneLayout {
+                    offset: native_chroma.offset,
+                    stride: native_chroma.row_pitch as u32,
+                },
+            ],
+            "the report's native layout must be the plain image's own",
+        );
+
+        // The requirement of the image the importer builds from that native layout.
+        let native_layouts = [
+            vk::SubresourceLayout::default()
+                .offset(native_luma.offset)
+                .size(luma_bytes)
+                .row_pitch(native_luma.row_pitch),
+            vk::SubresourceLayout::default()
+                .offset(native_chroma.offset)
+                .size(chroma_bytes)
+                .row_pitch(native_chroma.row_pitch),
+        ];
+        let measured =
+            match reported_layout(&device, width, height, LinearNv12::Declared(&native_layouts)) {
+                Ok((_, _, size)) => size,
+                Err(error) => {
+                    eprintln!("the device refused its own layout when asked directly ({error:?})");
+                    return;
+                }
+            };
+        eprintln!(
+            "reported linear NV12: native {:?}, required {}, declared {} (measured requirement \
+             {measured})",
+            report.native, report.required, report.declared,
+        );
+
+        assert_eq!(
+            report.declared, span,
+            "the report's declared span is the layout the producer proposed",
+        );
+        assert_eq!(
+            report.required, measured,
+            "the report's requirement must be the device's own, measured independently",
+        );
+        assert!(
+            report.required >= report.declared,
+            "an image never needs less than its own layout spans",
+        );
+        assert_eq!(
+            report.backed(),
+            report.required == report.declared,
+            "a layout is backed exactly when the device needs no more than it spans",
+        );
+    }
 
     #[test]
     fn a_linear_buffer_exports_a_dma_buf() {
@@ -1447,6 +2066,77 @@ mod tests {
             handle.planes[0].stride,
             handle.planes[1].offset,
             handle.planes[1].stride,
+        );
+    }
+
+    #[test]
+    fn a_pushed_buffer_exports_at_the_layout_it_declares() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        // A whole page past the luma's end, which no driver's own linear layout would choose — the
+        // offset a consumer that fell back to its own layout would read as padding.
+        let luma = 64usize * 64;
+        let chroma_offset = luma + 4096;
+        let content = vec![0u8; chroma_offset + 32 * 32 * 2];
+        let buffer = SharedBuffer::export_at(
+            &device,
+            64,
+            64,
+            SurfaceFormatKind::nv12(),
+            &[
+                PlaneLayout {
+                    offset: 0,
+                    stride: 64,
+                },
+                PlaneLayout {
+                    offset: chroma_offset as u64,
+                    stride: 64,
+                },
+            ],
+            &content,
+        )
+        .expect("export at a declared layout");
+        let handle = buffer.handle();
+        assert_eq!(handle.modifier, DmaBufHandle::LINEAR, "a pushed buffer is linear");
+        assert_eq!(handle.planes[0].offset, 0);
+        assert_eq!(
+            handle.planes[1].offset, chroma_offset as u64,
+            "the declared chroma offset, not the driver's",
+        );
+        assert_eq!(handle.planes[1].stride, 64);
+        assert!(buffer.image().is_none(), "a pushed buffer backs no image");
+    }
+
+    #[test]
+    fn a_pushed_buffer_refuses_a_layout_that_runs_past_its_content() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        // Luma alone fits the 4096 bytes; chroma at 4096 does not.
+        let content = vec![0u8; 64 * 64];
+        let refused = SharedBuffer::export_at(
+            &device,
+            64,
+            64,
+            SurfaceFormatKind::nv12(),
+            &[
+                PlaneLayout {
+                    offset: 0,
+                    stride: 64,
+                },
+                PlaneLayout {
+                    offset: 4096,
+                    stride: 64,
+                },
+            ],
+            &content,
+        );
+        assert!(
+            refused.is_err(),
+            "a chroma plane past the content is refused",
         );
     }
 

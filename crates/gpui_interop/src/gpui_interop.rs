@@ -26,7 +26,10 @@
 //! - On Linux, [`SharedBuffer`] is the producer half of the dma-buf transport: a producer renders into
 //!   a shareable image and exports it as a dma-buf, and hands GPUI the `gpui::DmaBufHandle` the
 //!   renderer imports under its modifier. Single- or two-plane, linear or on a driver-tiled modifier
-//!   the renderer can import, and ordered by a [`Fence`] that exports the acquire `sync_file`.
+//!   the renderer can import, and ordered by a [`Fence`] that exports the acquire `sync_file`. It
+//!   covers both sharing contracts: [`SharedBuffer::new`] lets the driver choose the image's layout and
+//!   reports it back, while [`SharedBuffer::export_at`] pushes bytes at a plane layout the producer
+//!   declares — the shape a decoder or capture pipeline whose layout comes from elsewhere needs.
 //!
 //! # Sketch
 //!
@@ -70,7 +73,7 @@ pub use input::{
     SurfaceButton, SurfaceEvent, SurfaceInput, SurfaceModifiers, SurfacePoint, surface_input,
 };
 #[cfg(target_os = "linux")]
-pub use linux::{Fence, GpuDevice, GpuId, SharedBuffer, Tiling, gpu_id, remember};
+pub use linux::{Fence, GpuDevice, GpuId, LinearLayout, PlaneLayout, SharedBuffer, Tiling, gpu_id, remember};
 #[cfg(target_os = "windows")]
 pub use windows::{Fence, SharedSurface};
 

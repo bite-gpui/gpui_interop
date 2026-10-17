@@ -192,14 +192,14 @@ fn tile(
 /// GPU, composited into one headless window, and read back.
 #[test]
 fn an_exported_buffer_composites_byte_for_byte() {
-    if gpui::current_headless_renderer().is_none() {
+    if !gpui::current_headless_renderer().is_ok_and(|renderer| renderer.is_some()) {
         eprintln!("skipping: no headless renderer (no Vulkan adapter)");
         return;
     }
 
     let text_system = Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = gpui::HeadlessAppContext::with_platform(text_system, Arc::new(()), || {
-        Ok(gpui::current_headless_renderer())
+        gpui::current_headless_renderer()
     });
 
     let built = Rc::new(Cell::new(false));
