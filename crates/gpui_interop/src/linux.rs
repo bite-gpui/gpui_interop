@@ -136,6 +136,48 @@ impl GpuId {
             Self { name, render_node }
         }
     }
+
+    /// The producer-facing identity of an adapter the application enumerated.
+    ///
+    /// [`gpui::GpuAdapterInfo`] carries the PCI ids and the Vulkan device name; the render node a
+    /// non-Vulkan producer opens comes from `VK_EXT_physical_device_drm`, which no `wgpu` adapter
+    /// exposes. So this opens a short-lived instance and matches the physical device by PCI id — no
+    /// device is created — and returns `None` when no Vulkan device matches (an OpenGL adapter, or a
+    /// name-only backend).
+    ///
+    /// This is how an application turns a [`gpui::GpuPreference::Custom`] choice into the identity a
+    /// producer uses: the preference picks the renderer's adapter, this names the same GPU to the
+    /// producer, and [`Adapter::gpu_id`] confirms it once a canvas exists.
+    #[cfg(feature = "gpui")]
+    pub fn from_adapter(info: &gpui::GpuAdapterInfo) -> Option<Self> {
+        // A backend that reports no PCI ids (OpenGL often reports both as zero) cannot be matched
+        // this way, and matching zero against zero would name the wrong GPU.
+        if info.device_id == 0 {
+            return None;
+        }
+        // See `LOADER`: the loader's global entry points must not be initialised concurrently.
+        let _loading = LOADER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = unsafe { ash::Entry::load() }.ok()?;
+        let instance = create_instance(&entry).ok()?;
+        let devices = unsafe { instance.enumerate_physical_devices() }.ok()?;
+        let physical_device = devices.into_iter().find(|physical_device| {
+            // SAFETY: `physical_device` came from this instance.
+            let properties =
+                unsafe { instance.get_physical_device_properties(*physical_device) };
+            properties.vendor_id == info.vendor_id && properties.device_id == info.device_id
+        })?;
+        Some(Self::of(&instance, physical_device))
+    }
+
+    /// Whether `info` names this GPU.
+    ///
+    /// The platform reports the same Vulkan device name, so the name is the join a
+    /// [`gpui::GpuPreference::Custom`] predicate can use without opening anything. Use
+    /// [`from_adapter`](Self::from_adapter) when the render node is needed as well.
+    #[cfg(feature = "gpui")]
+    pub fn matches_adapter(&self, info: &gpui::GpuAdapterInfo) -> bool {
+        self.name == info.name
+    }
 }
 
 /// The renderer's GPU, remembered when a canvas last read it — for a producer that runs off the
