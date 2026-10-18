@@ -66,8 +66,8 @@ use gpui::{
 /// The window a guest opens: its content size, in logical pixels.
 ///
 /// The headless display reports a scale factor of one, so these are also the frame's device
-/// pixels. A host that presents on a HiDPI surface asks for the physical size it wants through
-/// [`Guest::request_frame`] instead.
+/// pixels. A host that needs a different size passes it to [`Guest::request_frame`], in the same
+/// logical pixels.
 #[derive(Clone, Copy, Debug)]
 pub struct GuestOptions {
     /// The initial content size.
@@ -77,8 +77,9 @@ pub struct GuestOptions {
 /// One frame, handed from the guest thread to the host loop.
 ///
 /// The surface is the renderer's own opaque handle (`WgpuOffscreenSurface` for the wgpu backend),
-/// which the host downcasts to the type its backend publishes. It is kept alive by this value, so
-/// a host may sample it after the guest has drawn again.
+/// which the host downcasts to the type its backend publishes. This value keeps the target alive for
+/// as long as the host holds it, but a later frame of the same size renders into the same target: a
+/// host samples this frame before asking for the next one.
 pub struct GuestFrame {
     surface: Arc<dyn Any + Send + Sync>,
     size: Size<DevicePixels>,
@@ -96,7 +97,7 @@ impl GuestFrame {
     }
 }
 
-/// Work the host posts back to the guest thread.
+/// Work the host posts to the guest thread.
 type GuestUpdate = Box<dyn FnOnce(&mut Window, &mut App) + Send>;
 
 /// Work the host posts back to the guest thread.
