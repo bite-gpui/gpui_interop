@@ -145,19 +145,29 @@ impl GpuId {
     ///
     /// [`gpui::GpuAdapterInfo`] carries the adapter's PCI ids (the permanent part of its `GpuId`)
     /// and the Vulkan device name; the render node a non-Vulkan producer opens comes from
-    /// `VK_EXT_physical_device_drm`, which no `wgpu` adapter exposes. So this opens a short-lived
-    /// instance and matches the physical device by PCI id — no device is created — and returns
-    /// `None` when no Vulkan device matches (an OpenGL adapter, or a name-only backend).
+    /// `VK_EXT_physical_device_drm`, which no `wgpu` adapter exposes. When the platform's session
+    /// handle is a DRM render node — which is the Linux backend's usual answer — it names the exact
+    /// card this process enumerated, so the node is taken from it directly; otherwise this opens a
+    /// short-lived instance and matches the physical device by PCI id, creating no device, and
+    /// returns `None` when no Vulkan device matches (an OpenGL adapter, or a name-only backend).
     ///
-    /// The platform's session handle is not consulted: on Linux it is a DRM render node, but the
-    /// match here is the permanent pair, so two identical cards resolve to the first matching
-    /// Vulkan device. Once a physical device is chosen, `of` reads its own node.
+    /// Without a session handle the permanent pair is the match, so two identical cards resolve to
+    /// the first matching Vulkan device.
     ///
     /// This is how an application turns a [`gpui::GpuPreference::Custom`] choice into the identity a
     /// producer uses: the preference picks the renderer's adapter, this names the same GPU to the
     /// producer, and [`Adapter::gpu_id`] confirms it once a canvas exists.
     #[cfg(feature = "gpui")]
     pub fn from_adapter(info: &gpui::GpuAdapterInfo) -> Option<Self> {
+        // The session handle is the exact adapter in this process. On Linux it is the render node
+        // itself, so nothing has to be re-derived through an instance and a PCI match.
+        if let Some(gpui::SessionGpuId::Drm { render_minor }) = info.id.session {
+            return Some(Self {
+                name: info.name.clone(),
+                render_node: Some(PathBuf::from(format!("/dev/dri/renderD{render_minor}"))),
+            });
+        }
+
         // A backend that reports no PCI ids (OpenGL often reports both as zero) cannot be matched
         // this way, and matching zero against zero would name the wrong GPU.
         let vendor_id = info.vendor_id()?;
@@ -2287,5 +2297,48 @@ mod tests {
             error.to_string().contains("plane 1"),
             "the error should name the plane: {error}"
         );
+    }
+
+    /// The session handle the platform already resolved names the exact card, so `from_adapter`
+    /// takes the render node from it rather than opening an instance and matching PCI.
+    #[cfg(feature = "gpui")]
+    #[test]
+    fn from_adapter_reads_the_sessions_render_node() {
+        let info = gpui::GpuAdapterInfo::new(
+            gpui::GpuId {
+                permanent: gpui::PermanentGpuId::Pci {
+                    vendor_id: Some(0x8086),
+                    device_id: 0x1916,
+                    subsys_id: None,
+                    revision: None,
+                },
+                session: Some(gpui::SessionGpuId::Drm { render_minor: 128 }),
+            },
+            "Intel(R) HD Graphics 520",
+            gpui::GpuDeviceType::Integrated,
+            gpui::GpuBackend::Vulkan,
+            false,
+        );
+        let gpu = GpuId::from_adapter(&info).expect("a DRM session names a render node");
+        assert_eq!(gpu.name, "Intel(R) HD Graphics 520");
+        assert_eq!(gpu.render_node, Some(PathBuf::from("/dev/dri/renderD128")));
+    }
+
+    /// An adapter with no PCI identity and no render node cannot be mapped; guessing would name the
+    /// wrong GPU to a producer.
+    #[cfg(feature = "gpui")]
+    #[test]
+    fn from_adapter_refuses_an_adapter_it_cannot_name() {
+        let info = gpui::GpuAdapterInfo::new(
+            gpui::GpuId {
+                permanent: gpui::PermanentGpuId::Name("llvmpipe".into()),
+                session: None,
+            },
+            "llvmpipe",
+            gpui::GpuDeviceType::Cpu,
+            gpui::GpuBackend::Vulkan,
+            true,
+        );
+        assert!(GpuId::from_adapter(&info).is_none());
     }
 }
