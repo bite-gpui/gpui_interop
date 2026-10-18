@@ -215,6 +215,117 @@ front:
    paint — a decoder or capture thread — reads the GPU identity after a canvas has run once through
    `gpui_interop::gpu_id()`; `Adapter::gpu_id` remembers it.
 
+## Choosing the GPU
+
+The same-GPU rule decides whether a producer can exist at all, so the GPU is chosen **once, for the
+process, before the first window** — `GpuPreference` on `Application`. There is no runtime switch: a
+settings change applies on the next launch. (A [`Guest`](#guest-mode-gpui-inside-a-host-loop) states
+the same choice in its renderer factory, because its headless context is what creates the device.)
+
+| preference | use it when |
+| --- | --- |
+| `LowPower` (the default) | the producer does not need the discrete GPU. On a hybrid laptop this is the panel's GPU, so the window never wakes the dGPU. |
+| `HighPerformance` | a 3D engine or CAD viewport wants the discrete GPU. The renderer follows it, and the producer shares its device. |
+| `Device(GpuId)` | a saved choice from a settings panel. Store the id's **permanent** part; the session handle is skipped when serialised. |
+| `Custom(predicate)` | the requirement is not a device class — a hardware decoder (`gpui_va::decode_preference`), a minimum Vulkan feature, another capability the adapter list does not state. |
+
+`HighPerformance`, `Device` and `Custom` are **preferences, not pins**: if the display cannot be
+configured on the chosen adapter (or a saved card is gone), the renderer falls back to `Auto`'s order.
+Read `App::active_gpu()` once the first window exists to confirm what was actually chosen.
+
+### A CAD viewport on the discrete GPU
+
+A CAD engine is a producer that owns its device: it wants the fast GPU, and the renderer must be on
+that same GPU or the dma-buf cannot be imported. State that before the first window:
+
+```rust
+use gpui::GpuPreference;
+
+let app = gpui::application().with_gpu_preference(GpuPreference::HighPerformance);
+```
+
+Inside the view's `gpu_canvas`, `attach` lands the engine on the renderer's own GPU. The renderer type
+is platform-specific — `WgpuRenderer` on Linux, `DirectXRenderer` on Windows:
+
+```rust
+// Linux: the window's renderer is `WgpuRenderer`.
+let interop = gpui_interop::attach(gpu.try_device::<gpui_wgpu::WgpuRenderer>())?;
+let device = interop.adapter().gpu_device(); // a dma-buf-capable Vulkan device on the renderer's GPU
+// ... or, for an engine that owns its own device, the identity to match:
+// let gpu = interop.adapter().gpu_id();
+
+// Windows: the window's renderer is `DirectXRenderer`, and `wgpu` matches its adapter by LUID.
+// let interop = gpui_interop::attach(gpu.try_device::<gpui::DirectXRenderer>())?;
+// let (device, queue) = interop.adapter().wgpu().expect("the renderer's adapter");
+```
+
+Keep the default `LowPower` when the engine does not need the dGPU: a renderer on the discrete GPU
+keeps it powered for the window's lifetime and crosses PCIe to the panel on every frame. Check
+`active_gpu()` if the engine has hard requirements; a silent fallback to the integrated GPU means the
+engine should either run there or fall back to a CPU copy.
+
+### A user-chosen adapter
+
+A preferences panel lists `enumerate_gpus()` and stores the chosen adapter's `GpuId`. Serialisation
+keeps the permanent part and drops the session handle, so the stored value re-resolves on the next
+boot through `Device`:
+
+```rust
+use gpui::{GpuId, GpuPreference};
+
+// In the settings panel: `chosen: &GpuAdapterInfo`.
+let saved = serde_json::to_string(&chosen.id)?;
+
+// At startup, before the first window.
+let preference = match saved_config.as_deref() {
+    Some(saved) => GpuPreference::Device(serde_json::from_str::<GpuId>(saved)?),
+    None => GpuPreference::LowPower,
+};
+let app = gpui::application().with_gpu_preference(preference);
+```
+
+`Device` matches the permanent part (PCI ids, a PnP id, or a name) and falls back to `Auto` when the
+card is absent — another reason to read `active_gpu()` after the window. The panel cannot switch the
+renderer live: persist the choice and tell the user it applies on the next launch.
+
+### A capability-based choice
+
+When the requirement is not a device class, express it as a predicate over the enumerated list. A
+CAD engine that wants a discrete Vulkan device says so directly; `gpui_va::decode_preference` is the
+same shape for a decoder requirement.
+
+```rust
+use std::sync::Arc;
+use gpui::{GpuAdapterInfo, GpuBackend, GpuDeviceType, GpuPreference};
+
+let preference = GpuPreference::Custom(Arc::new(|gpus: &[GpuAdapterInfo]| {
+    gpus.iter().position(|gpu| {
+        gpu.device_type == GpuDeviceType::Discrete && gpu.backend == GpuBackend::Vulkan
+    })
+}));
+```
+
+The predicate returns **one** index. `None`, or an index past the list, fails the window naming the
+shortfall rather than silently drawing on a GPU the application did not choose.
+
+### Mapping an adapter to a producer
+
+On Linux, `gpui_interop::GpuId::from_adapter` (behind the crate's `gpui` feature) maps an enumerated
+`GpuAdapterInfo` to the producer's identity — the device name and DRM render node — and
+`GpuId::matches_adapter` is the name join a predicate can use without opening anything. Inside a
+canvas, `Adapter::gpu_id` confirms the renderer's GPU and remembers it for a producer off the paint
+(`gpui_interop::gpu_id()`). On Windows the identity is the adapter LUID, which `Adapter::wgpu` matches
+for a producer that can render on wgpu.
+
+### What can only be checked after the device exists
+
+`GpuAdapterInfo` deliberately carries no capabilities: proving one creates a device, which is the
+cost enumeration exists to avoid. Once the first window has made the renderer's device,
+`App::dmabuf_capabilities()` reports the formats and DRM modifiers the renderer will import, and
+`gpui_interop::GpuDevice::linear_layout` reports the plane layout its device gives a linear buffer.
+Use those to choose the producer's layout, and `App::active_gpu()` to confirm the choice. A platform
+whose surfaces are not dma-bufs returns `None`.
+
 ## Guest mode: GPUI inside a host loop
 
 The crate also works in the opposite direction. With the `guest` feature, `gpui_interop::Guest` runs a
