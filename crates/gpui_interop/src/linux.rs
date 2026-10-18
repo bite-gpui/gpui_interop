@@ -152,7 +152,9 @@ impl GpuId {
     pub fn from_adapter(info: &gpui::GpuAdapterInfo) -> Option<Self> {
         // A backend that reports no PCI ids (OpenGL often reports both as zero) cannot be matched
         // this way, and matching zero against zero would name the wrong GPU.
-        if info.device_id == 0 {
+        let vendor_id = info.vendor_id()?;
+        let device_id = info.device_id()?;
+        if device_id == 0 {
             return None;
         }
         // See `LOADER`: the loader's global entry points must not be initialised concurrently.
@@ -164,7 +166,7 @@ impl GpuId {
             // SAFETY: `physical_device` came from this instance.
             let properties =
                 unsafe { instance.get_physical_device_properties(*physical_device) };
-            properties.vendor_id == info.vendor_id && properties.device_id == info.device_id
+            properties.vendor_id == vendor_id && properties.device_id == device_id
         })?;
         Some(Self::of(&instance, physical_device))
     }
