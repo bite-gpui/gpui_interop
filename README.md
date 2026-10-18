@@ -67,19 +67,42 @@ fn bridge(gpu: &mut gpui::GpuCanvasContext) -> Result<(), Unavailable> {
     // 1. Connect to the window's active renderer.
     let interop = attach(gpu.try_device::<gpui::DirectXRenderer>())?;
 
-    // 2. Get a wgpu device and queue on the same physical GPU (requires the `wgpu` feature).
+    // 2. A producer that wants wgpu can get a device on the renderer's own adapter (Windows;
+    //    the `wgpu` feature). This is an adapter match, not a transport.
     let (device, queue) = interop.adapter().wgpu().expect("no matching GPU adapter found");
 
-    // 3. Render your 3D scene or video frame on `device`, then pass the exported surface to GPUI
-    //    through the `surface()` element (or `gpu_canvas`'s own `paint_surface`).
+    // 3. The hand-off is the platform's native transport:
+    //    - Windows: allocate a `SharedSurface` on a Direct3D 12 device on that adapter, signal a
+    //      `Fence`, and paint its `SurfaceSource`;
+    //    - Linux: a Vulkan producer allocates a `SharedBuffer` (or uses `Adapter::gpu_device`).
     Ok(())
 }
 ```
 
-The snippet above shows the Windows setup using `gpui::DirectXRenderer` and `Adapter::wgpu()`. On Linux,
-the window uses `gpui_wgpu::WgpuRenderer`, and you obtain your device from
-`interop.adapter().gpu_device()` instead — which creates a `dma-buf`-capable Vulkan device on the same
-physical GPU (see the Linux code example below).
+The snippet above shows the Windows adapter match using `gpui::DirectXRenderer` and
+`Adapter::wgpu()`. On Linux, the window uses `gpui_wgpu::WgpuRenderer`, and a producer that owns its
+device obtains one from `interop.adapter().gpu_device()` instead — which creates a dma-buf-capable
+Vulkan device on the same physical GPU (see the Linux code example below).
+
+### wgpu producers
+
+`Adapter::wgpu()` is the **adapter match**, not a wgpu transport. On Windows it gives a
+`wgpu::Device`/`Queue` on the renderer's Direct3D adapter; the frame still leaves through a raw
+Direct3D 12 `SharedSurface`, because wgpu does not create shareable textures. On Linux it returns
+`None`: the window renderer already is wgpu, so a wgpu producer does not need this crate at all.
+
+A wgpu producer therefore has two supported shapes:
+
+- **Same device — recommended.** Render on the window's own wgpu device (always on Linux; on Windows
+  when the window's renderer factory installs `WgpuRenderer`) and composite the texture with GPUI's
+  built-in imported-texture path — `ImportedTextureExt::to_imported_handle` plus
+  `GpuCanvasContext::paint_texture`. No CPU copy, no `gpui_interop`.
+- **Cross-device native.** Use the platform's native producer: raw Vulkan on Linux (`SharedBuffer`)
+  or raw Direct3D 12 on Windows (`SharedSurface` + `Fence`). A wgpu engine can use `Adapter::wgpu()`
+  to land on the right adapter, but it still needs the native hand-off.
+
+There is no `wgpu::Texture` export helper today. That would be a wgpu-hal-level feature, not a flag on
+this crate.
 
 If the canvas does not expose a compatible hardware device (for example, when running in an offscreen
 test or an unsupported renderer), `attach` returns `Err(Unavailable::NoDevice)` instead of panicking so
@@ -373,7 +396,7 @@ working tree — see the next section.
 | Feature | Description |
 | --- | --- |
 | *(default)* | Core library and platform transport types (`SharedBuffer`, `SharedSurface`, `Fence`) for Linux and Windows. |
-| `wgpu` | Enables `Adapter::wgpu`, which initializes a `wgpu::Device` and `wgpu::Queue` on the same physical GPU as the GPUI window. |
+| `wgpu` | Enables `Adapter::wgpu`, which initializes a `wgpu::Device` and `wgpu::Queue` on the same physical GPU as the GPUI window. This is the adapter match, not a wgpu transport; the hand-off still uses the native surface type. |
 | `gpui` | Enables the viewport input helpers (`surface_input`, `SurfaceInput`, `SurfaceEvent`, `SurfacePoint`) for routing pointer events into an embedded 3D scene or video player. |
 | `example` | Enables the dependencies needed to build and run the Linux window examples on top of `wgpu`. |
 | `readback-test` | Enables the headless GPU compositing and pixel read-back integration test. |

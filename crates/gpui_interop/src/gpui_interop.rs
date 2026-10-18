@@ -17,10 +17,11 @@
 //!
 //! - [`Interop::adapter`] returns an [`Adapter`], the producer's view of the window's device.
 //! - With the `wgpu` feature, `Adapter::wgpu` returns a wgpu `Device` and `Queue` on the adapter that
-//!   matches the window's device (a LUID match on Windows), or `None` when none does. Rendering with
-//!   those puts the producer's pixels on the same physical GPU as the window. On Linux the match is
-//!   [`Adapter::gpu_device`], which makes a second logical device on the renderer's own
-//!   `vk::PhysicalDevice`.
+//!   matches the window's device (a LUID match on Windows), or `None` when none does. It is the
+//!   adapter match, not a wgpu transport: the frame still leaves through the platform's native
+//!   surface type, so a wgpu producer that can render on the window's own device should use GPUI's
+//!   imported-texture path instead. On Linux the match is [`Adapter::gpu_device`], which makes a
+//!   second logical device on the renderer's own `vk::PhysicalDevice`.
 //! - On Windows, [`SharedSurface`] / [`Fence`] are the producer half of the Direct3D transport: a
 //!   Direct3D 12 producer renders into a shared texture and signals a fence, and hands GPUI the
 //!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
@@ -49,10 +50,10 @@
 //!     // Negotiate with the window's renderer, inside the canvas that lends its device.
 //!     let interop = attach(gpu.try_device::<gpui::DirectXRenderer>())?;
 //!
-//!     // With the `wgpu` feature, this gives a device and queue on a matching adapter.
+//!     // With the `wgpu` feature, this gives a device and queue on a matching adapter (Windows).
 //!     let (device, queue) = interop.adapter().wgpu().expect("no matching adapter");
 //!
-//!     // Render the frame on `device`, then hand its surface to the scene through `surface()`.
+//!     // The hand-off is native: a `SharedSurface` on Windows, a `SharedBuffer` on Linux.
 //!     Ok(())
 //! }
 //! ```
