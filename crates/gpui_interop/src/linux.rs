@@ -139,11 +139,15 @@ impl GpuId {
 
     /// The producer-facing identity of an adapter the application enumerated.
     ///
-    /// [`gpui::GpuAdapterInfo`] carries the PCI ids and the Vulkan device name; the render node a
-    /// non-Vulkan producer opens comes from `VK_EXT_physical_device_drm`, which no `wgpu` adapter
-    /// exposes. So this opens a short-lived instance and matches the physical device by PCI id — no
-    /// device is created — and returns `None` when no Vulkan device matches (an OpenGL adapter, or a
-    /// name-only backend).
+    /// [`gpui::GpuAdapterInfo`] carries the adapter's PCI ids (the permanent part of its `GpuId`)
+    /// and the Vulkan device name; the render node a non-Vulkan producer opens comes from
+    /// `VK_EXT_physical_device_drm`, which no `wgpu` adapter exposes. So this opens a short-lived
+    /// instance and matches the physical device by PCI id — no device is created — and returns
+    /// `None` when no Vulkan device matches (an OpenGL adapter, or a name-only backend).
+    ///
+    /// The platform's session handle is not consulted: on Linux it is a DRM render node, but the
+    /// match here is the permanent pair, so two identical cards resolve to the first matching
+    /// Vulkan device. Once a physical device is chosen, `of` reads its own node.
     ///
     /// This is how an application turns a [`gpui::GpuPreference::Custom`] choice into the identity a
     /// producer uses: the preference picks the renderer's adapter, this names the same GPU to the
