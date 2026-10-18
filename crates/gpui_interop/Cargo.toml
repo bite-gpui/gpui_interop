@@ -52,6 +52,14 @@ name = "surface_input"
 path = "tests/surface_input.rs"
 required-features = ["input-test"]
 
+# The guest runner's test: a worker thread runs a headless GPUI app, hands a frame to the test
+# thread as a shareable surface, and the test samples it on the renderer's device. Opt-in like the
+# read-back test: it needs the platform bundle and a real Vulkan device.
+[[test]]
+name = "guest_runner"
+path = "tests/guest_runner.rs"
+required-features = ["guest-test"]
+
 [features]
 default = []
 # The cross-API bridge: the wgpu side of a producer's device, and the transports it moves.
@@ -76,14 +84,28 @@ readback-test = ["gpui", "wgpu", "gpui/platform", "gpui/test-support"]
 # input, so it needs "test-support"'s harness — and the gateway's own facade dependency, but neither
 # the platform bundle nor a GPU. Kept on its own so the ordinary `cargo test` builds none of it.
 input-test = ["gpui", "gpui/test-support"]
+# The guest runner: headless GPUI on a worker thread, handing frames to a foreign host loop. It
+# needs the facade's platform bundle (a headless `Application`) and an async channel for the
+# command loop. The renderer is the caller's, so this crate names no graphics backend.
+guest = ["gpui", "gpui/platform", "dep:futures"]
+# The runner's test (`tests/guest_runner.rs`) builds a real headless wgpu renderer and samples its
+# frame on the host thread, so it needs the guest feature and the renderer crate, which is already
+# a Linux dev-dependency. Kept apart from `guest` so the library does not pull in a backend.
+guest-test = ["guest"]
 
 [dependencies]
+# The transport and the guest runner report failures as `anyhow` errors; the Linux arm already named it,
+# and the guest is not Linux-shaped, so it is a plain dependency rather than a target one.
+anyhow.workspace = true
 # The facade is named only by the example and the read-back test, whose windows are its; the library
 # itself names the engine's payload types. Optional, so a producer that depends on this crate — a
 # decoder, a capture pipeline — does not inherit the authoring/runtime/platform stack the facade
 # carries.
 gpui = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
+# The guest runner's command channel: the host sends work from its own loop, and the guest task
+# awaits it on GPUI's foreground executor. Optional, so the crate's other features stay free of it.
+futures = { workspace = true, optional = true }
 
 [build-dependencies]
 # The test binary opens a real Direct3D window, whose prompt imports `TaskDialogIndirect`. Only the
@@ -99,7 +121,6 @@ gpui_engine.workspace = true
 # The Linux transport exports a shareable image as a dma-buf through Vulkan's external-memory
 # extensions. `gpui_va`'s VA-API export is its own path and does not use this.
 ash = "0.38"
-anyhow.workspace = true
 # A `Tiling::Tiled` request the device cannot soundly honour is refused, not silently mistiled.
 log = "0.4.16"
 
@@ -115,7 +136,6 @@ windows = { workspace = true, features = ["Win32_Graphics_Direct3D12"] }
 # public `Platform`/`PlatformWindow` seams, and `gpui_windows` is only here to build the platform.
 # A dev-dependency and not a dependency: nothing in the library names it, and the facade's own
 # graph stays free of the backend crate.
-anyhow.workspace = true
 gpui_windows.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

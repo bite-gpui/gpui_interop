@@ -31,6 +31,13 @@
 //!   reports it back, while [`SharedBuffer::export_at`] pushes bytes at a plane layout the producer
 //!   declares — the shape a decoder or capture pipeline whose layout comes from elsewhere needs.
 //!
+//! # The other direction
+//!
+//! With the `guest` feature, [`Guest`] runs the inverse: headless GPUI on a worker thread for a host
+//! loop that owns the window and its cadence. Frames leave as shareable surfaces, so the host samples
+//! them on the same device; work and input enter through [`Guest::update`]. Only the frame handle and
+//! plain commands cross the thread; the `!Send` renderer stays pinned to the guest.
+//!
 //! # Sketch
 //!
 //! ```rust
@@ -57,6 +64,7 @@
 //! backends that are implemented today are exposed; the rest arrive as they are written.
 
 mod adapter;
+#[cfg(feature = "guest")]
 mod guest;
 #[cfg(feature = "gpui")]
 mod input;
@@ -68,6 +76,8 @@ mod macos;
 mod windows;
 
 pub use adapter::{Adapter, Unavailable};
+#[cfg(feature = "guest")]
+pub use guest::{Guest, GuestFrame, GuestOptions};
 #[cfg(feature = "gpui")]
 pub use input::{
     SurfaceButton, SurfaceEvent, SurfaceInput, SurfaceModifiers, SurfacePoint, surface_input,

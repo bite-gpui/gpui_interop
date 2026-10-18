@@ -191,6 +191,38 @@ front:
 3. If no matching physical GPU is found, the adapter call returns `None` rather than guessing which card
    to use.
 
+## Guest mode: GPUI inside a host loop
+
+The crate also works in the opposite direction. With the `guest` feature, `gpui_interop::Guest` runs a
+headless GPUI app on a worker thread for a host that owns its own window and presents through another
+API. Nothing about the guest's renderer crosses the thread: the host asks for a frame, the guest draws
+and presents it, and the renderer's shareable surface comes back.
+
+```rust
+use gpui::PlatformRenderer;
+use gpui_interop::{Guest, GuestOptions};
+use gpui_wgpu::{WgpuHeadlessRenderer, WgpuOffscreenSurface};
+
+let mut guest = Guest::spawn(
+    GuestOptions { size: size(px(1280.), px(720.)) },
+    || Ok(Box::new(WgpuHeadlessRenderer::new()?) as Box<dyn PlatformRenderer>),
+    |_window, cx| cx.new(|_| MyView),
+)?;
+
+// Each turn of the host's loop:
+let frame = guest.request_frame(None)?;
+let surface = frame.surface().downcast_ref::<WgpuOffscreenSurface>();
+// sample surface.texture() on the same wgpu device
+
+// Work and input go back the other way, in order:
+guest.update(|window, cx| { /* ... */ })?;
+```
+
+Frames are drawn only when the host asks, so the host's cadence wins; the guest's animations and async
+tasks simply mark the window dirty until the next request. `request_frame` errors when the renderer has
+no shareable surface, so a CPU-only backend fails where the GPU path is asked for instead of silently
+returning an empty frame.
+
 ## Cargo features
 
 | Feature | Description |
@@ -201,6 +233,8 @@ front:
 | `example` | Enables the dependencies needed to build and run the Linux window examples on top of `wgpu`. |
 | `readback-test` | Enables the headless GPU compositing and pixel read-back integration test. |
 | `input-test` | Enables headless tests that route pointer events through `surface_input`. |
+| `guest` | Enables `Guest`, the headless worker-thread runner that hands frames to a foreign host loop, with a command channel back. |
+| `guest-test` | Enables the guest runner's GPU integration test. |
 
 ## Using with `bite-gpui` 1.23.301
 
@@ -229,6 +263,7 @@ cargo test -p gpui_interop
 # Optional integration tests (each opens a window):
 cargo test -p gpui_interop --features readback-test   # composites a buffer in GPUI and reads the pixels back
 cargo test -p gpui_interop --features input-test      # routes pointer events through surface_input
+cargo test -p gpui_interop --features guest-test      # a worker thread hands a frame to the host loop
 
 # Windows integration test: composites a shared D3D12 texture on GPUI's D3D11 renderer.
 cargo test -p gpui_interop a_shared_d3d12_surface
@@ -243,6 +278,7 @@ crates/gpui_interop/
   src/linux.rs                    Linux dma-buf support: SharedBuffer, GpuDevice, GpuId, Tiling, Fence
   src/windows.rs                  Windows D3D12 support: SharedSurface, Fence
   src/macos.rs                    macOS IOSurface stub (not yet implemented)
+  src/guest.rs                    Guest: headless GPUI on a worker thread, handing frames to a host loop
   src/input.rs                    Input routing for interactive viewports and surfaces
   examples/                       Linux demos: interop_linux, interop_cube, interop_cube_drag
 ```

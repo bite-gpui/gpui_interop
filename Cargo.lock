@@ -2239,6 +2239,7 @@ dependencies = [
  "anyhow",
  "ash",
  "embed-resource",
+ "futures",
  "gpui",
  "gpui_engine",
  "gpui_wgpu",
