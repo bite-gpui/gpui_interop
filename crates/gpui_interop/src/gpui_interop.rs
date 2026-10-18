@@ -17,8 +17,10 @@
 //!
 //! - [`Interop::adapter`] returns an [`Adapter`], the producer's view of the window's device.
 //! - With the `wgpu` feature, `Adapter::wgpu` returns a wgpu `Device` and `Queue` on the adapter that
-//!   matches the window's device, or `None` when none does. Rendering with those puts the producer's
-//!   pixels on the same physical GPU as the window.
+//!   matches the window's device (a LUID match on Windows), or `None` when none does. Rendering with
+//!   those puts the producer's pixels on the same physical GPU as the window. On Linux the match is
+//!   [`Adapter::gpu_device`], which makes a second logical device on the renderer's own
+//!   `vk::PhysicalDevice`.
 //! - On Windows, [`SharedSurface`] / [`Fence`] are the producer half of the Direct3D transport: a
 //!   Direct3D 12 producer renders into a shared texture and signals a fence, and hands GPUI the
 //!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
@@ -55,8 +57,9 @@
 //! }
 //! ```
 //!
-//! The `wgpu` line requires the `wgpu` feature; without it, `Adapter::wgpu` is not compiled in, and
-//! only the Windows handle transport is available.
+//! The `wgpu` line requires the `wgpu` feature; without it, `Adapter::wgpu` is not compiled in. The
+//! Linux `SharedBuffer`/`Fence` transport and the Windows handles remain available without it, because
+//! neither is a `wgpu` client.
 //!
 //! # Provisional
 //!

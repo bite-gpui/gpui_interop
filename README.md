@@ -35,7 +35,7 @@ OS-level handle (a `dma-buf` on Linux or a shared texture on Windows), and passe
 
 | Platform | Handle types | How it works |
 | --- | --- | --- |
-| **Linux** | `SharedBuffer` → `gpui::DmaBufHandle` | Exports a Vulkan image as a `dma-buf` with its DRM format modifier (linear or driver-tiled, single-plane or two-plane NV12). Frame synchronization is handled by a `Fence` that exports a `sync_file`. |
+| **Linux** | `SharedBuffer` → `gpui::DmaBufHandle` | Exports a Vulkan image as a `dma-buf` with its DRM format modifier (linear or driver-tiled, single-plane or two-plane NV12). `SharedBuffer::new` lets the driver choose the layout; `SharedBuffer::export_at` pushes one the producer declares, which is the shape a decoder or a canonical DRM buffer needs. Frame synchronization is handled by a `Fence` that exports a `sync_file`. |
 | **Windows** | `SharedSurface` + `Fence` | Exports a shared texture from a Direct3D 12 renderer and opens it on GPUI's Direct3D 11 device, using a shared fence to synchronize the two GPU queues. |
 | **macOS** | `IOSurface` | **Not yet implemented.** Planned support will wrap an external renderer's `IOSurface` in an `MTLTexture`. |
 
@@ -162,6 +162,28 @@ fn tile(slot: Rc<RefCell<Option<Tiles>>>, pick: fn(&Tiles) -> &SharedBuffer) -> 
 }
 ```
 
+### When the layout comes from somewhere else
+
+A decoder, a camera or a canonical DRM buffer already has a plane layout, and on some GPUs the
+driver's own linear layout pads it (an NVIDIA 930M puts `NV12` chroma at 65,536 bytes rather than
+4,096). Ask the device what it will actually sample **before** allocating:
+
+```rust
+// The layout this device gives a plain LINEAR image, and the bytes that image needs.
+let format = SurfaceFormatKind::nv12();
+let layout = device.linear_layout(format, width, height, &planes)?;
+// ...place the planes at `layout.native` and allocate at least `layout.required` bytes...
+let buffer = SharedBuffer::export_at(&device, width, height, format, &layout.native, bytes)?;
+```
+
+`export_at` allocates device-local memory and stages the producer's bytes into it, because the NVIDIA
+driver faults on a host-visible exportable allocation. It also records that the buffer is written at
+export, so `clear` and `fill` refuse it.
+
+The transfer curve is separate from the layout: a buffer holding display-encoded values (sRGB bytes,
+or BT.709 `R'G'B'`) is the default, and one holding linear light declares it with
+`SharedBuffer::with_transfer(TransferFunction::Linear)`. `TransferFunction` is `gpui::TransferFunction`.
+
 ## How it works under the hood
 
 ```mermaid
@@ -189,7 +211,9 @@ front:
      creates a second logical Vulkan device on that same physical card, ensuring your producer's render
      queue never races with GPUI's queue.
 3. If no matching physical GPU is found, the adapter call returns `None` rather than guessing which card
-   to use.
+   to use (`Adapter::wgpu` on Windows, `Adapter::gpu_device` on Linux). A producer that runs off the
+   paint — a decoder or capture thread — reads the GPU identity after a canvas has run once through
+   `gpui_interop::gpu_id()`; `Adapter::gpu_id` remembers it.
 
 ## Guest mode: GPUI inside a host loop
 
@@ -223,6 +247,14 @@ tasks simply mark the window dirty until the next request. `request_frame` error
 no shareable surface, so a CPU-only backend fails where the GPU path is asked for instead of silently
 returning an empty frame.
 
+The renderer is the caller's, so the sample above uses `gpui_wgpu`'s headless renderer (the
+`headless` feature of `gpui_wgpu`); any renderer that answers `PlatformRenderer` and exposes an
+`offscreen_surface_handle` works. `WgpuHeadlessRenderer::with_gpu_preference` pins the guest to a GPU,
+and the headless context is process-wide, so the host that samples joins the same device rather than
+opening a second one. The guest seam (`Window::present`, the headless window honouring a renderer
+factory) is newer than the last published core, so this feature currently needs the `bite_v1.23.x`
+working tree — see the next section.
+
 ## Cargo features
 
 | Feature | Description |
@@ -233,25 +265,40 @@ returning an empty frame.
 | `example` | Enables the dependencies needed to build and run the Linux window examples on top of `wgpu`. |
 | `readback-test` | Enables the headless GPU compositing and pixel read-back integration test. |
 | `input-test` | Enables headless tests that route pointer events through `surface_input`. |
-| `guest` | Enables `Guest`, the headless worker-thread runner that hands frames to a foreign host loop, with a command channel back. |
+| `guest` | Enables `Guest`, the headless worker-thread runner that hands frames to a foreign host loop, with a command channel back. The renderer comes from the caller, so a test build also needs a backend such as `gpui_wgpu`'s `headless` feature. |
 | `guest-test` | Enables the guest runner's GPU integration test. |
 
-## Using with `bite-gpui` 1.23.301
+## Using with `bite-gpui`
 
-This workspace pulls GPUI from `crates.io` rather than a git branch. In `Cargo.toml`, the published
-`bite-gpui` packages are aliased back to their standard crate names so imports like `use gpui::...`
-compile unchanged:
+During development this workspace takes the core from the sibling checkout — `gpui`, `gpui_engine`,
+`gpui_wgpu` and `gpui_windows` are path dependencies on `../bite-gpui/crates/…` — so a fix in the
+renderer reaches this stack without a release. On release each path becomes the published package.
+
+The last published release is `1.23.302`. A consumer aliases the published packages back to their
+standard crate names so imports like `use gpui::...` compile unchanged:
 
 ```toml
 [workspace.dependencies]
-gpui         = { package = "bite-gpui",       version = "1.23.301", default-features = false }
-gpui_engine  = { package = "bite-gp-engine",  version = "1.23.301" }
-gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.23.301" }
-gpui_windows = { package = "bite-gp-windows", version = "1.23.301" }
+gpui         = { package = "bite-gpui",       version = "1.23.302", default-features = false }
+gpui_engine  = { package = "bite-gp-engine",  version = "1.23.302" }
+gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.23.302" }
+gpui_windows = { package = "bite-gp-windows", version = "1.23.302" }
 ```
 
-To test against a local checkout or a custom GPUI branch, replace those version entries with `path` or
-`git`/`branch` sources.
+The crate's current line needs core additions that are on `bite_v1.23.x` **after** that tag: the
+guest seams (a public `Window::present`, the headless renderer factory, the offscreen surface
+handle), the dma-buf explicit-layout guard, and the transfer function. Until the next amendment to
+the `1.23` line is published, point at the branch or a checkout instead:
+
+```toml
+[workspace.dependencies]
+gpui         = { path = "../bite-gpui/crates/gpui", default-features = false }
+gpui_engine  = { path = "../bite-gpui/crates/gpui_engine" }
+gpui_wgpu    = { path = "../bite-gpui/crates/gpui_wgpu" }
+gpui_windows = { path = "../bite-gpui/crates/gpui_windows" }
+```
+
+To test against a custom GPUI branch, replace those paths with `git`/`branch` sources.
 
 ## Running the tests
 
@@ -264,6 +311,10 @@ cargo test -p gpui_interop
 cargo test -p gpui_interop --features readback-test   # composites a buffer in GPUI and reads the pixels back
 cargo test -p gpui_interop --features input-test      # routes pointer events through surface_input
 cargo test -p gpui_interop --features guest-test      # a worker thread hands a frame to the host loop
+
+# The GPU-backed suites need a Vulkan adapter. On a machine with more than one GPU, pin the PCI
+# device id with `ZED_DEVICE_ID` (the guest and read-back suites both honour it):
+ZED_DEVICE_ID=1916 cargo test -p gpui_interop --features guest-test --test guest_runner -- --test-threads=1
 
 # Windows integration test: composites a shared D3D12 texture on GPUI's D3D11 renderer.
 cargo test -p gpui_interop a_shared_d3d12_surface
@@ -280,6 +331,7 @@ crates/gpui_interop/
   src/macos.rs                    macOS IOSurface stub (not yet implemented)
   src/guest.rs                    Guest: headless GPUI on a worker thread, handing frames to a host loop
   src/input.rs                    Input routing for interactive viewports and surfaces
+  tests/                          Opt-in integration suites: guest_runner, linux_dmabuf_readback, surface_input
   examples/                       Linux demos: interop_linux, interop_cube, interop_cube_drag
 ```
 

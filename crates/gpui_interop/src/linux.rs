@@ -110,6 +110,10 @@ impl LinearLayout {
 ///
 /// Read it inside a `gpu_canvas` with `Adapter::gpu_id`, or, for a producer that runs off the paint,
 /// after a canvas has remembered it: [`gpu_id`].
+///
+/// This is the producer's matchable identity, not the core's `gpui::GpuId`: the latter names an
+/// adapter for `gpui::GpuPreference::Device`, while this one is what a foreign API or process can
+/// check itself — a Vulkan device name and a DRM render node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuId {
     /// The device name Vulkan reports, e.g. `Intel(R) HD Graphics 520`.
