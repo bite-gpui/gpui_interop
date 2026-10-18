@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 use ash::vk;
-use gpui_engine::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind};
+use gpui_engine::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind, TransferFunction};
 
 /// The device extensions an image needs to be exported as a dma-buf, tiled or not.
 const DEVICE_EXTENSIONS: [&str; 4] = [
@@ -890,6 +890,17 @@ impl SharedBuffer {
             memory,
             handle,
         })
+    }
+
+    /// Declare how this buffer's values relate to light, for the renderer's compositor.
+    ///
+    /// A producer whose pipeline writes **linear** light — a 3D engine's render target, a physically
+    /// based pass — says so here, and GPUI encodes it for its display-encoded target. The default
+    /// follows the format (`Srgb` for RGB, the video curve for YCbCr), so an sRGB producer need not
+    /// call this.
+    pub fn with_transfer(mut self, transfer: TransferFunction) -> Self {
+        self.handle.transfer = transfer;
+        self
     }
 
     /// The description the `surface()` element takes. Cheap to clone — the planes share their fds.
@@ -2042,6 +2053,22 @@ mod tests {
         );
         assert_eq!(handle.width, 64);
         assert_eq!(handle.height, 64);
+    }
+
+    /// A producer whose pipeline writes linear light declares it on the handle the renderer takes;
+    /// the default for an RGB buffer is the sRGB encoding every desktop producer emits.
+    #[test]
+    fn a_shared_buffer_can_declare_linear_light() {
+        let Ok(device) = GpuDevice::open() else {
+            eprintln!("skipping: no Vulkan device exports a dma-buf");
+            return;
+        };
+        let buffer = SharedBuffer::new(&device, 4, 4, SurfaceFormatKind::rgba8(), Tiling::Linear)
+            .expect("allocate a shareable buffer");
+        assert_eq!(buffer.handle().transfer, TransferFunction::Srgb);
+
+        let linear = buffer.with_transfer(TransferFunction::Linear);
+        assert_eq!(linear.handle().transfer, TransferFunction::Linear);
     }
 
     #[test]
