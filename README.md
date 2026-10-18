@@ -236,7 +236,8 @@ Read `App::active_gpu()` once the first window exists to confirm what was actual
 ### A CAD viewport on the discrete GPU
 
 A CAD engine is a producer that owns its device: it wants the fast GPU, and the renderer must be on
-that same GPU or the dma-buf cannot be imported. State that before the first window:
+that same GPU or the shared handle cannot be opened on the renderer's device. State that before the
+first window:
 
 ```rust
 use gpui::GpuPreference;
@@ -315,7 +316,8 @@ On Linux, `gpui_interop::GpuId::from_adapter` (behind the crate's `gpui` feature
 `GpuId::matches_adapter` is the name join a predicate can use without opening anything. Inside a
 canvas, `Adapter::gpu_id` confirms the renderer's GPU and remembers it for a producer off the paint
 (`gpui_interop::gpu_id()`). On Windows the identity is the adapter LUID, which `Adapter::wgpu` matches
-for a producer that can render on wgpu.
+internally for a producer that can render on wgpu; a producer that must own its own Direct3D 12
+device needs that LUID and the crate does not expose it yet.
 
 ### What can only be checked after the device exists
 
