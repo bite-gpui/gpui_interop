@@ -35,20 +35,10 @@ name = "interop_cube_drag"
 path = "examples/interop_cube_drag.rs"
 required-features = ["example"]
 
-# The same-device wgpu example: an ordinary wgpu pipeline renders into a `WgpuSurface` on the window
-# renderer's own device, and `paint_texture` composites it. No export, no fence, no CPU copy.
-[[example]]
-name = "interop_wgpu"
-path = "examples/interop_wgpu.rs"
-required-features = ["example"]
-
-# The Bevy example: a headless Bevy app (no `winit`) renders a PBR scene into an offscreen image
-# on the window renderer's own wgpu device, and GPUI composites the image's texture view. Bevy 0.19
-# is the pin, not 0.20: 0.20 depends on wgpu 30, which would put a second wgpu in this graph.
-[[example]]
-name = "interop_bevy"
-path = "examples/interop_bevy.rs"
-required-features = ["bevy-example"]
+# The same-device wgpu and Bevy producers are their own crates under `examples/`, so each one's
+# dependencies and build profile are independent. `cargo run -p interop_wgpu` or
+# `cargo run -p interop_bevy` builds the corresponding producer; switching between them does not
+# rebuild this library.
 
 # The read-back test needs the facade's platform bundle and `test-support` (its own feature), and
 # builds its buffers on the renderer's device through `Adapter::gpu_device`, so it is opt-in and its
@@ -99,10 +89,6 @@ gpui = ["dep:gpui"]
 # `cargo test` would compile the whole platform stack -- and need its system graphics libraries -- for
 # a crate whose own code uses none of it.
 example = ["gpui", "wgpu", "gpui/platform"]
-# The Bevy example's engine. Bevy is an optional *dependency* rather than a dev-dependency for the
-# same reason `gpui` is optional: dev-dependencies are built for every test and example, and a Bevy
-# graph is tens of crates. It implies `example`, because it uses the same windowing and wgpu bridge.
-bevy-example = ["example", "dep:bevy"]
 # The read-back test (`tests/linux_dmabuf_readback.rs`) drives a real offscreen window and builds its
 # buffers on the renderer's device through `Adapter::gpu_device`, so it needs the platform bundle,
 # `gpui/test-support`'s headless harness, and the `wgpu` bridge. Kept apart from `example` so neither
@@ -150,30 +136,7 @@ embed-resource = "3.0"
 # The payload types a dma-buf producer names (`DmaBufHandle`, `DmaBufPlane`, `SurfaceFormatKind`) live
 # in the engine, so the library depends on it rather than the facade.
 gpui_engine.workspace = true
-# The Bevy example's engine, headless: no `bevy_winit`, and only the render, camera, PBR, asset,
-# glTF and log crates. `bevy_log` surfaces the renderer's validation errors, which is how the
-# device-limit failure was found; without a subscriber they are silent. `multi_threaded` keeps
-# Bevy's task pools and its pipelined render thread, so the example measures the engine as it
-# normally runs. Optional so only `bevy-example` pulls it; a dev-dependency would be built for
-# every test in the workspace. `bevy_render` 0.19 depends on `wgpu = "29.0.3"`, which is the
-# workspace's 29.0.4.
-bevy = { version = "0.19.0", default-features = false, features = [
-    "std",
-    "multi_threaded",
-    "bevy_asset",
-    "bevy_camera",
-    "bevy_core_pipeline",
-    "bevy_gltf",
-    "bevy_image",
-    "bevy_light",
-    "bevy_log",
-    "bevy_material",
-    "bevy_mesh",
-    "bevy_pbr",
-    "bevy_render",
-    "bevy_shader",
-    "bevy_window",
-], optional = true }
+
 # The Linux transport exports a shareable image as a dma-buf through Vulkan's external-memory
 # extensions. `gpui_va`'s VA-API export is its own path and does not use this.
 ash = "0.38"

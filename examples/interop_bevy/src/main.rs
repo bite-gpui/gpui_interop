@@ -1,7 +1,7 @@
 //! `interop_bevy`: a Bevy scene inside a GPUI window.
 //!
 //! ```sh
-//! cargo run -p gpui_interop --example interop_bevy --features bevy-example
+//! cargo run -p interop_bevy
 //! ```
 //!
 //! Bevy is built **headless**: `default-features = false`, no `bevy_winit`, no window, no event
@@ -50,9 +50,9 @@
 //! `TextureView` with `paint_texture`. The transfer export costs ~0.14–0.8 ms/frame here and the
 //! import ~0.02 ms, so transport is not what separates a hand-written wgpu pipeline from Bevy.
 //!
-//! In release on the test laptop the engine floor is ~5.8 ms/frame on the Intel HD 520 and
-//! ~3.6 ms on the NVIDIA 930M; the 49-cube field adds only ~0.5 ms. The same field as a
-//! hand-written wgpu producer costs 1.08 ms and 0.31 ms, which is where the producer gap lives.
+//! In release on the test laptop the engine floor is ~5.9 ms/frame on the Intel HD 520 and
+//! ~3.6 ms on the NVIDIA 930M; the 49-cube field adds only ~0.4 ms. The same field as a
+//! hand-written wgpu producer costs 1.29 ms and 0.41 ms, which is where the producer gap lives.
 //! Both paths present at the display's 60 Hz in a window.
 //!
 //! # Sizing
@@ -67,11 +67,11 @@
 //! field; the window always uses whatever `--scene` was passed.
 //!
 //! ```sh
-//! cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --bench 10
-//! cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --bench 10
-//! cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --scene clear --bench 10
-//! cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --stats
-//! cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --transfer --stats
+//! cargo run -p interop_bevy -- --bench 10
+//! cargo run -p interop_bevy -- --gpu 1 --bench 10
+//! cargo run -p interop_bevy -- --gpu 1 --scene clear --bench 10
+//! cargo run -p interop_bevy -- --gpu 1 --stats
+//! cargo run -p interop_bevy -- --gpu 1 --transfer --stats
 //! ```
 //!
 //! Compare that with a normal windowed run's frame metrics: the bench is the producer ceiling
@@ -100,7 +100,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod demo {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -147,12 +147,17 @@ mod demo {
     use gpui::{
         AnyElement, App, Bounds, Context, Corners, Entity, FocusId, FramePipeline,
         FramePipelineExt, IntoElement, PhaseMetrics, PreparedRoots, Render,
-        StandardImmediatePipeline, StyleRefinement, Window as GpuiWindow, WindowBounds,
-        WindowMetrics, WindowOptions, div, gpu_canvas, prelude::*, px, rgb, rgba, size,
+        StandardImmediatePipeline, Window as GpuiWindow, WindowBounds, WindowMetrics,
+        WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
     };
     use gpui_engine::DmaBufHandle;
     use gpui_interop::{WgpuSharedBuffer, attach};
     use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
+    use interop_demo::{
+        ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
+        histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
+        page, panel, section_label, title, viewport_frame,
+    };
 
     /// The headless bench's fixed size. The windowed viewport follows its canvas bounds instead,
     /// so the two are only directly comparable when the window happens to be this size.
@@ -602,6 +607,21 @@ mod demo {
                     gpu.paint_texture(handle, Corners::default(), 1.0, false);
                 }
                 SceneOutput::Transfer(transfer) => {
+                    // A paused frame does not advance Bevy, so there is no newly exported handle;
+                    // exporting the buffer again with an empty submission gives this paint a fresh
+                    // fence for the frame it is already holding.
+                    if transfer.handle.is_none() {
+                        let encoder =
+                            self.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("interop_bevy_transfer"),
+                                });
+                        transfer.handle = Some(
+                            transfer
+                                .buffer
+                                .submit(&self.queue, Some(encoder.finish()))?,
+                        );
+                    }
                     if let Some(handle) = transfer.handle.take() {
                         gpu.paint_surface(handle);
                     }
@@ -614,8 +634,8 @@ mod demo {
         /// is either "Bevy drew nothing" or "GPUI sampled the wrong handle"; this distinguishes
         /// them without a screenshot tool. The transfer path exports only render-attachment usage,
         /// so it has no copy source to read; the window itself is the check there.
-        fn probe(&mut self) -> anyhow::Result<()> {
-            if !self.probe || self.probed || self.frames < 30 {
+        fn probe(&mut self, force: bool) -> anyhow::Result<()> {
+            if !force && (!self.probe || self.probed || self.frames < 30) {
                 return Ok(());
             }
             let SceneOutput::Image(frame) = &self.output else {
@@ -1230,21 +1250,22 @@ mod demo {
         }
     }
 
-    /// The header's live text, updated at 5 Hz rather than every animation frame.
+    /// The right column's live text, updated at 5 Hz rather than every animation frame.
     #[derive(Clone, Default)]
     struct HeaderInfo {
         gpu: String,
         backend: String,
+        hand_off: String,
     }
 
-    /// The cached header. Its title, subtitle and metrics are text, so rebuilding and shaping them
-    /// every frame is exactly what `.cached()` avoids.
-    struct HeaderPanel {
+    /// The right column: the title, the live metrics and the producer's path. Its text is cached,
+    /// so the shapes are rebuilt only when the snapshot is refreshed (5×/s).
+    struct MetricsPanel {
         info: Rc<RefCell<HeaderInfo>>,
         metrics: Rc<RefCell<Option<Metrics>>>,
     }
 
-    impl Render for HeaderPanel {
+    impl Render for MetricsPanel {
         fn render(
             &mut self,
             _window: &mut GpuiWindow,
@@ -1252,23 +1273,23 @@ mod demo {
         ) -> impl IntoElement {
             let info = self.info.borrow().clone();
             let metrics = self.metrics.borrow().clone().unwrap_or_default();
-            header_element(&info, &metrics)
+            metrics_section(&info, &metrics)
         }
     }
 
-    /// The cached sidebar: static prose plus the metrics rows.
-    struct SidebarPanel {
+    /// The left column's cached interval histogram.
+    struct HistogramPanel {
         metrics: Rc<RefCell<Option<Metrics>>>,
     }
 
-    impl Render for SidebarPanel {
+    impl Render for HistogramPanel {
         fn render(
             &mut self,
             _window: &mut GpuiWindow,
             _cx: &mut Context<Self>,
         ) -> impl IntoElement {
             let metrics = self.metrics.borrow().clone().unwrap_or_default();
-            sidebar_element(&metrics)
+            histogram_section(&metrics)
         }
     }
 
@@ -1286,12 +1307,16 @@ mod demo {
         metrics: Rc<RefCell<Metrics>>,
         panel_metrics: Rc<RefCell<Option<Metrics>>>,
         header_info: Rc<RefCell<HeaderInfo>>,
-        header: Entity<HeaderPanel>,
-        sidebar: Entity<SidebarPanel>,
+        metrics_panel: Entity<MetricsPanel>,
+        histogram_panel: Entity<HistogramPanel>,
         phase_costs: Rc<RefCell<PhaseCosts>>,
         displayed_at: Option<Instant>,
         config: ViewConfig,
         logged: Rc<RefCell<Instant>>,
+        /// Whether Bevy is stopped. Paused, the canvas keeps presenting the last frame.
+        paused: Rc<Cell<bool>>,
+        /// A one-shot read-back requested from the left panel.
+        probe_requested: Rc<Cell<bool>>,
     }
 
     impl BevyDemo {
@@ -1302,11 +1327,11 @@ mod demo {
         ) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
             let header_info = Rc::new(RefCell::new(HeaderInfo::default()));
-            let header = cx.new(|_| HeaderPanel {
+            let metrics_panel = cx.new(|_| MetricsPanel {
                 info: header_info.clone(),
                 metrics: panel_metrics.clone(),
             });
-            let sidebar = cx.new(|_| SidebarPanel {
+            let histogram_panel = cx.new(|_| HistogramPanel {
                 metrics: panel_metrics.clone(),
             });
             Self {
@@ -1315,12 +1340,14 @@ mod demo {
                 metrics: Rc::new(RefCell::new(Metrics::default())),
                 panel_metrics,
                 header_info,
-                header,
-                sidebar,
+                metrics_panel,
+                histogram_panel,
                 phase_costs,
                 displayed_at: None,
                 config,
                 logged: Rc::new(RefCell::new(Instant::now())),
+                paused: Rc::new(Cell::new(false)),
+                probe_requested: Rc::new(Cell::new(false)),
             }
         }
     }
@@ -1328,9 +1355,9 @@ mod demo {
     impl Render for BevyDemo {
         fn render(&mut self, window: &mut GpuiWindow, cx: &mut Context<Self>) -> impl IntoElement {
             let failed = self.error.borrow().is_some();
-            if !failed {
+            if !failed && !self.paused.get() {
                 // The canvas must run every frame: its paint is what advances Bevy and samples
-                // the produced texture.
+                // the produced texture. Paused, only a control asks for another frame.
                 window.request_animation_frame();
             }
 
@@ -1338,14 +1365,26 @@ mod demo {
                 .displayed_at
                 .is_none_or(|at| at.elapsed() >= Duration::from_millis(200))
             {
-                let (gpu, backend) = {
+                let (gpu, backend, hand_off) = {
                     let scene = self.scene.borrow();
                     match scene.as_ref() {
-                        Some(scene) => (scene.gpu.clone(), format!("{:?}", scene.adapter.backend)),
-                        None => ("—".to_owned(), "—".to_owned()),
+                        Some(scene) => (
+                            scene.gpu.clone(),
+                            format!("{:?}", scene.adapter.backend),
+                            if self.config.transfer {
+                                "dma-buf + sync_file".to_owned()
+                            } else {
+                                "same-device texture".to_owned()
+                            },
+                        ),
+                        None => ("—".to_owned(), "—".to_owned(), "—".to_owned()),
                     }
                 };
-                *self.header_info.borrow_mut() = HeaderInfo { gpu, backend };
+                *self.header_info.borrow_mut() = HeaderInfo {
+                    gpu,
+                    backend,
+                    hand_off,
+                };
 
                 let mut metrics = self.metrics.borrow().clone();
                 let costs = *self.phase_costs.borrow();
@@ -1358,172 +1397,162 @@ mod demo {
                 metrics.gpui_frames = costs.frames;
                 *self.panel_metrics.borrow_mut() = Some(metrics);
                 self.displayed_at = Some(Instant::now());
-                self.header.update(cx, |_, cx| cx.notify());
-                self.sidebar.update(cx, |_, cx| cx.notify());
+                self.metrics_panel.update(cx, |_, cx| cx.notify());
+                self.histogram_panel.update(cx, |_, cx| cx.notify());
             }
 
-            div()
-                .size_full()
-                .bg(rgb(0x10141c))
-                .flex()
-                .flex_col()
-                .p_6()
-                .gap_4()
-                .child(
-                    div().flex_none().w(px(1256.)).h(px(76.)).child(
-                        self.header
-                            .clone()
-                            .cached(StyleRefinement::default().w(px(1256.)).h(px(76.))),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_1()
-                        .gap_4()
-                        .child(viewport(
-                            self.scene.clone(),
-                            self.error.clone(),
-                            self.metrics.clone(),
-                            self.phase_costs.clone(),
-                            self.config,
-                            self.logged.clone(),
-                        ))
-                        .child(
-                            div().flex_none().w(px(280.)).h(px(600.)).child(
-                                self.sidebar
-                                    .clone()
-                                    .cached(StyleRefinement::default().w(px(280.)).h(px(600.))),
-                            ),
-                        ),
-                )
+            page(
+                controls_panel(
+                    cx,
+                    self.paused.clone(),
+                    self.probe_requested.clone(),
+                    self.histogram_panel.clone(),
+                ),
+                viewport(
+                    self.scene.clone(),
+                    self.error.clone(),
+                    self.metrics.clone(),
+                    self.phase_costs.clone(),
+                    self.config,
+                    self.logged.clone(),
+                    self.paused.clone(),
+                    self.probe_requested.clone(),
+                ),
+                self.metrics_panel.clone().cached(metrics_panel_style()),
+            )
         }
     }
 
-    fn header_element(info: &HeaderInfo, metrics: &Metrics) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_row()
-            .items_end()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(rgb(0xf2f4f8))
-                            .child("Bevy, inside GPUI"),
-                    )
-                    .child(div().text_sm().text_color(rgb(0x8b93a3)).child(
-                        "A headless Bevy app renders into an offscreen image on the window \
-                             renderer's wgpu device; GPUI samples that texture view.",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(rgb(0x9ec1ff))
-                            .child(format!("{:.1} FPS", metrics.fps)),
-                    )
-                    .child(div().text_xs().text_color(rgb(0xd7dce6)).child(format!(
-                        "{:.2} ms · bevy {:.2} + gpu {:.2} + layout {:.2}",
-                        metrics.interval_ms, metrics.update_ms, metrics.wait_ms, metrics.layout_ms
-                    )))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x6b7382))
-                            .child(format!("{} · {} · same device", info.gpu, info.backend)),
-                    ),
-            )
+    /// The left column: the pause and probe controls, and the cached interval histogram.
+    fn controls_panel(
+        cx: &mut Context<BevyDemo>,
+        paused: Rc<Cell<bool>>,
+        probe_requested: Rc<Cell<bool>>,
+        histogram_panel: Entity<HistogramPanel>,
+    ) -> AnyElement {
+        let pause_label = if paused.get() { "Resume" } else { "Pause" };
+        let pause =
+            control("pause", pause_label).on_click(cx.listener(move |_this, _, window, cx| {
+                paused.set(!paused.get());
+                window.request_animation_frame();
+                cx.notify();
+            }));
+        let probe = control("probe", "Probe").on_click(cx.listener(move |_this, _, window, cx| {
+            probe_requested.set(true);
+            window.request_animation_frame();
+            cx.notify();
+        }));
+
+        panel(LEFT_WIDTH)
+            .child(section_label("Controls"))
+            .child(pause)
+            .child(probe)
+            .child(div().h(px(8.)).flex_none())
+            .child(histogram_panel.cached(histogram_style()))
             .into_any_element()
     }
 
-    fn sidebar_element(metrics: &Metrics) -> AnyElement {
+    /// The left column's histogram block: the interval bars and where the interval went.
+    fn histogram_section(metrics: &Metrics) -> AnyElement {
+        let intervals: Vec<f32> = metrics.intervals.iter().copied().collect();
         div()
             .size_full()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_3()
-            .rounded_md()
-            .bg(rgb(0x171d28))
-            .border_1()
-            .border_color(rgb(0x27303e))
-            .child(section_label("engine"))
-            .child(div().text_xs().text_color(rgb(0xb7c0cf)).child(
-                "bevy 0.19 · no winit · ScheduleRunner in --bench, GPUI's paint in the window",
+            .gap_1()
+            .child(section_label("Frame interval"))
+            .child(histogram(&intervals, None))
+            .child(histogram_caption(false))
+            .child(pacing_note(
+                metrics.interval_ms,
+                metrics.draw_ms,
+                metrics.present_wait_ms,
+                metrics.active,
             ))
-            .child(section_label("hand-off"))
-            .child(div().text_xs().text_color(rgb(0xb7c0cf)).child(
-                "RenderCreation::Manual on the window's device · GpuImage texture view \
-                     published from the render world · 0 CPU copies",
+            .into_any_element()
+    }
+
+    /// The right column: title, frame rate, the pipeline's breakdown and the engine's own timings.
+    fn metrics_section(info: &HeaderInfo, metrics: &Metrics) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(title(
+                "Bevy, inside GPUI",
+                "A headless Bevy app renders into a texture on the window renderer's own device.",
             ))
-            .child(section_label("metrics"))
+            .child(div().h(px(2.)).flex_none())
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(stat("gpui frames", format!("{}", metrics.gpui_frames)))
-                    .child(stat("bevy frames", format!("{}", metrics.frames)))
-                    .child(stat("engine step", format!("{:.2} ms", metrics.update_ms)))
-                    .child(stat("gpu wait", format!("{:.2} ms", metrics.wait_ms)))
-                    .child(stat("transport", format!("{:.2} ms", metrics.transport_ms)))
-                    .child(stat("texture paint", format!("{:.2} ms", metrics.paint_ms)))
-                    .child(stat("evaluate", format!("{:.2} ms", metrics.evaluate_ms)))
-                    .child(stat("layout", format!("{:.2} ms", metrics.layout_ms)))
-                    .child(stat(
-                        "pipeline paint",
-                        format!("{:.2} ms", metrics.pipeline_paint_ms),
-                    ))
-                    .child(stat(
-                        "frame interval",
-                        format!("{:.2} ms", metrics.interval_ms),
-                    ))
-                    .child(stat("draw", format!("{:.2} ms", metrics.draw_ms)))
-                    .child(stat(
-                        "present wait",
-                        format!("{:.2} ms", metrics.present_wait_ms),
-                    ))
-                    .child(stat(
-                        "window active",
-                        if metrics.active { "yes" } else { "no" }.to_owned(),
-                    ))
-                    .child(stat("present rate", format!("{:.1} fps", metrics.fps))),
+                    .text_2xl()
+                    .text_color(rgb(ACCENT))
+                    .child(format!("{:.1} FPS", metrics.fps)),
             )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                "{:.2} ms · bevy {:.2} · gpu {:.2} · layout {:.2}",
+                metrics.interval_ms, metrics.update_ms, metrics.wait_ms, metrics.layout_ms
+            )))
+            .child(div().h(px(4.)).flex_none())
+            .child(section_label("Frame"))
+            .child(metric_row(
+                "frame interval",
+                format!("{:.2} ms", metrics.interval_ms),
+            ))
+            .child(metric_row("draw", format!("{:.2} ms", metrics.draw_ms)))
+            .child(metric_row(
+                "present wait",
+                format!("{:.2} ms", metrics.present_wait_ms),
+            ))
+            .child(metric_row(
+                "evaluate",
+                format!("{:.2} ms", metrics.evaluate_ms),
+            ))
+            .child(metric_row("layout", format!("{:.2} ms", metrics.layout_ms)))
+            .child(metric_row(
+                "pipeline paint",
+                format!("{:.2} ms", metrics.pipeline_paint_ms),
+            ))
+            .child(div().h(px(4.)).flex_none())
+            .child(section_label("Engine"))
+            .child(metric_row(
+                "gpui frames",
+                format!("{}", metrics.gpui_frames),
+            ))
+            .child(metric_row("bevy frames", format!("{}", metrics.frames)))
+            .child(metric_row(
+                "engine step",
+                format!("{:.2} ms", metrics.update_ms),
+            ))
+            .child(metric_row("gpu wait", format!("{:.2} ms", metrics.wait_ms)))
+            .child(metric_row(
+                "transport",
+                format!("{:.2} ms", metrics.transport_ms),
+            ))
+            .child(metric_row(
+                "texture paint",
+                format!("{:.2} ms", metrics.paint_ms),
+            ))
+            .child(div().h(px(4.)).flex_none())
+            .child(section_label("Adapter"))
+            .child(metric_row(
+                "gpu",
+                format!("{} · {}", info.gpu, info.backend),
+            ))
+            .child(metric_row("hand-off", info.hand_off.clone()))
+            .child(metric_row(
+                "present rate",
+                format!("{:.1} fps", metrics.fps),
+            ))
+            .child(metric_row(
+                "window",
+                if metrics.active { "active" } else { "inactive" }.to_owned(),
+            ))
             .into_any_element()
     }
 
-    fn stat(label: &'static str, value: String) -> AnyElement {
-        div()
-            .flex()
-            .flex_row()
-            .justify_between()
-            .child(div().text_xs().text_color(rgb(0x8b93a3)).child(label))
-            .child(div().text_xs().text_color(rgb(0xd7dce6)).child(value))
-            .into_any_element()
-    }
-
-    fn section_label(label: &'static str) -> AnyElement {
-        div()
-            .text_xs()
-            .text_color(rgb(0x6b7382))
-            .child(label.to_uppercase())
-            .into_any_element()
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn viewport(
         scene: Rc<RefCell<Option<BevyScene>>>,
         error: Rc<RefCell<Option<String>>>,
@@ -1531,9 +1560,12 @@ mod demo {
         phase_costs: Rc<RefCell<PhaseCosts>>,
         config: ViewConfig,
         logged: Rc<RefCell<Instant>>,
+        paused: Rc<Cell<bool>>,
+        probe_requested: Rc<Cell<bool>>,
     ) -> AnyElement {
         let drawing_error = error.clone();
-        let painting_error = error;
+        let overlay_error = error;
+        let paused_for_canvas = paused.clone();
         let canvas = gpu_canvas(move |gpu| {
             // The canvas is a physical-pixel producer: follow its current bounds, not the size it
             // happened to have when the app was built. A resize recreates the backing texture.
@@ -1565,17 +1597,22 @@ mod demo {
                 return;
             }
 
-            let (update, wait, transport) = match scene.step() {
-                Ok(timings) => timings,
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    eprintln!("interop_bevy: cannot render a Bevy frame: {message}");
-                    *drawing_error.borrow_mut() = Some(message);
-                    return;
+            let stepped = !paused_for_canvas.get();
+            let (update, wait, transport) = if stepped {
+                match scene.step() {
+                    Ok(timings) => timings,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        eprintln!("interop_bevy: cannot render a Bevy frame: {message}");
+                        *drawing_error.borrow_mut() = Some(message);
+                        return;
+                    }
                 }
+            } else {
+                (Duration::ZERO, Duration::ZERO, Duration::ZERO)
             };
 
-            if let Err(error) = scene.probe() {
+            if let Err(error) = scene.probe(probe_requested.take()) {
                 eprintln!("interop_bevy: probe failed: {error:#}");
             }
 
@@ -1586,9 +1623,11 @@ mod demo {
                 *drawing_error.borrow_mut() = Some(message);
                 return;
             }
-            metrics
-                .borrow_mut()
-                .record(update, wait, transport, paint.elapsed());
+            if stepped {
+                metrics
+                    .borrow_mut()
+                    .record(update, wait, transport, paint.elapsed());
+            }
 
             if config.log_stats {
                 let now = Instant::now();
@@ -1624,63 +1663,26 @@ mod demo {
         })
         .size_full();
 
-        let mut element = div()
-            .relative()
-            .flex_1()
-            .min_w(px(320.))
-            .min_h(px(240.))
-            .rounded_lg()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(0x27303e))
-            .child(canvas);
-        if let Some(message) = painting_error.borrow().clone() {
-            element = element.child(error_panel(message));
-        }
-        element
-            .child(
-                div()
-                    .absolute()
-                    .top(px(12.))
-                    .right(px(12.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgba(0x0a0f18cc))
-                    .border_1()
-                    .border_color(rgba(0xffffff1f))
-                    .text_xs()
-                    .text_color(rgb(0x9ec1ff))
-                    .child("bevy · same-device texture · 0 CPU copies"),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(12.))
-                    .left(px(12.))
-                    .text_xs()
-                    .text_color(rgba(0xffffff99))
-                    .child("headless bevy 0.19 · pumped by GPUI's paint"),
-            )
-            .into_any_element()
-    }
-
-    fn error_panel(message: String) -> AnyElement {
-        div()
-            .absolute()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x1a0f12f2))
-            .p_6()
-            .child(
-                div()
-                    .max_w(px(640.))
-                    .text_sm()
-                    .text_color(rgb(0xffb4b4))
-                    .child(message),
-            )
+        viewport_frame()
+            .child(canvas)
+            .children(overlay_error.borrow().clone().map(|message| {
+                error_panel(
+                    "The Bevy viewport could not start",
+                    message,
+                    "Run with --list-gpus to see the adapters; --transfer switches to the \
+                     dma-buf hand-off.",
+                )
+            }))
+            .child(overlay_badge(if config.transfer {
+                "bevy · dma-buf · 0 CPU copies"
+            } else {
+                "bevy · same-device texture · 0 CPU copies"
+            }))
+            .child(overlay_hint(if paused.get() {
+                "paused · GPUI presents the last frame"
+            } else {
+                "headless bevy 0.19 · pumped by GPUI's paint"
+            }))
             .into_any_element()
     }
 
@@ -1731,7 +1733,7 @@ mod demo {
                 list_gpus(cx);
                 std::process::exit(0);
             }
-            let bounds = Bounds::centered(None, size(px(1320.), px(760.)), cx);
+            let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),

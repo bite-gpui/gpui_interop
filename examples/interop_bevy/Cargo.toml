@@ -1,0 +1,46 @@
+[package]
+name = "interop_bevy"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Its own crate, so Bevy's graph is built only when this demo is. The shared library's feature set
+# is identical to `interop_wgpu`'s, which is what keeps the library and the GPUI stack cached when
+# moving between the two.
+[[bin]]
+name = "interop_bevy"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow.workspace = true
+# Headless: no `bevy_winit`, no window, no event loop of its own. `bevy_log` surfaces renderer
+# validation errors; `multi_threaded` keeps the task pools and the pipelined render thread, so the
+# demo measures the engine as it normally runs. `bevy_render` 0.19 depends on `wgpu = "29.0.3"`,
+# which is the workspace's 29.0.4.
+bevy = { version = "0.19.0", default-features = false, features = [
+    "std",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_camera",
+    "bevy_core_pipeline",
+    "bevy_gltf",
+    "bevy_image",
+    "bevy_light",
+    "bevy_log",
+    "bevy_material",
+    "bevy_mesh",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_shader",
+    "bevy_window",
+] }
+gpui.workspace = true
+# The `DmaBufHandle` the transfer path exports lives in the engine.
+gpui_engine.workspace = true
+gpui_interop = { workspace = true, features = ["example"] }
+gpui_wgpu.workspace = true
+interop_demo.workspace = true
+wgpu.workspace = true

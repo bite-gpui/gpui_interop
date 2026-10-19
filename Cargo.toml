@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "crates/gpui_interop",
+    "crates/interop_demo",
+    "examples/interop_wgpu",
+    "examples/interop_bevy",
 ]
 
 [workspace.package]
@@ -74,8 +77,11 @@ glam = { opt-level = 3 }
 encase = { opt-level = 3 }
 
 [workspace.dependencies]
-# This repo's own crate: a path for development, a version for release.
+# This repo's own crates: a path for development, a version for release.
 gpui_interop = { version = "0.1.0", path = "crates/gpui_interop" }
+# The chrome the two producer demos share (controls, histogram, metrics panel). Private: it is not
+# part of the published surface, only of the examples in this workspace.
+interop_demo = { path = "crates/interop_demo" }
 
 # The core, from the working tree next door — `bite-gpui`'s own checkout, so a fix in `gpui_wgpu`
 # (the dma-buf importer) reaches this stack without a release. Each key keeps its source name, so

@@ -1,7 +1,7 @@
 //! `interop_wgpu`: a wgpu scene inside a GPUI window, with GPUI controls in front of it.
 //!
 //! ```sh
-//! cargo run -p gpui_interop --example interop_wgpu --features example
+//! cargo run -p interop_wgpu
 //! ```
 //!
 //! The window is a real 3D viewport: an instanced field of lit cubes, turning on a clock or dragged
@@ -11,10 +11,10 @@
 //! `sync_file` fence. The window's renderer imports that native handle and composites it; no CPU
 //! copy, and no wgpu type crosses the boundary.
 //!
-//! The chrome is ordinary GPUI: a sidebar of real buttons (pause, speed, palette, reset), a stats
-//! panel, and two non-interactive overlays on the viewport. The sidebar and the overlays sit in
-//! front of the surface, so a click on a control is a click and a drag anywhere else reaches the
-//! scene.
+//! The chrome is the shared demo shell: real buttons (pause, speed, palette, reset) and a frame
+//! interval histogram in the left column, live metrics in the right, and two non-interactive
+//! overlays on the viewport. The columns and overlays sit outside the producer's hitbox, so a click
+//! on a control is a click and a drag anywhere else reaches the scene.
 //!
 //! Drag the viewport to orbit the camera, scroll to zoom, or use the controls. Pausing stops the
 //! clock but not interaction: a drag still turns the camera, and the next frame is exported.
@@ -25,7 +25,7 @@
 //! and a `sync_file` fence. On an adapter that cannot export — a GL device, or a Vulkan driver
 //! without the external-memory extensions — the scene renders into a `WgpuSurface` and
 //! `paint_texture` samples the same-device view instead. GPUI's own drawing needs neither export nor
-//! copy in either case; the header says which path the frame took.
+//! copy in either case; the metrics panel says which path the frame took.
 //!
 //! # Raw throughput
 //!
@@ -40,8 +40,8 @@
 //! cost.
 //!
 //! ```sh
-//! cargo run -p gpui_interop --example interop_wgpu --features example -- --gpu 0 --bench 10
-//! cargo run -p gpui_interop --example interop_wgpu --features example -- --gpu 1 --bench 10
+//! cargo run -p interop_wgpu -- --gpu 0 --bench 10
+//! cargo run -p interop_wgpu -- --gpu 1 --bench 10
 //! ```
 //!
 //! # Choosing the GPU
@@ -49,11 +49,11 @@
 //! `--list-gpus` enumerates the adapters this process can render on and exits; `--gpu <index>`
 //! selects one from that list, and `--gpu-id <hex>` or `--gpu-name <text>` name one directly. Each
 //! lowers to a `GpuPreference` on the application, before the first window makes a device. The
-//! adapter the renderer actually chose is printed at startup and shown in the header.
+//! adapter the renderer actually chose is printed at startup and shown in the metrics panel.
 //!
 //! ```sh
-//! cargo run -p gpui_interop --example interop_wgpu --features example -- --list-gpus
-//! cargo run -p gpui_interop --example interop_wgpu --features example -- --gpu 1
+//! cargo run -p interop_wgpu -- --list-gpus
+//! cargo run -p interop_wgpu -- --gpu 1
 //! ```
 
 #[cfg(target_os = "linux")]
@@ -80,21 +80,25 @@ mod demo {
     use gpui::{
         AnyElement, App, Bounds, Context, Corners, Entity, FocusId, FramePipeline,
         FramePipelineExt, IntoElement, PhaseMetrics, PreparedRoots, Render, ScrollDelta,
-        StandardImmediatePipeline, StyleRefinement, Window, WindowBounds, WindowMetrics,
-        WindowOptions, div, gpu_canvas, prelude::*, px, rgb, rgba, size,
+        StandardImmediatePipeline, Window, WindowBounds, WindowMetrics, WindowOptions, div,
+        gpu_canvas, prelude::*, px, rgb, size,
     };
     use gpui_interop::{
         SurfaceEvent, SurfaceInput, SurfacePoint, WgpuSharedBuffer, WgpuSurface, attach,
         surface_input,
     };
     use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
+    use interop_demo::{
+        ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
+        histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
+        page, panel, section_label, title, viewport_frame,
+    };
     use wgpu::util::DeviceExt as _;
 
-    /// The window and the produced surface. The viewport is fixed so the demo does not have to
-    /// recreate its exported buffer on every resize; a real viewport keeps a ring and reallocates
-    /// when its bounds change.
-    const VIEW_WIDTH: u32 = 800;
-    const VIEW_HEIGHT: u32 = 500;
+    /// The headless bench's fixed size, so producer runs are comparable between the two demos.
+    /// The windowed viewport follows its canvas's physical size instead.
+    const BENCH_WIDTH: u32 = 960;
+    const BENCH_HEIGHT: u32 = 600;
 
     /// The grid of cubes: `GRID` × `GRID`, centred on the origin.
     const GRID: i32 = 7;
@@ -107,7 +111,8 @@ mod demo {
 
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-    /// Three colour pairs the instances interpolate between, cycled by the sidebar's palette button.
+    /// Three colour pairs the instances interpolate between, cycled by the left panel's palette
+    /// button.
     const PALETTES: [(&str, [f32; 3], [f32; 3]); 3] = [
         ("Ember", [1.00, 0.42, 0.15], [0.15, 0.55, 1.00]),
         ("Tide", [0.10, 0.90, 0.72], [0.16, 0.32, 1.00]),
@@ -294,7 +299,7 @@ mod demo {
         );
     }
 
-    /// How many frame intervals the sparkline keeps.
+    /// How many frame intervals the histogram keeps.
     const MAX_SAMPLES: usize = 120;
 
     /// Frame intervals, the pipeline work each interval contained, and the window state the frame
@@ -411,6 +416,10 @@ mod demo {
         active: bool,
         intervals: Vec<f32>,
         work: Vec<f32>,
+        /// The adapter the window's renderer chose.
+        gpu: String,
+        /// How the frames reach GPUI: `dma-buf + sync_file` or `same-device view`.
+        path: &'static str,
     }
 
     impl Metrics {
@@ -430,6 +439,8 @@ mod demo {
                 active: stats.active,
                 intervals: stats.intervals_ms.iter().copied().collect(),
                 work: stats.work_ms.iter().copied().collect(),
+                gpu: String::new(),
+                path: "",
             }
         }
     }
@@ -550,7 +561,7 @@ mod demo {
                 std::process::exit(0);
             }
             let view_stats = stats;
-            let bounds = Bounds::centered(None, size(px(1140.), px(720.)), cx);
+            let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -563,15 +574,29 @@ mod demo {
         });
     }
 
-    /// The sidebar's stats section as its own view, so the animation's per-frame render of the root
-    /// does not re-lay-out its rows and sparkline. Embedded with `.cached()`, it is a single
-    /// definite-size layout node until the root notifies it (5×/s, when the metrics snapshot is
-    /// refreshed).
-    struct StatsPanel {
+    /// The left column's histogram block, cached so the animation's per-frame render of the root
+    /// does not re-lay-out its bars. Embedded with `.cached()`, it is a single definite-size
+    /// layout node until the root notifies it (5×/s, when the snapshot is refreshed).
+    struct HistogramPanel {
         metrics: Rc<RefCell<Option<Metrics>>>,
     }
 
-    impl Render for StatsPanel {
+    impl Render for HistogramPanel {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            match self.metrics.borrow().as_ref() {
+                Some(metrics) => histogram_section(metrics),
+                None => div().into_any_element(),
+            }
+        }
+    }
+
+    /// The right column: the demo's title, the live metrics and the producer's path. Cached for the
+    /// same reason as the histogram.
+    struct MetricsPanel {
+        metrics: Rc<RefCell<Option<Metrics>>>,
+    }
+
+    impl Render for MetricsPanel {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             match self.metrics.borrow().as_ref() {
                 Some(metrics) => metrics_section(metrics),
@@ -588,7 +613,7 @@ mod demo {
         error: Rc<RefCell<Option<String>>>,
         /// Whether the clock is stopped. Controls and input still render a frame.
         paused: Rc<Cell<bool>>,
-        /// How fast the clock runs, cycled by the sidebar.
+        /// How fast the clock runs, cycled by the left panel.
         speed: Rc<Cell<f32>>,
         /// Which colour pair the instances interpolate between.
         palette: Rc<Cell<u8>>,
@@ -600,11 +625,13 @@ mod demo {
         requested: u32,
         /// The frame-interval and pass-timing collector the installed pipeline fills.
         stats: Rc<RefCell<FrameStats>>,
-        /// The stats section, cached as a child view.
-        stats_panel: Entity<StatsPanel>,
-        /// The snapshot the cached stats section renders.
+        /// The left column's histogram, cached as a child view.
+        histogram_panel: Entity<HistogramPanel>,
+        /// The right column's metrics, cached as a child view.
+        metrics_panel: Entity<MetricsPanel>,
+        /// The snapshot the cached panels render.
         panel_metrics: Rc<RefCell<Option<Metrics>>>,
-        /// The metrics as last displayed in the header. Refreshed a few times a second rather than
+        /// The metrics as last displayed in the right panel. Refreshed a few times a second rather than
         /// every frame: each changed string is a text-layout cache miss.
         display: Option<Metrics>,
         displayed_at: Instant,
@@ -621,7 +648,10 @@ mod demo {
             cx: &mut Context<Self>,
         ) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
-            let stats_panel = cx.new(|_| StatsPanel {
+            let histogram_panel = cx.new(|_| HistogramPanel {
+                metrics: panel_metrics.clone(),
+            });
+            let metrics_panel = cx.new(|_| MetricsPanel {
                 metrics: panel_metrics.clone(),
             });
             Self {
@@ -634,7 +664,8 @@ mod demo {
                 grab: Rc::new(Cell::new(false)),
                 requested: 0,
                 stats,
-                stats_panel,
+                histogram_panel,
+                metrics_panel,
                 panel_metrics,
                 display: None,
                 displayed_at: Instant::now(),
@@ -666,129 +697,52 @@ mod demo {
             };
             let refresh = self.display.is_none() || self.displayed_at.elapsed().as_millis() >= 200;
             if refresh {
-                let metrics = Metrics::new(&self.stats.borrow(), produced);
+                let mut metrics = Metrics::new(&self.stats.borrow(), produced);
+                metrics.gpu = gpu;
+                metrics.path = path;
                 *self.panel_metrics.borrow_mut() = Some(metrics.clone());
                 self.display = Some(metrics);
                 self.displayed_at = Instant::now();
-                // The cached panel is the only part of the root that has to be told its contents
-                // changed; the root itself is already dirty every animation frame.
-                self.stats_panel.update(cx, |_, cx| cx.notify());
+                // The cached panels are the only parts of the root that have to be told their
+                // contents changed; the root itself is already dirty every animation frame.
+                self.histogram_panel.update(cx, |_, cx| cx.notify());
+                self.metrics_panel.update(cx, |_, cx| cx.notify());
             }
-            let Some(metrics) = self.display.as_ref() else {
-                unreachable!("the refresh above stores metrics")
-            };
 
             let paused = self.paused.clone();
             let speed = self.speed.clone();
             let palette = self.palette.clone();
 
-            div()
-                .size_full()
-                .bg(rgb(0x10141c))
-                .flex()
-                .flex_col()
-                .p_6()
-                .gap_4()
-                .child(header(paused.get(), self.speed.get(), &gpu, path, metrics))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_1()
-                        .gap_4()
-                        .child(sidebar(
-                            cx,
-                            paused.clone(),
-                            speed.clone(),
-                            palette.clone(),
-                            self.stats_panel.clone(),
-                        ))
-                        .child(viewport(
-                            self.scene.clone(),
-                            self.error.clone(),
-                            self.last.clone(),
-                            self.grab.clone(),
-                            paused,
-                            speed,
-                            palette,
-                            self.bench,
-                        )),
-                )
+            page(
+                controls_panel(
+                    cx,
+                    paused.clone(),
+                    speed.clone(),
+                    palette.clone(),
+                    self.histogram_panel.clone(),
+                ),
+                viewport(
+                    self.scene.clone(),
+                    self.error.clone(),
+                    self.last.clone(),
+                    self.grab.clone(),
+                    paused,
+                    speed,
+                    palette,
+                    self.bench,
+                ),
+                self.metrics_panel.clone().cached(metrics_panel_style()),
+            )
         }
     }
 
-    /// The title bar: what the demo is, and the live frame metrics.
-    fn header(paused: bool, speed: f32, gpu: &str, path: &str, metrics: &Metrics) -> AnyElement {
-        let state = if paused {
-            "paused".to_owned()
-        } else {
-            format!("running · {speed:.1}×")
-        };
-        div()
-            .flex()
-            .flex_row()
-            .items_end()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(rgb(0xf2f4f8))
-                            .child("wgpu, inside GPUI"),
-                    )
-                    .child(div().text_sm().text_color(rgb(0x8b93a3)).child(
-                        "A wgpu render target exported as a dma-buf, composited by the window \
-                                 renderer beneath ordinary GPUI controls.",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(rgb(0x9ec1ff))
-                            .child(format!("{:.1} FPS", metrics.fps)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xd7dce6))
-                            .child(format!("{:.2} ms · {state}", metrics.frame_ms)),
-                    )
-                    .child(div().text_xs().text_color(rgb(0x6b7382)).child(format!(
-                        "draw {:.3} ms · wait {:.2} ms",
-                        metrics.draw_ms, metrics.wait_ms
-                    )))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x6b7382))
-                            .child(format!("{gpu} · {path}")),
-                    )
-                    .child(div().text_xs().text_color(rgb(0x6b7382)).child(format!(
-                        "{} GPUI frames · {} produced",
-                        metrics.gpui_frames, metrics.produced
-                    ))),
-            )
-            .into_any_element()
-    }
-
-    /// The controls, in ordinary GPUI, in front of the viewport. The stats section below them is a
-    /// cached child view, not rebuilt by the animation.
-    fn sidebar(
+    /// The left column: real GPUI controls, and beneath them the cached interval histogram.
+    fn controls_panel(
         cx: &mut Context<Showcase>,
         paused: Rc<Cell<bool>>,
         speed: Rc<Cell<f32>>,
         palette: Rc<Cell<u8>>,
-        stats_panel: Entity<StatsPanel>,
+        histogram_panel: Entity<HistogramPanel>,
     ) -> AnyElement {
         let pause_label = if paused.get() { "Resume" } else { "Pause" };
         let pause = control("pause", pause_label).on_click(cx.listener(move |_this, _, _, cx| {
@@ -825,46 +779,69 @@ mod demo {
             cx.notify();
         }));
 
-        div()
-            .w(px(250.))
-            .flex()
-            .flex_col()
-            .gap_2()
+        panel(LEFT_WIDTH)
             .child(section_label("Controls"))
             .child(pause)
             .child(speed_button)
             .child(palette_button)
             .child(reset)
             .child(div().h(px(8.)).flex_none())
-            .child(
-                // A definite size is the contract `.cached()` requires: it skips measuring the
-                // contents, so the rows and sparkline cost nothing while the animation runs.
-                stats_panel.cached(StyleRefinement::default().w(px(250.)).h(px(350.))),
-            )
+            .child(histogram_panel.cached(histogram_style()))
             .into_any_element()
     }
 
-    /// The metrics the installed pipeline collects: the interval, how much of it the root passes
-    /// account for, and the window state that selects the frame source's pacing.
+    /// The left column's histogram block: the interval bars, what they mean, and where the most
+    /// recent interval went.
+    fn histogram_section(metrics: &Metrics) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_label("Frame interval"))
+            .child(histogram(&metrics.intervals, Some(&metrics.work)))
+            .child(histogram_caption(true))
+            .child(pacing_note(
+                metrics.frame_ms,
+                metrics.draw_ms,
+                metrics.wait_ms,
+                metrics.active,
+            ))
+            .into_any_element()
+    }
+
+    /// The right column: the title, the frame rate, the pipeline's own breakdown, and the producer.
     fn metrics_section(metrics: &Metrics) -> AnyElement {
         div()
             .size_full()
             .flex()
             .flex_col()
             .gap_1()
+            .child(title(
+                "wgpu, inside GPUI",
+                "An instanced wgpu scene handed to the window renderer with no CPU copy.",
+            ))
+            .child(div().h(px(2.)).flex_none())
+            .child(
+                div()
+                    .text_2xl()
+                    .text_color(rgb(ACCENT))
+                    .child(format!("{:.1} FPS", metrics.fps)),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                "{:.2} ms · draw {:.2} ms · wait {:.2} ms",
+                metrics.frame_ms, metrics.draw_ms, metrics.wait_ms
+            )))
+            .child(div().h(px(4.)).flex_none())
             .child(section_label("Frame pipeline · per frame"))
-            .child(metric_row("FPS", format!("{:.1}", metrics.fps)))
             .child(metric_row(
                 "frame interval",
                 format!("{:.2} ms", metrics.frame_ms),
             ))
-            .child(metric_row("draw", format!("{:.3} ms", metrics.draw_ms)))
-            .child(metric_row("wait", format!("{:.2} ms", metrics.wait_ms)))
             .child(metric_row(
                 "root passes",
                 format!("{:.3} ms", metrics.passes_ms),
             ))
-            .child(div().h(px(4.)).flex_none())
             .child(metric_row(
                 "evaluate",
                 format!("{:.3} ms", metrics.evaluate_ms),
@@ -872,6 +849,7 @@ mod demo {
             .child(metric_row("layout", format!("{:.3} ms", metrics.layout_ms)))
             .child(metric_row("paint", format!("{:.3} ms", metrics.paint_ms)))
             .child(div().h(px(4.)).flex_none())
+            .child(section_label("Counters"))
             .child(metric_row("GPUI frames", metrics.gpui_frames.to_string()))
             .child(metric_row("asked", metrics.asked.to_string()))
             .child(metric_row("produced", metrics.produced.to_string()))
@@ -880,157 +858,10 @@ mod demo {
                 if metrics.active { "active" } else { "inactive" }.to_owned(),
             ))
             .child(div().h(px(4.)).flex_none())
-            .child(sparkline(&metrics.intervals, &metrics.work))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x6f7787))
-                    .child("bar: interval · green: pipeline draw · updates 5/s, newest right"),
-            )
-            .child(pacing_note(metrics))
+            .child(section_label("Producer"))
+            .child(metric_row("adapter", metrics.gpu.clone()))
+            .child(metric_row("hand-off", metrics.path.to_owned()))
             .into_any_element()
-    }
-
-    /// Says where the interval goes. An inactive window is the frame source's own 30 fps cap; an
-    /// active one at a low rate is either pass work or presentation pacing, and the split decides.
-    fn pacing_note(metrics: &Metrics) -> AnyElement {
-        let (note, colour) = if metrics.frame_ms <= 0.0 {
-            ("no frame measured yet", rgb(0x6f7787))
-        } else if !metrics.active {
-            (
-                "inactive window: the frame source caps animation at ~30 fps",
-                rgb(0xf59e0b),
-            )
-        } else if metrics.wait_ms > metrics.draw_ms {
-            (
-                "most of the interval is presentation/pacing, not pipeline work",
-                rgb(0x7d8595),
-            )
-        } else {
-            ("the interval is dominated by pipeline work", rgb(0x7d8595))
-        };
-        div()
-            .text_xs()
-            .text_color(colour)
-            .child(note)
-            .into_any_element()
-    }
-
-    fn metric_row(label: &'static str, value: String) -> AnyElement {
-        div()
-            .flex()
-            .flex_row()
-            .justify_between()
-            .text_xs()
-            .child(div().text_color(rgb(0x7d8595)).child(label))
-            .child(div().text_color(rgb(0xd7dce6)).child(value))
-            .into_any_element()
-    }
-
-    /// One bar per recent frame, oldest left: total height is the interval, the green foot is the
-    /// pipeline's draw. Blue is a 60 fps interval, amber 30 fps, red slower.
-    fn sparkline(intervals: &[f32], work: &[f32]) -> AnyElement {
-        const MAX_MS: f32 = 50.0;
-        const HEIGHT: f32 = 34.0;
-        div()
-            .h(px(HEIGHT))
-            .w_full()
-            .flex()
-            .flex_row()
-            .items_end()
-            .gap(px(1.))
-            .children(
-                intervals
-                    .iter()
-                    .zip(work)
-                    .rev()
-                    .take(60)
-                    .rev()
-                    .map(|(&interval, &work)| {
-                        let total = (interval / MAX_MS).clamp(0.0, 1.0) * HEIGHT;
-                        let work = (work / MAX_MS).clamp(0.0, 1.0) * HEIGHT;
-                        let wait = (total - work).max(if total < 1.0 { 1.0 } else { 0.0 });
-                        let colour = if interval <= 16.7 {
-                            rgb(0x38bdf8)
-                        } else if interval <= 33.3 {
-                            rgb(0xf59e0b)
-                        } else {
-                            rgb(0xef4444)
-                        };
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .justify_end()
-                            .child(div().w_full().h(px(wait)).bg(colour))
-                            .child(div().w_full().h(px(work)).bg(rgb(0x34d399)))
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// A section caption in the sidebar.
-    fn section_label(label: &'static str) -> AnyElement {
-        div()
-            .text_xs()
-            .text_color(rgb(0x6f7787))
-            .child(label)
-            .into_any_element()
-    }
-
-    /// The viewport's fallback when the scene cannot be built or a frame cannot be rendered: a panel
-    /// over the (empty) canvas that names the refusal.
-    fn error_panel(message: String) -> AnyElement {
-        div()
-            .absolute()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0a0f18ee))
-            .child(
-                div()
-                    .max_w(px(560.))
-                    .p_4()
-                    .rounded_lg()
-                    .bg(rgb(0x1a202b))
-                    .border_1()
-                    .border_color(rgb(0x6b3a3a))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_lg()
-                            .text_color(rgb(0xffb4a8))
-                            .child("The wgpu viewport could not start"),
-                    )
-                    .child(div().text_xs().text_color(rgb(0xc9ced8)).child(message))
-                    .child(div().text_xs().text_color(rgb(0x8b93a3)).child(
-                        "Run with --list-gpus to see the adapters. A Vulkan adapter uses the \
-                                 dma-buf path; the others fall back to a same-device view.",
-                    )),
-            )
-            .into_any_element()
-    }
-
-    /// One sidebar button. Real GPUI widgets: they carry an id and a listener, so they `occlude` the
-    /// viewport beneath and take their own clicks.
-    fn control(id: &'static str, label: impl Into<String>) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .occlude()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(0x1a202b))
-            .border_1()
-            .border_color(rgb(0x27303e))
-            .text_sm()
-            .text_color(rgb(0xe7eaf0))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x222b38)).border_color(rgb(0x3a4b63)))
-            .child(label.into())
     }
 
     /// The viewport: the exported surface, wrapped in the input gateway, with two non-interactive
@@ -1051,9 +882,17 @@ mod demo {
         let overlay_error = error.clone();
         let painting_error = error;
         let surface = gpu_canvas(move |gpu| {
+            // The canvas is a physical-pixel producer: follow its current bounds, not the size it
+            // had when the app was built. A resize recreates the exported buffer (or the
+            // same-device surface) and the depth attachment, so the image is never stretched.
+            let bounds = gpu.bounds();
+            let scale = gpu.scale_factor();
+            let width = (bounds.size.width.0 * scale).round().max(1.0) as u32;
+            let height = (bounds.size.height.0 * scale).round().max(1.0) as u32;
+
             let mut slot = drawing.borrow_mut();
             if slot.is_none() && painting_error.borrow().is_none() {
-                match Scene::build(gpu, bench) {
+                match Scene::build(gpu, width, height, bench) {
                     Ok(built) => *slot = Some(built),
                     Err(build) => {
                         let message = format!("{build:#}");
@@ -1094,6 +933,14 @@ mod demo {
                     scene.path,
                 );
                 unsafe { libc::_exit(0) }
+            }
+
+            if let Err(error) = scene.resize(width, height) {
+                let message = format!("{error:#}");
+                eprintln!("interop_wgpu: cannot resize the render target: {message}");
+                log::error!("interop_wgpu: cannot resize the render target: {message}");
+                *painting_error.borrow_mut() = Some(message);
+                return;
             }
 
             match scene.render(gpu, paused.get(), speed.get(), palette.get()) {
@@ -1144,40 +991,18 @@ mod demo {
             }
         };
 
-        div()
-            .relative()
-            .w(px(VIEW_WIDTH as f32))
-            .h(px(VIEW_HEIGHT as f32))
-            .rounded_lg()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(0x27303e))
+        viewport_frame()
             .child(surface_input(surface, handler))
-            .children(overlay_error.borrow().clone().map(error_panel))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(12.))
-                    .right(px(12.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgba(0x0a0f18cc))
-                    .border_1()
-                    .border_color(rgba(0xffffff1f))
-                    .text_xs()
-                    .text_color(rgb(0x9ec1ff))
-                    .child("wgpu · 0 CPU copies"),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(12.))
-                    .left(px(12.))
-                    .text_xs()
-                    .text_color(rgba(0xffffff99))
-                    .child("drag to orbit · scroll to zoom"),
-            )
+            .children(overlay_error.borrow().clone().map(|message| {
+                error_panel(
+                    "The wgpu viewport could not start",
+                    message,
+                    "Run with --list-gpus to see the adapters. A Vulkan adapter uses the dma-buf \
+                     path; the others fall back to a same-device view.",
+                )
+            }))
+            .child(overlay_badge("wgpu · 0 CPU copies"))
+            .child(overlay_hint("drag to orbit · scroll to zoom"))
             .into_any_element()
     }
 
@@ -1203,8 +1028,11 @@ mod demo {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         output: Output,
-        /// How the frames reach GPUI, for the header: `dma-buf` or `same-device`.
+        /// How the frames reach GPUI, for the metrics panel: `dma-buf` or `same-device`.
         path: &'static str,
+        /// The target's current size, in physical pixels.
+        width: u32,
+        height: u32,
         depth: wgpu::TextureView,
         pipeline: wgpu::RenderPipeline,
         vertices: wgpu::Buffer,
@@ -1226,8 +1054,17 @@ mod demo {
     impl Scene {
         fn build(
             gpu: &mut gpui::GpuCanvasContext,
+            width: u32,
+            height: u32,
             bench: Option<Duration>,
         ) -> anyhow::Result<Self> {
+            // The bench keeps a fixed size so the two demos' producer numbers compare; the window
+            // follows the canvas's physical size instead.
+            let (width, height) = if bench.is_some() {
+                (BENCH_WIDTH, BENCH_HEIGHT)
+            } else {
+                (width.max(1), height.max(1))
+            };
             let interop = attach(gpu.try_device::<WgpuRenderer>())
                 .map_err(|unavailable| anyhow::anyhow!("{unavailable:?}"))?;
             let (device, queue) = interop
@@ -1239,38 +1076,22 @@ mod demo {
                 .gpu_id()
                 .map_or_else(|| "non-Vulkan wgpu adapter".to_owned(), |id| id.name);
             eprintln!("interop_wgpu: rendering on {gpu_name}");
-            let (output, path) =
-                match WgpuSharedBuffer::new(&device, VIEW_WIDTH, VIEW_HEIGHT, FORMAT) {
-                    Ok(buffer) => (Output::Exported(Box::new(buffer)), "dma-buf + sync_file"),
-                    Err(export) => {
-                        // A wgpu device on a non-Vulkan backend (or one without the export extensions)
-                        // has no VkImage to export, and needs none: the renderer samples a view on the
-                        // same device, so the pixels never leave it at all.
-                        eprintln!(
-                            "interop_wgpu: dma-buf export unavailable ({export:#}); using the \
+            let (output, path) = match WgpuSharedBuffer::new(&device, width, height, FORMAT) {
+                Ok(buffer) => (Output::Exported(Box::new(buffer)), "dma-buf + sync_file"),
+                Err(export) => {
+                    // A wgpu device on a non-Vulkan backend (or one without the export extensions)
+                    // has no VkImage to export, and needs none: the renderer samples a view on the
+                    // same device, so the pixels never leave it at all.
+                    eprintln!(
+                        "interop_wgpu: dma-buf export unavailable ({export:#}); using the \
                          same-device view"
-                        );
-                        let surface = WgpuSurface::new(&device, VIEW_WIDTH, VIEW_HEIGHT)?;
-                        (Output::SameDevice(surface), "same-device view")
-                    }
-                };
+                    );
+                    let surface = WgpuSurface::new(&device, width, height)?;
+                    (Output::SameDevice(surface), "same-device view")
+                }
+            };
 
-            let depth = device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("interop_wgpu_depth"),
-                    size: wgpu::Extent3d {
-                        width: VIEW_WIDTH,
-                        height: VIEW_HEIGHT,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                })
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            let depth = Self::depth_view(&device, width, height);
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("interop_wgpu_shader"),
@@ -1432,8 +1253,54 @@ mod demo {
                 gpu: gpu_name,
                 output,
                 path,
+                width,
+                height,
                 bench,
             })
+        }
+
+        /// The depth attachment for a target of this size.
+        fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("interop_wgpu_depth"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        }
+
+        /// Follow the canvas's physical size. Reallocating on a bounds change keeps the producer's
+        /// pixels square: GPUI draws the surface into the canvas's bounds, so a target of a
+        /// different aspect would be stretched to fill it.
+        fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
+            let width = width.max(1);
+            let height = height.max(1);
+            if (width, height) == (self.width, self.height) {
+                return Ok(());
+            }
+
+            match &mut self.output {
+                Output::Exported(buffer) => {
+                    **buffer = WgpuSharedBuffer::new(&self.device, width, height, FORMAT)?;
+                }
+                Output::SameDevice(surface) => {
+                    *surface = WgpuSurface::new(&self.device, width, height)?;
+                }
+            }
+            self.depth = Self::depth_view(&self.device, width, height);
+            self.width = width;
+            self.height = height;
+            Ok(())
         }
 
         /// Render one frame and hand it to the canvas — as a dma-buf on the exported path, or as a
@@ -1479,7 +1346,7 @@ mod demo {
                 self.distance * self.pitch.cos() * self.yaw.cos(),
             ];
             let view = look_at(eye, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-            let projection = perspective(0.9, VIEW_WIDTH as f32 / VIEW_HEIGHT as f32, 0.1, 100.0);
+            let projection = perspective(0.9, self.width as f32 / self.height as f32, 0.1, 100.0);
             let view_projection = mul(&projection, &view);
             self.queue
                 .write_buffer(&self.uniforms, 0, &floats(&view_projection.concat()));

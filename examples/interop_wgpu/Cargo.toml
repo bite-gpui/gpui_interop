@@ -1,0 +1,26 @@
+[package]
+name = "interop_wgpu"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Its own crate so `cargo run -p interop_wgpu` builds only this producer. The shared library is
+# enabled with the same `example` feature the Bevy demo uses, so switching between the two does not
+# rebuild the library or the GPUI stack.
+[[bin]]
+name = "interop_wgpu"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow.workspace = true
+log = "0.4.16"
+gpui.workspace = true
+gpui_interop = { workspace = true, features = ["example"] }
+gpui_wgpu.workspace = true
+interop_demo.workspace = true
+# The bench leaves the process without unwinding the window loop.
+libc = "0.2"
+wgpu.workspace = true
