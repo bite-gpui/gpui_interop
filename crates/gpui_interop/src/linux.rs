@@ -372,16 +372,6 @@ impl GpuDevice {
         self.queue_family_index
     }
 
-    /// A modifier of `format` the renderer can sample and render to — the tiled choice, or `None`
-    /// where the device offers none.
-    fn tiled_modifier(&self, format: vk::Format, required: vk::FormatFeatureFlags) -> Option<u64> {
-        supported_modifiers(self, format)
-            .into_iter()
-            .filter(|p| p.drm_format_modifier != DmaBufHandle::LINEAR)
-            .find(|p| p.drm_format_modifier_tiling_features.contains(required))
-            .map(|p| p.drm_format_modifier)
-    }
-
     /// The GPU this device is on — the identity a producer that must match the renderer's GPU reads.
     pub fn gpu_id(&self) -> GpuId {
         GpuId::of(&self.instance, self.physical_device)
@@ -545,6 +535,225 @@ impl Drop for GpuDevice {
             if self.owns_instance {
                 self.instance.destroy_instance(None);
             }
+        }
+    }
+}
+
+/// The Vulkan handles an export needs, whether the producer opened the device
+/// ([`GpuDevice`]) or borrowed one that already exists — a wgpu device's own `VkDevice`.
+///
+/// Only what `vkCreateImage`, the modifier query and the memory allocation read is here; the
+/// queue and command pool belong to [`GpuDevice`]'s submission helpers and are not part of an
+/// export.
+pub(crate) trait ExportDevice {
+    fn instance(&self) -> &ash::Instance;
+    fn physical_device(&self) -> vk::PhysicalDevice;
+    fn device(&self) -> &ash::Device;
+    fn external_memory_fd(&self) -> &ash::khr::external_memory_fd::Device;
+    fn drm_format_modifier(&self) -> &ash::ext::image_drm_format_modifier::Device;
+
+    /// Whether the device is the renderer's own, which is what makes a DRM modifier's importability
+    /// knowable. [`Tiling::Tiled`] is honoured only when this is true.
+    fn renderer_bound(&self) -> bool;
+
+    /// The first memory type the image allows that carries every flag in `required`.
+    fn memory_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
+        // SAFETY: the call reads the physical device's memory properties.
+        let properties = unsafe {
+            self.instance()
+                .get_physical_device_memory_properties(self.physical_device())
+        };
+        (0..properties.memory_type_count)
+            .find(|i| {
+                bits & (1u32 << i) != 0
+                    && properties.memory_types[*i as usize]
+                        .property_flags
+                        .contains(required)
+            })
+            .ok_or_else(|| anyhow!("no memory type carrying {required:?} for the image"))
+    }
+}
+
+impl ExportDevice for GpuDevice {
+    fn instance(&self) -> &ash::Instance {
+        GpuDevice::instance(self)
+    }
+
+    fn physical_device(&self) -> vk::PhysicalDevice {
+        GpuDevice::physical_device(self)
+    }
+
+    fn device(&self) -> &ash::Device {
+        GpuDevice::device(self)
+    }
+
+    fn external_memory_fd(&self) -> &ash::khr::external_memory_fd::Device {
+        GpuDevice::external_memory_fd(self)
+    }
+
+    fn drm_format_modifier(&self) -> &ash::ext::image_drm_format_modifier::Device {
+        GpuDevice::drm_format_modifier(self)
+    }
+
+    fn renderer_bound(&self) -> bool {
+        self.renderer_bound
+    }
+
+    fn memory_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
+        GpuDevice::memory_type(self, bits, required)
+    }
+}
+
+/// Allocate an image backed by an exported dma-buf: the image, its memory, and the handle the
+/// renderer imports under.
+///
+/// `vk_format` is the Vulkan form of `format`. It is a parameter rather than derived here because a
+/// caller that renders with a GPU API writes through that API's sRGB form (`_SRGB`), while a caller
+/// that uploads already-encoded bytes uses `_UNORM` — both carry the same DRM layout and the same
+/// [`SurfaceFormatKind`].
+///
+/// `tiling` is honoured as [`SharedBuffer::new`] honours it: a modifier is picked only where the
+/// device's layout is the consumer's (`renderer_bound`), otherwise the buffer is linear with a
+/// warning.
+pub(crate) fn allocate_export_image<D: ExportDevice + ?Sized>(
+    device: &D,
+    width: u32,
+    height: u32,
+    format: SurfaceFormatKind,
+    vk_format: vk::Format,
+    tiling: Tiling,
+    rendered: bool,
+) -> Result<(vk::Image, vk::DeviceMemory, DmaBufHandle)> {
+    let plane_count = format.plane_count();
+    let usage = usage_for(rendered);
+    let required = required_features(usage);
+    let modifier = match tiling {
+        Tiling::Linear => None,
+        Tiling::Tiled if !device.renderer_bound() => {
+            // A modifier is a claim about the memory layout of a GPU the consumer shares, and only
+            // the renderer's own device can make it truthfully — a different vendor's modifier is
+            // not importable at all. Refusing here exports a buffer the consumer can sample, where
+            // honouring it could wedge the device instead.
+            log::warn!(
+                "gpui_interop: Tiling::Tiled needs the renderer's own device; this one was opened \
+                 by the producer, so the modifier it would pick is not known to be importable. \
+                 Exporting a linear buffer — borrow the renderer's device with \
+                 `Adapter::gpu_device` to tile."
+            );
+            None
+        }
+        Tiling::Tiled => {
+            let modifier = tiled_modifier(device, vk_format, required);
+            if modifier.is_none() {
+                log::warn!(
+                    "gpui_interop: this device offers no {format:?} modifier the renderer can \
+                     import; exporting a linear buffer"
+                );
+            }
+            modifier
+        }
+    };
+
+    ensure_image_supported(device, vk_format, width, height, usage, required, modifier)?;
+
+    let image = create_image(device, vk_format, width, height, usage, modifier)?;
+
+    let requirements = unsafe { device.device().get_image_memory_requirements(image) };
+    let memory_type_index = device.memory_type(
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+
+    let mut export = vk::ExportMemoryAllocateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    // A dedicated allocation, as the two working dma-buf paths here make — `gpui_wgpu`'s importer
+    // and `gpui_va`'s tiled fill. An image that is imported or exported wants one, and a driver is
+    // allowed to require it.
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index)
+        .push_next(&mut export)
+        .push_next(&mut dedicated);
+
+    // SAFETY: the allocation chains a local `export`, the size and type come from the image, and
+    // the memory is freed by the caller on every path.
+    let memory = match unsafe { device.device().allocate_memory(&allocate_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.device().destroy_image(image, None) };
+            return Err(anyhow!("allocate the image memory: {e:?}"));
+        }
+    };
+    // SAFETY: `memory` was allocated for `image` (same requirements) and is bound once.
+    if let Err(e) = unsafe { device.device().bind_image_memory(image, memory, 0) } {
+        unsafe { device.device().free_memory(memory, None) };
+        unsafe { device.device().destroy_image(image, None) };
+        return Err(anyhow!("bind the image memory: {e:?}"));
+    }
+
+    let result = (|| -> Result<DmaBufHandle> {
+        // The modifier the driver actually chose, which is what the renderer imports under.
+        let drm = modifier.is_some();
+        let modifier = match modifier {
+            Some(_) => {
+                let mut properties = vk::ImageDrmFormatModifierPropertiesEXT::default();
+                // SAFETY: `image` is live and bound.
+                unsafe {
+                    device
+                        .drm_format_modifier()
+                        .get_image_drm_format_modifier_properties(image, &mut properties)
+                }
+                .map_err(|e| anyhow!("read the image's modifier: {e:?}"))?;
+                properties.drm_format_modifier
+            }
+            None => DmaBufHandle::LINEAR,
+        };
+
+        // SAFETY: the fd is freshly exported for this memory, and takes ownership below.
+        let fd = unsafe {
+            device.external_memory_fd().get_memory_fd(
+                &vk::MemoryGetFdInfoKHR::default()
+                    .memory(memory)
+                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+            )
+        }
+        .map_err(|e| anyhow!("export the dma-buf fd: {e:?}"))?;
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let mut planes = Vec::with_capacity(plane_count);
+        for plane in 0..plane_count {
+            // SAFETY: `image` is live and the subresource names `plane`.
+            let layout = unsafe {
+                device.device().get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask: subresource_aspect(drm, plane, plane_count),
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            let plane_fd = fd
+                .try_clone()
+                .map_err(|e| anyhow!("duplicate the dma-buf fd for plane {plane}: {e}"))?;
+            planes.push(DmaBufPlane::new(
+                plane_fd,
+                layout.offset,
+                layout.row_pitch as u32,
+            ));
+        }
+        Ok(DmaBufHandle::new(
+            width, height, format, modifier, planes, None,
+        ))
+    })();
+
+    match result {
+        Ok(handle) => Ok((image, memory, handle)),
+        Err(error) => {
+            unsafe { device.device().free_memory(memory, None) };
+            unsafe { device.device().destroy_image(image, None) };
+            Err(error)
         }
     }
 }
@@ -781,123 +990,8 @@ impl SharedBuffer {
         rendered: bool,
     ) -> Result<Self> {
         let vk_format = vk_format(format)?;
-        let plane_count = format.plane_count();
-        let usage = usage_for(rendered);
-        let required = required_features(usage);
-        let modifier = match tiling {
-            Tiling::Linear => None,
-            Tiling::Tiled if !device.renderer_bound => {
-                // A modifier is a claim about the memory layout of a GPU the consumer shares, and only
-                // the renderer's own device can make it truthfully — a different vendor's modifier is
-                // not importable at all. Refusing here exports a buffer the consumer can sample, where
-                // honouring it could wedge the device instead.
-                log::warn!(
-                    "gpui_interop: Tiling::Tiled needs the renderer's own device; this one was opened \
-                     by the producer, so the modifier it would pick is not known to be importable. \
-                     Exporting a linear buffer — borrow the renderer's device with \
-                     `Adapter::gpu_device` to tile."
-                );
-                None
-            }
-            Tiling::Tiled => {
-                let modifier = device.tiled_modifier(vk_format, required);
-                if modifier.is_none() {
-                    log::warn!(
-                        "gpui_interop: this device offers no {format:?} modifier the renderer can \
-                         import; exporting a linear buffer"
-                    );
-                }
-                modifier
-            }
-        };
-
-        ensure_image_supported(device, vk_format, width, height, usage, required, modifier)?;
-
-        let image = create_image(device, vk_format, width, height, usage, modifier)?;
-
-        let requirements = unsafe { device.device().get_image_memory_requirements(image) };
-        let memory_type_index = device.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
-
-        let mut export = vk::ExportMemoryAllocateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        // A dedicated allocation, as the two working dma-buf paths here make — `gpui_wgpu`'s importer
-        // and `gpui_va`'s tiled fill. An image that is imported or exported wants one, and a driver is
-        // allowed to require it.
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index)
-            .push_next(&mut export)
-            .push_next(&mut dedicated);
-
-        // SAFETY: the allocation chains a local `export`, the size and type come from the image, and
-        // the memory is freed when the returned value drops.
-        let memory = unsafe { device.device().allocate_memory(&allocate_info, None) }
-            .map_err(|e| anyhow!("allocate the image memory: {e:?}"))?;
-        // SAFETY: `memory` was allocated for `image` (same requirements) and is bound once.
-        if let Err(e) = unsafe { device.device().bind_image_memory(image, memory, 0) } {
-            unsafe { device.device().free_memory(memory, None) };
-            unsafe { device.device().destroy_image(image, None) };
-            return Err(anyhow!("bind the image memory: {e:?}"));
-        }
-
-        // The modifier the driver actually chose, which is what the renderer imports under.
-        let drm = modifier.is_some();
-        let modifier = match modifier {
-            Some(_) => {
-                let mut properties = vk::ImageDrmFormatModifierPropertiesEXT::default();
-                if let Err(e) = unsafe {
-                    device
-                        .drm_format_modifier()
-                        .get_image_drm_format_modifier_properties(image, &mut properties)
-                } {
-                    unsafe { device.device().free_memory(memory, None) };
-                    unsafe { device.device().destroy_image(image, None) };
-                    return Err(anyhow!("read the image's modifier: {e:?}"));
-                }
-                properties.drm_format_modifier
-            }
-            None => DmaBufHandle::LINEAR,
-        };
-
-        // SAFETY: the fd is freshly exported for this memory, and takes ownership below.
-        let fd = unsafe {
-            device.external_memory_fd().get_memory_fd(
-                &vk::MemoryGetFdInfoKHR::default()
-                    .memory(memory)
-                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
-            )
-        }
-        .map_err(|e| anyhow!("export the dma-buf fd: {e:?}"))?;
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        let mut planes = Vec::with_capacity(plane_count);
-        for plane in 0..plane_count {
-            // SAFETY: `image` is live and the subresource names `plane`.
-            let layout = unsafe {
-                device.device().get_image_subresource_layout(
-                    image,
-                    vk::ImageSubresource {
-                        aspect_mask: subresource_aspect(drm, plane, plane_count),
-                        mip_level: 0,
-                        array_layer: 0,
-                    },
-                )
-            };
-            let plane_fd = fd
-                .try_clone()
-                .map_err(|e| anyhow!("duplicate the dma-buf fd for plane {plane}: {e}"))?;
-            planes.push(DmaBufPlane::new(
-                plane_fd,
-                layout.offset,
-                layout.row_pitch as u32,
-            ));
-        }
-        let handle = DmaBufHandle::new(width, height, format, modifier, planes, None);
-
+        let (image, memory, handle) =
+            allocate_export_image(device, width, height, format, vk_format, tiling, rendered)?;
         Ok(Self {
             device: device.device().clone(),
             backing: Backing::Image(image),
@@ -1245,9 +1339,23 @@ impl Drop for Fence {
     }
 }
 
+/// A modifier of `format` the device can sample and render to — the tiled choice, or `None` where
+/// the device offers none.
+pub(crate) fn tiled_modifier<D: ExportDevice + ?Sized>(
+    device: &D,
+    format: vk::Format,
+    required: vk::FormatFeatureFlags,
+) -> Option<u64> {
+    supported_modifiers(device, format)
+        .into_iter()
+        .filter(|p| p.drm_format_modifier != DmaBufHandle::LINEAR)
+        .find(|p| p.drm_format_modifier_tiling_features.contains(required))
+        .map(|p| p.drm_format_modifier)
+}
+
 /// Create the shareable image, on `modifier` when one was chosen and linear otherwise.
-fn create_image(
-    device: &GpuDevice,
+fn create_image<D: ExportDevice + ?Sized>(
+    device: &D,
     format: vk::Format,
     width: u32,
     height: u32,
@@ -1571,8 +1679,8 @@ fn pick_device(instance: &ash::Instance) -> Option<(vk::PhysicalDevice, u32)> {
 }
 
 /// Every DRM format modifier `format` supports, with the features each carries.
-fn supported_modifiers(
-    device: &GpuDevice,
+fn supported_modifiers<D: ExportDevice + ?Sized>(
+    device: &D,
     format: vk::Format,
 ) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
     // SAFETY: both calls read; the list is filled into a buffer sized from the first call's count.
@@ -1603,7 +1711,10 @@ fn supported_modifiers(
 }
 
 /// The properties the device reports for `format` — the feature bits each tiling carries.
-fn format_properties(device: &GpuDevice, format: vk::Format) -> vk::FormatProperties {
+fn format_properties<D: ExportDevice + ?Sized>(
+    device: &D,
+    format: vk::Format,
+) -> vk::FormatProperties {
     // SAFETY: the call only reads; the properties are copied out.
     unsafe {
         device
@@ -1618,8 +1729,8 @@ fn format_properties(device: &GpuDevice, format: vk::Format) -> vk::FormatProper
 /// `vkCreateImage` answers an unsupported request with a bare `VK_ERROR_FORMAT_NOT_SUPPORTED`, which
 /// names neither the format nor what is missing. This names both, so a caller can pick another format
 /// or tiling instead of guessing.
-fn ensure_image_supported(
-    device: &GpuDevice,
+fn ensure_image_supported<D: ExportDevice + ?Sized>(
+    device: &D,
     format: vk::Format,
     width: u32,
     height: u32,

@@ -18,8 +18,10 @@ texture sharing will not work without downloading the frame to system RAM and re
 OS-level handle (a `dma-buf` on Linux or a shared texture on Windows), and passes it to GPUI's
 `surface()` element. GPUI's renderer imports that handle and samples the texture directly on the GPU.
 
-> **Note:** You only need this crate when your renderer uses its own separate GPU device. If your code
-> can draw directly on GPUI's device, use GPUI's built-in rendering APIs instead.
+> **Note:** there are two wgpu shapes. `WgpuSharedBuffer` (Linux) renders into an exportable image and
+> hands GPUI a dma-buf with its modifier and a `sync_file` — the cross-device shape a renderer of
+> another backend imports. Where the renderer is wgpu, `WgpuSurface` plus `paint_texture` is the
+> same-device fast path, with no export and no fence.
 
 ## Common use cases
 
@@ -38,6 +40,10 @@ OS-level handle (a `dma-buf` on Linux or a shared texture on Windows), and passe
 | **Linux** | `SharedBuffer` → `gpui::DmaBufHandle` | Exports a Vulkan image as a `dma-buf` with its DRM format modifier (linear or driver-tiled, single-plane or two-plane NV12). `SharedBuffer::new` lets the driver choose the layout; `SharedBuffer::export_at` pushes one the producer declares, which is the shape a decoder or a canonical DRM buffer needs. Frame synchronization is handled by a `Fence` that exports a `sync_file`. |
 | **Windows** | `SharedSurface` + `Fence` | Exports a shared texture from a Direct3D 12 renderer and opens it on GPUI's Direct3D 11 device, using a shared fence to synchronize the two GPU queues. |
 | **macOS** | `IOSurface` | **Not yet implemented.** Planned support will wrap an external renderer's `IOSurface` in an `MTLTexture`. |
+
+A wgpu producer has two shapes: `WgpuSharedBuffer` exports an offscreen image as a dma-buf that
+`paint_surface` imports (the cross-device shape), and `WgpuSurface` is the same-device fast path for
+`paint_texture`. Both start from `Adapter::wgpu`. See [wgpu producers](#wgpu-producers).
 
 ## Requirements
 
@@ -67,42 +73,104 @@ fn bridge(gpu: &mut gpui::GpuCanvasContext) -> Result<(), Unavailable> {
     // 1. Connect to the window's active renderer.
     let interop = attach(gpu.try_device::<gpui::DirectXRenderer>())?;
 
-    // 2. A producer that wants wgpu can get a device on the renderer's own adapter (Windows;
-    //    the `wgpu` feature). This is an adapter match, not a transport.
+    // 2. A producer that wants wgpu can get a device and queue to render on. Where the attached
+    //    renderer is wgpu (Linux; Windows with `WgpuRenderer`) this is that renderer's own pair;
+    //    under the Direct3D 11 renderer it is a separate DX12 device on the same adapter.
     let (device, queue) = interop.adapter().wgpu().expect("no matching GPU adapter found");
 
-    // 3. The hand-off is the platform's native transport:
-    //    - Windows: allocate a `SharedSurface` on a Direct3D 12 device on that adapter, signal a
-    //      `Fence`, and paint its `SurfaceSource`;
-    //    - Linux: a Vulkan producer allocates a `SharedBuffer` (or uses `Adapter::gpu_device`).
+    // 3. A wgpu producer renders into a `WgpuSharedBuffer` and paints its exported dma-buf, or,
+    //    where the renderer is wgpu, into a `WgpuSurface` and paints the view. A Vulkan producer
+    //    hands over a `SharedBuffer` dma-buf; a Direct3D 12 one a `SharedSurface`.
     Ok(())
 }
 ```
 
 The snippet above shows the Windows adapter match using `gpui::DirectXRenderer` and
-`Adapter::wgpu()`. On Linux, the window uses `gpui_wgpu::WgpuRenderer`, and a producer that owns its
-device obtains one from `interop.adapter().gpu_device()` instead — which creates a dma-buf-capable
-Vulkan device on the same physical GPU (see the Linux code example below).
+`Adapter::wgpu()`. On Linux, the window uses `gpui_wgpu::WgpuRenderer`, and `Adapter::wgpu()` returns
+that renderer's own device and queue for a wgpu viewport. A **Vulkan** producer that owns its device
+uses `interop.adapter().gpu_device()` instead — a dma-buf-capable Vulkan device on the same physical
+GPU (see the Linux code example below).
 
 ### wgpu producers
 
-`Adapter::wgpu()` is the **adapter match**, not a wgpu transport. On Windows it gives a
-`wgpu::Device`/`Queue` on the renderer's Direct3D adapter; the frame still leaves through a raw
-Direct3D 12 `SharedSurface`, because wgpu does not create shareable textures. On Linux it returns
-`None`: the window renderer already is wgpu, so a wgpu producer does not need this crate at all.
+A wgpu producer has two shapes, and both start from `Adapter::wgpu()` — a wgpu device and queue on
+the renderer's GPU. Which one to use turns on whether the frame is consumed as a **native handle** or
+as a view on the same device.
 
-A wgpu producer therefore has two supported shapes:
+#### The exported buffer (cross-device shape)
 
-- **Same device — recommended.** Render on the window's own wgpu device (always on Linux; on Windows
-  when the window's renderer factory installs `WgpuRenderer`) and composite the texture with GPUI's
-  built-in imported-texture path — `ImportedTextureExt::to_imported_handle` plus
-  `GpuCanvasContext::paint_texture`. No CPU copy, no `gpui_interop`.
-- **Cross-device native.** Use the platform's native producer: raw Vulkan on Linux (`SharedBuffer`)
-  or raw Direct3D 12 on Windows (`SharedSurface` + `Fence`). A wgpu engine can use `Adapter::wgpu()`
-  to land on the right adapter, but it still needs the native hand-off.
+`WgpuSharedBuffer` allocates an **exportable**, tiled image on the wgpu device's own `VkDevice`,
+wraps it back into wgpu so the producer draws with the ordinary API, and exports the frame as a
+`DmaBufHandle`: the DRM modifier, per-plane offsets and strides, and a `sync_file` fence signalled by
+the submission. `GpuCanvasContext::paint_surface` imports that native handle exactly as it imports a
+decoder's, so the window renderer's own backend samples it. This is the shape to use when the
+consumer is not the producer's device, and it keeps the hand-off identical across platforms.
 
-There is no `wgpu::Texture` export helper today. That would be a wgpu-hal-level feature, not a flag on
-this crate.
+```rust
+use gpui::GpuCanvasContext;
+use gpui_interop::{WgpuSharedBuffer, attach};
+use gpui_wgpu::WgpuRenderer;
+
+fn viewport(gpu: &mut GpuCanvasContext, engine: &mut Engine) -> anyhow::Result<()> {
+    let interop = attach(gpu.try_device::<WgpuRenderer>())?;
+    let (device, queue) = interop.adapter().wgpu().expect("the renderer's device");
+
+    // An exportable, tiled image; `Rgba8UnormSrgb` and `Bgra8UnormSrgb` are accepted.
+    let mut buffer =
+        WgpuSharedBuffer::new(&device, 960, 540, wgpu::TextureFormat::Rgba8UnormSrgb)?;
+
+    // Render into buffer.view() with the ordinary wgpu API. `submit` registers the fence on the
+    // submission, submits it, and returns the dma-buf handle the scene imports.
+    let commands = engine.encode(&device, buffer.view());
+    gpu.paint_surface(buffer.submit(&queue, Some(commands))?);
+    Ok(())
+}
+```
+
+`WgpuSharedBuffer` is single-frame: a producer that renders the next frame while the renderer
+samples the last one keeps a ring of them. The image is always tiled — a linear image cannot carry
+`COLOR_ATTACHMENT` on the devices this path supports — so there is no linear fallback. The wgpu
+device must carry `VK_EXT_image_drm_format_modifier`, `VK_KHR_external_memory_fd`,
+`VK_EXT_external_memory_dma_buf` and `VK_KHR_external_semaphore_fd`; `Adapter::wgpu` on Linux
+returns the renderer's device, which `gpui_wgpu` creates with the first and fourth, and wgpu-hal
+enables the middle two. A device from a plain `request_device` lacks the first and is refused with a
+message naming it.
+
+#### The same-device view (fast path)
+
+Where the window renderer *is* wgpu — the Linux default, or a Windows window whose factory installed
+`WgpuRenderer` — `Adapter::wgpu()` returns exactly that device and queue, cloned. A `WgpuSurface`
+rendered there is sampled by the same device with `paint_texture`: no export, no fence, no import.
+
+```rust
+use gpui::{Corners, GpuCanvasContext};
+use gpui_interop::{WgpuSurface, attach};
+use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
+
+fn viewport(gpu: &mut GpuCanvasContext, engine: &mut Engine) -> anyhow::Result<()> {
+    let interop = attach(gpu.try_device::<WgpuRenderer>())?;
+    let (device, queue) = interop.adapter().wgpu().expect("the renderer's own device");
+    let surface = WgpuSurface::new(&device, 960, 540)?;
+
+    engine.render(&device, &queue, surface.view());
+    gpu.paint_texture(
+        surface.view().to_imported_handle()?,
+        Corners::default(),
+        1.0,
+        false,
+    );
+    Ok(())
+}
+```
+
+`WgpuSurface` also offers `with_format` for `Bgra8UnormSrgb` (the other form
+`to_imported_handle` accepts) and `resize` for a viewport whose bounds follow the window. It refuses
+non-sRGB formats up front, where the mistake is the caller's: `to_imported_handle` accepts only sRGB,
+and a `UNORM` view sampled without that check composites with a gamma error rather than failing.
+
+A `wgpu::Texture` that wgpu allocated itself still cannot be exported — wgpu allocates it without the
+external-memory flags a dma-buf needs and exposes no export API. Allocate the shared image with
+`WgpuSharedBuffer` instead, or use the same-device view above.
 
 If the canvas does not expose a compatible hardware device (for example, when running in an offscreen
 test or an unsupported renderer), `attach` returns `Err(Unavailable::NoDevice)` instead of panicking so
@@ -110,20 +178,120 @@ your application can fall back cleanly.
 
 ## Examples
 
-Three Linux examples show how to pass frames and input between an external renderer and GPUI. Build and
-run them with the `example` feature:
+Five Linux examples show how to pass frames and input between an external renderer and GPUI. Build
+and run them with the `example` feature (the Bevy demo has its own `bevy-example` feature, which
+implies `example`):
 
 | Example | Description |
 | --- | --- |
 | `interop_linux` | Minimal setup: clears two `SharedBuffer` textures on a separate GPU device (one linear, one driver-tiled), exports them as `dma-buf` handles, and draws them as tiles in a GPUI window. |
 | `interop_cube` | Embedded 3D engine: an independent Vulkan pipeline renders a spinning cube into a `SharedBuffer` and composites it into GPUI with zero CPU copies. |
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
+| `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in GPUI controls, a stats panel and overlays. `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting. |
+| `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
 
 ```sh
 cargo run -p gpui_interop --example interop_linux     --features example
 cargo run -p gpui_interop --example interop_cube      --features example
 cargo run -p gpui_interop --example interop_cube_drag --features example
+cargo run -p gpui_interop --example interop_wgpu      --features example
+cargo run -p gpui_interop --example interop_bevy      --features bevy-example
+
+# The wgpu and Bevy demos also enumerate and select their adapter:
+cargo run -p gpui_interop --example interop_wgpu --features example -- --list-gpus
+cargo run -p gpui_interop --example interop_wgpu --features example -- --gpu 1
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --list-gpus
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --stats
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --probe
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --transfer --stats
+
+# Raw producer throughput, one adapter at a time (no presentation):
+cargo run -p gpui_interop --example interop_wgpu --features example -- --gpu 0 --bench 10
+cargo run -p gpui_interop --example interop_wgpu --features example -- --gpu 1 --bench 10
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 0 --bench 10
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --bench 10
+cargo run -p gpui_interop --example interop_bevy --features bevy-example -- --gpu 1 --scene clear --bench 10
 ```
+
+`--bench` measures the producer: the wgpu render plus, on the dma-buf path, the export and fence,
+with the GPU waited on each frame. It does not present, so it is independent of vsync and the
+window loop. The consumer's half is a normal run's `paint` (import/composite) and `wait`
+(presentation; on an Optimus laptop the PRIME transfer to the display). Compare both ways to tell
+an adapter's render ceiling from its display path.
+
+`interop_bevy --bench` is the same measurement for a full engine: headless Bevy, no window, its own
+`ScheduleRunnerPlugin` loop, and a device poll per frame. It is deliberately Bevy 0.19 rather than
+0.20: `bevy_render` 0.19 depends on `wgpu 29`, the version this workspace already has, so the
+producer cannot accidentally compile a second wgpu and split the texture types.
+
+A Bevy PBR frame also exposed two limits in the window renderer's device that a hand-written
+pipeline never hits. Bevy's clustered-forward pass needs 5–8 storage buffers per stage and a
+64 KiB uniform binding, while `gpui_wgpu` requested `Limits::downlevel_defaults` (4 and 16 KiB);
+and its post-processing stores `R16Float`/`Rgba16Float`, which needs
+`TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`. Without both, Bevy's bind-group layouts fail
+validation, the render world quits, and the image stays all zeros. `gpui_wgpu` now raises those
+limits to the adapter's reported values on native (GL keeps the downlevel set) and enables the
+format feature where available.
+
+Measured on an Intel HD 520 + NVIDIA 930M laptop, 960 × 600, the 7 × 7 Ember field, with the
+Bevy and wgpu crates at `opt-level = 3` (`[profile.dev.package]`), sequentially rather than
+concurrently:
+
+| Path | Intel HD 520 | NVIDIA 930M |
+| --- | --- | --- |
+| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 522.7 fps · 1.9 ms/frame | 1497.3 fps · 0.7 ms/frame |
+| `interop_bevy --bench 5` (Bevy only, GPU waited) | 121.5 fps · 8.2 ms/frame | 176.1 fps · 5.7 ms/frame |
+| `interop_bevy --scene clear --bench 5` (engine only) | — | 195.9 fps · 5.1 ms/frame |
+| Windowed `--stats` (image, presented) | ~45 fps | ~45 fps |
+| Windowed `--transfer --stats` (dma-buf, presented) | ~43 fps | ~46 fps |
+
+Bevy's PBR producer is 4–9× slower than the hand-written instanced pipeline, but both are far
+above the presented rate: the whole GPUI paint phase is ~5–7 ms while the frame interval is
+17–41 ms. The window is limited by presentation and the debug-build frame source, not by the
+producer.
+
+The scene is not the reason for Bevy's producer gap. `--scene clear` runs the same app with the
+camera and the clear pass but no meshes; after the lean-plugin change it measured 196 fps, one
+cube 179 fps, and the full field 176 fps on the NVIDIA adapter. Bevy's *engine loop* costs
+~5.1 ms even with nothing to draw; the 49-cube PBR field adds only ~0.6 ms. The 1497 → 176 fps
+drop from the hand-written wgpu loop is ECS/extract/prepare/render-graph overhead, not the scene.
+`--transfer` measured the dma-buf export at ~0.2–0.4 ms/frame and the `paint_surface` import at
+~0.03 ms, so transport is not the explanation either.
+
+In the windowed runs the Bevy step was ~2.0–4.0 ms, `paint_texture`/`paint_surface` ~0.03–0.09 ms
+and layout ~1.3–3.0 ms. The draw/present split shows why the interval is ~32 ms on a window that
+is not focused: the pipeline's `draw` is ~9 ms, the platform's `present wait` is the rest, and the
+`window active` row reads `no` until it is focused. GPUI caps an inactive window at 33.3 ms. The
+`gpui` and `bevy` tick counters are printed together and stay equal, so Bevy runs exactly once per
+GPUI paint; it has no pacing of its own. Removing `.cached()` from the header and sidebar raised
+layout to 9–11 ms and cost ~6 fps on the Intel adapter. The headless rows are engine ceilings, not
+the display path. `--transfer` adds ~0.2–0.4 ms for the export and ~0.03 ms for the import, and
+presents at the same rate as the image path.
+
+`interop_bevy` renders at the canvas's current **physical** size: the viewport is `flex_1`, and the
+paint callback resizes the target when its bounds or the window scale factor changes. In the
+default window the probe reports 953 × 598, not the old fixed 960 × 600. The bench keeps the fixed
+960 × 600 so producer runs are comparable. The image path changes the `Image` descriptor in place
+and lets Bevy recreate the texture; `--transfer` rebuilds the `WgpuSharedBuffer` and its manual
+view at the new size. Resizing therefore never stretches the source to a different aspect.
+
+Build the demos with `--release` for representative frame numbers. A debug build runs the GPUI
+authoring and layout crates at `opt-level = 0`; the same panel measured ~15 ms per frame in debug
+against ~2.2 ms in release. The `[profile.dev.package]` section in the root manifest optimises the
+layout engine and text shaper, but not the element traversal around them.
+
+`interop_wgpu`'s stats panel is fed entirely from the frame pipeline, so it also shows the
+out-of-tree decorator pattern: a small `MetricsPipeline` wraps
+`StandardImmediatePipeline.instrumented(PhaseMetrics)` and forwards every pass, recording the
+interval between frames and the time the pipeline spent driving each one. The panel splits the
+interval into `draw` (everything from `begin_frame` to `end_frame`, including the root passes) and
+`wait` (presentation, vsync and pacing), then breaks the draw down into evaluate, layout and paint,
+so a low rate can be attributed rather than guessed at.
+
+One cap lives outside the pipeline: an inactive window with no high-rate input is paced to
+`WindowOptions::inactive_frame_interval` (33.3 ms, about 30 fps) before `FramePipeline` is
+consulted, and thermal pressure caps at 60 fps. The panel reports the window's active state and
+whether the wait dominates the draw, which is how a uniform ~30 fps is diagnosed.
 
 ### The Linux `dma-buf` path in code
 
@@ -230,11 +398,14 @@ front:
      adapter name is unreliable because DXGI and `wgpu` can enumerate a different number of
      `Microsoft Basic Render Driver` (WARP) entries with identical names, whereas hardware LUIDs never
      collide.
-   * **On Linux:** It queries the renderer's `vk::PhysicalDevice`. Calling `Adapter::gpu_device` then
-     creates a second logical Vulkan device on that same physical card, ensuring your producer's render
-     queue never races with GPUI's queue.
+   * **On Linux:** It names the renderer's `vk::PhysicalDevice`. `Adapter::wgpu` returns the renderer's
+     own wgpu device and queue when the renderer is wgpu (the default), which is the same-device path
+     a wgpu viewport uses. `Adapter::gpu_device` is the separate door for a Vulkan producer that owns
+     its device: a second logical device on that same physical card with the dma-buf extensions, so
+     the producer's render queue never races GPUI's.
 3. If no matching physical GPU is found, the adapter call returns `None` rather than guessing which card
-   to use (`Adapter::wgpu` on Windows, `Adapter::gpu_device` on Linux). A producer that runs off the
+   to use (`Adapter::wgpu` where no wgpu renderer or matching DX12 adapter exists,
+   `Adapter::gpu_device` on a renderer that lends no Vulkan device). A producer that runs off the
    paint — a decoder or capture thread — reads the GPU identity after a canvas has run once through
    `gpui_interop::gpu_id()`; `Adapter::gpu_id` remembers it.
 
@@ -396,10 +567,12 @@ working tree — see the next section.
 | Feature | Description |
 | --- | --- |
 | *(default)* | Core library and platform transport types (`SharedBuffer`, `SharedSurface`, `Fence`) for Linux and Windows. |
-| `wgpu` | Enables `Adapter::wgpu`, which initializes a `wgpu::Device` and `wgpu::Queue` on the same physical GPU as the GPUI window. This is the adapter match, not a wgpu transport; the hand-off still uses the native surface type. |
+| `wgpu` | Enables `Adapter::wgpu`, `WgpuSurface` and, on Linux, `WgpuSharedBuffer`. Where the window renderer is wgpu, `Adapter::wgpu` returns its own device and queue. `WgpuSurface` is the same-device view; `WgpuSharedBuffer` allocates an exportable image and exports it as a dma-buf for `paint_surface`. Under the Direct3D 11 renderer `Adapter::wgpu` returns a separate DX12 device on the renderer's adapter, for the native `SharedSurface` hand-off. |
 | `gpui` | Enables the viewport input helpers (`surface_input`, `SurfaceInput`, `SurfaceEvent`, `SurfacePoint`) for routing pointer events into an embedded 3D scene or video player. |
 | `example` | Enables the dependencies needed to build and run the Linux window examples on top of `wgpu`. |
+| `bevy-example` | Implies `example` and adds Bevy 0.19 (headless, no `winit`) for `interop_bevy`. Kept separate because a Bevy graph is large and dev-dependencies would be built for every test. |
 | `readback-test` | Enables the headless GPU compositing and pixel read-back integration test. |
+| `wgpu-test` | Enables the headless tests that render through `WgpuSurface` and `WgpuSharedBuffer` and read the pixels back. |
 | `input-test` | Enables headless tests that route pointer events through `surface_input`. |
 | `guest` | Enables `Guest`, the headless worker-thread runner that hands frames to a foreign host loop, with a command channel back. The renderer comes from the caller, so a test build also needs a backend such as `gpui_wgpu`'s `headless` feature. |
 | `guest-test` | Enables the guest runner's GPU integration test. |
@@ -445,12 +618,16 @@ cargo test -p gpui_interop
 
 # Optional integration tests (each opens a window):
 cargo test -p gpui_interop --features readback-test   # composites a buffer in GPUI and reads the pixels back
+cargo test -p gpui_interop --features wgpu-test       # renders a same-device wgpu view and an exported dma-buf, and reads them back
 cargo test -p gpui_interop --features input-test      # routes pointer events through surface_input
 cargo test -p gpui_interop --features guest-test      # a worker thread hands a frame to the host loop
 
-# The GPU-backed suites need a Vulkan adapter. On a machine with more than one GPU, pin the PCI
-# device id with `ZED_DEVICE_ID` (the guest and read-back suites both honour it):
+# The GPU-backed suites need a Vulkan adapter. The guest and read-back suites honour the platform's
+# `ZED_DEVICE_ID` lowering; the wgpu suite names a `GpuPreference` through `GPUI_TEST_DEVICE_ID`
+# instead. Both take a four-digit hexadecimal PCI device id (1916 is the Intel HD 520 here, 1346 the
+# NVIDIA 930M):
 ZED_DEVICE_ID=1916 cargo test -p gpui_interop --features guest-test --test guest_runner -- --test-threads=1
+GPUI_TEST_DEVICE_ID=1346 cargo test -p gpui_interop --features wgpu-test --test wgpu_surface -- --test-threads=1
 
 # Windows integration test: composites a shared D3D12 texture on GPUI's D3D11 renderer.
 cargo test -p gpui_interop a_shared_d3d12_surface
@@ -462,13 +639,15 @@ cargo test -p gpui_interop a_shared_d3d12_surface
 Cargo.toml                        Workspace configuration and bite-gpui dependencies
 crates/gpui_interop/
   src/adapter.rs                  Adapter / Unavailable: matches an external GPU device to GPUI's renderer
+  src/wgpu_dmabuf.rs              WgpuSharedBuffer: an exportable wgpu image exported as a dma-buf (Linux)
+  src/wgpu_surface.rs             WgpuSurface: an sRGB render target on the renderer's own wgpu device
   src/linux.rs                    Linux dma-buf support: SharedBuffer, GpuDevice, GpuId, Tiling, Fence
   src/windows.rs                  Windows D3D12 support: SharedSurface, Fence
   src/macos.rs                    macOS IOSurface stub (not yet implemented)
   src/guest.rs                    Guest: headless GPUI on a worker thread, handing frames to a host loop
   src/input.rs                    Input routing for interactive viewports and surfaces
-  tests/                          Opt-in integration suites: guest_runner, linux_dmabuf_readback, surface_input
-  examples/                       Linux demos: interop_linux, interop_cube, interop_cube_drag
+  tests/                          Opt-in integration suites: guest_runner, linux_dmabuf_readback, surface_input, wgpu_surface
+  examples/                       Linux demos: interop_linux, interop_cube, interop_cube_drag, interop_wgpu, interop_bevy
 ```
 
 ## Status

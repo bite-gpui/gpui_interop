@@ -5,18 +5,26 @@
 //! [`Adapter`] is the producer's view of the window's device; [`Adapter::wgpu`] returns a wgpu device
 //! and queue only when one matches.
 //!
-//! On Windows the window's `ID3D11Device` names its adapter by LUID, and the same LUID identifies the
-//! wgpu DX12 adapter, so a match can be found without the caller handing over its device. The LUID —
-//! not the adapter name — is the identity, because DXGI and wgpu enumerate a *different number* of
-//! `Microsoft Basic Render Driver` entries, so the names collide where the LUIDs do not. When no
-//! adapter matches, [`Adapter::wgpu`] answers `None`; a caller-supplied device is the documented
-//! escape for a driver that hides the LUID, but it is not part of this surface yet.
+//! There are two mechanisms, and the first is not a match at all:
 //!
-//! The *interface* is universal though the *mechanism* is platform-specific: off Windows there is no
-//! LUID to match. macOS's wgpu adapter *is* the `MetalRenderer`'s device, so [`Adapter::wgpu`] has
-//! nothing to add there and answers `None`; on Linux the renderer's device names its `vk::PhysicalDevice`,
-//! and [`Adapter::gpu_device`] — not `wgpu` — is the match, answering `None` when the renderer lends no
-//! device or is not wgpu.
+//! - **The renderer already is wgpu.** A Linux window (and a Windows window whose factory installed
+//!   `WgpuRenderer`) lends `(wgpu::Device, wgpu::Queue)` through `GpuCanvasContext::device`, and that
+//!   *is* the device the producer must render on. [`Adapter::wgpu`] returns it unchanged — same
+//!   logical device, same queue — so a wgpu producer renders exactly where GPUI samples. This is the
+//!   same-device path, and [`WgpuSurface`](crate::WgpuSurface) is the surface it renders into.
+//! - **The renderer is Direct3D 11.** On Windows the window's `ID3D11Device` names its adapter by
+//!   LUID, and the same LUID identifies the wgpu DX12 adapter, so a match can be found without the
+//!   caller handing over its device. The LUID — not the adapter name — is the identity, because DXGI
+//!   and wgpu enumerate a *different number* of `Microsoft Basic Render Driver` entries, so the names
+//!   collide where the LUIDs do not. [`Adapter::wgpu`] then requests a **separate** DX12 device on
+//!   that adapter; the frame leaves through the Direct3D transport ([`SharedSurface`](crate::SharedSurface)),
+//!   not as a bare wgpu texture.
+//!
+//! When neither applies [`Adapter::wgpu`] answers `None`. macOS has no wgpu renderer to lend, and its
+//! renderer is Metal, which [`Adapter::wgpu`] does not match. On Linux the renderer also names its
+//! `vk::PhysicalDevice`, and [`Adapter::gpu_device`] is the separate door a **Vulkan** exporter uses
+//! — a second dma-buf-capable logical device on that GPU. A wgpu producer does not want it: it wants
+//! [`Adapter::wgpu`], which is the renderer's own device.
 
 use std::any::Any;
 use std::rc::Rc;
@@ -48,21 +56,35 @@ impl<'a> Adapter<'a> {
         Self { device }
     }
 
-    /// A wgpu device and queue the producer can render on, if one matches the window's.
+    /// A wgpu device and queue the producer can render on: the window renderer's own when it is
+    /// wgpu, or a matching one it made on the renderer's adapter.
     ///
-    /// On Windows this reads the window renderer's Direct3D 11 adapter LUID and finds the wgpu DX12
-    /// adapter carrying the same LUID, then requests a device and queue on it; `None` when
-    /// no adapter matches or the renderer lends no Direct3D device. A window whose renderer *is*
-    /// wgpu reaches its device and queue without this crate.
+    /// - When the window renderer *is* wgpu — the Linux default, or a Windows window whose factory
+    ///   installed `WgpuRenderer` — this is exactly the renderer's device and queue, cloned, not a
+    ///   second device. Render into a [`WgpuSurface`](crate::WgpuSurface) there and the canvas
+    ///   composites it with `GpuCanvasContext::paint_texture`: same device, no copy, no export.
+    /// - On Windows with the Direct3D 11 renderer, this reads the device's adapter LUID and requests
+    ///   a separate DX12 device and queue on that adapter; the hand-off is then the Direct3D one
+    ///   ([`SharedSurface`](crate::SharedSurface)), not a bare wgpu texture.
+    /// - `None` when the renderer is neither wgpu nor Direct3D 11, or no adapter matches.
     #[cfg(feature = "wgpu")]
     pub fn wgpu(&self) -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+        // The renderer that is itself wgpu lends the one device a same-device producer may use. No
+        // match is needed -- the Windows LUID path below would make a *second* DX12 device, which a
+        // sampled texture cannot cross back from.
+        if let Some((device, queue)) = self
+            .device
+            .downcast_ref::<(Arc<wgpu::Device>, Arc<wgpu::Queue>)>()
+        {
+            return Some((Arc::clone(device), Arc::clone(queue)));
+        }
+
         #[cfg(target_os = "windows")]
         {
             matched::wgpu_device(self.device)
         }
         #[cfg(not(target_os = "windows"))]
         {
-            // Nothing to match off Windows: each platform's module owns its own device story.
             None
         }
     }

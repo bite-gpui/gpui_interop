@@ -2,10 +2,12 @@
 //!
 //! A producer whose graphics device is **not** the window renderer's — another API, another adapter,
 //! another process — renders a frame and hands it to the scene through the `surface()` element,
-//! without a CPU copy of the pixels. When the producer can render directly on the window's own
-//! device, go through GPUI's built-in same-device path instead. Reach for this crate when the pixels
-//! come from somewhere the window renderer cannot draw itself, and must still land in the scene
-//! without a round trip through the CPU.
+//! without a CPU copy of the pixels.
+//!
+//! The crate also covers the case where the window renderer *is* wgpu: [`Adapter::wgpu`] hands the
+//! producer that renderer's own device and queue, and [`WgpuSurface`] is a render target the same
+//! device composites with `paint_texture`. That is the no-export, no-fence path a wgpu viewport
+//! wants. Either way, the pixels land in the scene without a round trip through the CPU.
 //!
 //! # The shape of the bridge
 //!
@@ -16,23 +18,31 @@
 //! From there:
 //!
 //! - [`Interop::adapter`] returns an [`Adapter`], the producer's view of the window's device.
-//! - With the `wgpu` feature, `Adapter::wgpu` returns a wgpu `Device` and `Queue` on the adapter that
-//!   matches the window's device (a LUID match on Windows), or `None` when none does. It is the
-//!   adapter match, not a wgpu transport: the frame still leaves through the platform's native
-//!   surface type, so a wgpu producer that can render on the window's own device should use GPUI's
-//!   imported-texture path instead. On Linux the match is [`Adapter::gpu_device`], which makes a
-//!   second logical device on the renderer's own `vk::PhysicalDevice`.
+//! - With the `wgpu` feature, `Adapter::wgpu` returns a wgpu `Device` and `Queue` the producer can
+//!   render on. When the window renderer *is* wgpu — the Linux default, or a Windows window whose
+//!   factory installed `WgpuRenderer` — it is the renderer's own device and queue, cloned: a
+//!   [`WgpuSurface`] rendered there is composited by the same device with
+//!   `GpuCanvasContext::paint_texture`, which is the no-copy path a wgpu viewport wants. On Windows
+//!   with the Direct3D 11 renderer it matches the adapter by LUID and makes a separate DX12 device,
+//!   and the frame then leaves through the native [`SharedSurface`] transport.
+//! - On Linux, `WgpuSharedBuffer` is the wgpu producer's **native** arm: it allocates an exportable
+//!   image on the wgpu device's own `VkDevice`, wraps it back into wgpu so the producer renders with
+//!   the ordinary API, and exports the frame as a dma-buf with its modifier, plane layout and a
+//!   `sync_file` fence. `GpuCanvasContext::paint_surface` imports that handle exactly as it does a
+//!   decoder's, which is the shape a renderer of another backend consumes.
+//! - On Linux, [`SharedBuffer`] is the producer half of the dma-buf transport for a producer that
+//!   owns its device: a Vulkan pipeline renders into a shareable image and exports it as a dma-buf,
+//!   and GPUI imports it under its modifier. Single- or two-plane, linear or on a driver-tiled
+//!   modifier the renderer can import, and ordered by a [`Fence`] that exports the acquire
+//!   `sync_file`. It covers both sharing contracts: [`SharedBuffer::new`] lets the driver choose the
+//!   image's layout and reports it back, while [`SharedBuffer::export_at`] pushes bytes at a plane
+//!   layout the producer declares — the shape a decoder or capture pipeline whose layout comes from
+//!   elsewhere needs. A wgpu producer does **not** use it: it renders into a `WgpuSharedBuffer` (or,
+//!   same-device, a `WgpuSurface`).
 //! - On Windows, [`SharedSurface`] / [`Fence`] are the producer half of the Direct3D transport: a
 //!   Direct3D 12 producer renders into a shared texture and signals a fence, and hands GPUI the
 //!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
 //!   the shared fence ordering the two queues.
-//! - On Linux, [`SharedBuffer`] is the producer half of the dma-buf transport: a producer renders into
-//!   a shareable image and exports it as a dma-buf, and hands GPUI the `gpui::DmaBufHandle` the
-//!   renderer imports under its modifier. Single- or two-plane, linear or on a driver-tiled modifier
-//!   the renderer can import, and ordered by a [`Fence`] that exports the acquire `sync_file`. It
-//!   covers both sharing contracts: [`SharedBuffer::new`] lets the driver choose the image's layout and
-//!   reports it back, while [`SharedBuffer::export_at`] pushes bytes at a plane layout the producer
-//!   declares — the shape a decoder or capture pipeline whose layout comes from elsewhere needs.
 //!
 //! # The other direction
 //!
@@ -44,23 +54,30 @@
 //! # Sketch
 //!
 //! ```rust
-//! use gpui_interop::{attach, Unavailable};
+//! use gpui_interop::{attach, Unavailable, WgpuSurface};
 //!
 //! fn bridge(gpu: &mut gpui::GpuCanvasContext) -> Result<(), Unavailable> {
-//!     // Negotiate with the window's renderer, inside the canvas that lends its device.
-//!     let interop = attach(gpu.try_device::<gpui::DirectXRenderer>())?;
+//!     // The window renderer, where it is wgpu (the Linux default).
+//!     let interop = attach(gpu.try_device::<gpui_wgpu::WgpuRenderer>())?;
 //!
-//!     // With the `wgpu` feature, this gives a device and queue on a matching adapter (Windows).
-//!     let (device, queue) = interop.adapter().wgpu().expect("no matching adapter");
+//!     // With the `wgpu` feature: the renderer's own device and queue, cloned.
+//!     let (device, queue) = interop.adapter().wgpu().expect("the renderer's own device");
 //!
-//!     // The hand-off is native: a `SharedSurface` on Windows, a `SharedBuffer` on Linux.
+//!     // A surface the ordinary `wgpu` API renders into; `paint_texture` accepts its view on the
+//!     // same device.
+//!     let surface = WgpuSurface::new(&device, 640, 480).expect("a render target");
+//!     let _ = (queue, surface);
 //!     Ok(())
 //! }
 //! ```
 //!
-//! The `wgpu` line requires the `wgpu` feature; without it, `Adapter::wgpu` is not compiled in. The
-//! Linux `SharedBuffer`/`Fence` transport and the Windows handles remain available without it, because
-//! neither is a `wgpu` client.
+//! The `wgpu` line requires the `wgpu` feature; without it, `Adapter::wgpu` and [`WgpuSurface`] are
+//! not compiled in. The Linux `SharedBuffer`/`Fence` transport and the Windows handles remain
+//! available without it, because neither is a `wgpu` client.
+//!
+//! On Windows, the same snippet is the path when the window's factory installed `WgpuRenderer`.
+//! Under the default Direct3D 11 renderer `Adapter::wgpu` makes a separate DX12 device, and the
+//! hand-off is [`SharedSurface`] instead — see the module documentation of `windows`.
 //!
 //! # Provisional
 //!
@@ -76,6 +93,10 @@ mod input;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+mod wgpu_dmabuf;
+#[cfg(feature = "wgpu")]
+mod wgpu_surface;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -87,7 +108,13 @@ pub use input::{
     SurfaceButton, SurfaceEvent, SurfaceInput, SurfaceModifiers, SurfacePoint, surface_input,
 };
 #[cfg(target_os = "linux")]
-pub use linux::{Fence, GpuDevice, GpuId, LinearLayout, PlaneLayout, SharedBuffer, Tiling, gpu_id, remember};
+pub use linux::{
+    Fence, GpuDevice, GpuId, LinearLayout, PlaneLayout, SharedBuffer, Tiling, gpu_id, remember,
+};
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+pub use wgpu_dmabuf::WgpuSharedBuffer;
+#[cfg(feature = "wgpu")]
+pub use wgpu_surface::WgpuSurface;
 #[cfg(target_os = "windows")]
 pub use windows::{Fence, SharedSurface};
 

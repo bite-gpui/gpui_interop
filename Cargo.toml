@@ -20,6 +20,59 @@ todo = "deny"
 declare_interior_mutable_const = "deny"
 redundant_clone = "deny"
 
+# `gpui-interop` builds the core from a path in a *separate* workspace, so it does not inherit
+# `bite-gpui`'s `[profile.dev.package]` tuning. A debug build would then run the layout engine and
+# the text shaper at opt-level 0: `interop_wgpu` measured 33–47 ms per frame in `layout` alone,
+# which looks like a renderer problem but is a build-profile one. Core already optimises `taffy`;
+# the shaping crates are just as hot because each metric string is shaped as it changes.
+[profile.dev.package]
+taffy = { opt-level = 3 }
+cosmic-text = { opt-level = 3 }
+swash = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+fontdb = { opt-level = 3 }
+skrifa = { opt-level = 3 }
+# The Bevy example vendors a whole engine next to the core; at opt-level 0 its ECS, render graph and
+# PBR pipeline dominate the frame, which would make the GPU comparison meaningless. These are the
+# crates on the producer's hot path. `wgpu` is shared with the core, so tuning it helps every
+# example, not just this one.
+bevy_app = { opt-level = 3 }
+bevy_asset = { opt-level = 3 }
+bevy_a11y = { opt-level = 3 }
+bevy_camera = { opt-level = 3 }
+bevy_color = { opt-level = 3 }
+bevy_core_pipeline = { opt-level = 3 }
+bevy_diagnostic = { opt-level = 3 }
+bevy_ecs = { opt-level = 3 }
+bevy_gltf = { opt-level = 3 }
+bevy_image = { opt-level = 3 }
+bevy_input = { opt-level = 3 }
+bevy_internal = { opt-level = 3 }
+bevy_light = { opt-level = 3 }
+bevy_material = { opt-level = 3 }
+bevy_math = { opt-level = 3 }
+bevy_mesh = { opt-level = 3 }
+bevy_pbr = { opt-level = 3 }
+bevy_platform = { opt-level = 3 }
+bevy_ptr = { opt-level = 3 }
+bevy_reflect = { opt-level = 3 }
+bevy_render = { opt-level = 3 }
+bevy_shader = { opt-level = 3 }
+bevy_tasks = { opt-level = 3 }
+bevy_time = { opt-level = 3 }
+bevy_transform = { opt-level = 3 }
+bevy_utils = { opt-level = 3 }
+bevy_window = { opt-level = 3 }
+bevy_world_serialization = { opt-level = 3 }
+bevy = { opt-level = 3 }
+wgpu = { opt-level = 3 }
+wgpu-core = { opt-level = 3 }
+wgpu-hal = { opt-level = 3 }
+naga = { opt-level = 3 }
+naga_oil = { opt-level = 3 }
+glam = { opt-level = 3 }
+encase = { opt-level = 3 }
+
 [workspace.dependencies]
 # This repo's own crate: a path for development, a version for release.
 gpui_interop = { version = "0.1.0", path = "crates/gpui_interop" }
