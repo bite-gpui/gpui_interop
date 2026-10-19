@@ -233,40 +233,37 @@ validation, the render world quits, and the image stays all zeros. `gpui_wgpu` n
 limits to the adapter's reported values on native (GL keeps the downlevel set) and enables the
 format feature where available.
 
-Measured on an Intel HD 520 + NVIDIA 930M laptop, 960 × 600, the 7 × 7 Ember field, with the
-Bevy and wgpu crates at `opt-level = 3` (`[profile.dev.package]`), sequentially rather than
-concurrently:
+Measured on an Intel HD 520 + NVIDIA 930M laptop, 960 × 600, the 7 × 7 Ember field, **release**,
+sequentially rather than concurrently:
 
 | Path | Intel HD 520 | NVIDIA 930M |
 | --- | --- | --- |
-| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 522.7 fps · 1.9 ms/frame | 1497.3 fps · 0.7 ms/frame |
-| `interop_bevy --bench 5` (Bevy only, GPU waited) | 121.5 fps · 8.2 ms/frame | 176.1 fps · 5.7 ms/frame |
-| `interop_bevy --scene clear --bench 5` (engine only) | — | 195.9 fps · 5.1 ms/frame |
-| Windowed `--stats` (image, presented) | ~45 fps | ~45 fps |
-| Windowed `--transfer --stats` (dma-buf, presented) | ~43 fps | ~46 fps |
+| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 924.5 fps · 1.08 ms/frame | 3241.4 fps · 0.31 ms/frame |
+| `interop_bevy --bench 5` (Bevy only, GPU waited) | 156.5 fps · 6.39 ms/frame | 249.4 fps · 4.01 ms/frame |
+| `interop_bevy --scene one --bench 5` | 160.1 fps · 6.25 ms/frame | 264.6 fps · 3.78 ms/frame |
+| `interop_bevy --scene clear --bench 5` (engine only) | 171.1 fps · 5.84 ms/frame | 280.8 fps · 3.56 ms/frame |
+| Windowed `--stats` (image, presented) | ~58–60 fps | ~60 fps |
+| Windowed `--transfer --stats` (dma-buf, presented) | ~57–59 fps | ~60 fps |
 
-Bevy's PBR producer is 4–9× slower than the hand-written instanced pipeline, but both are far
-above the presented rate: the whole GPUI paint phase is ~5–7 ms while the frame interval is
-17–41 ms. The window is limited by presentation and the debug-build frame source, not by the
-producer.
+Release confirms the attribution the debug run suggested. Bevy's *engine loop* costs ~5.8 ms on
+the Intel adapter and ~3.6 ms on the NVIDIA one even with an empty scene. The 49-cube PBR field
+adds ~0.55 ms and ~0.45 ms. The 3241 → 249 fps gap is therefore ECS/extract/prepare/render-graph
+overhead, not the scene, PBR, or transport. The hand-written instanced pipeline is still
+5.9–13× faster as a producer, so Bevy has a real per-frame floor; it is simply far below the
+display budget.
 
-The scene is not the reason for Bevy's producer gap. `--scene clear` runs the same app with the
-camera and the clear pass but no meshes; after the lean-plugin change it measured 196 fps, one
-cube 179 fps, and the full field 176 fps on the NVIDIA adapter. Bevy's *engine loop* costs
-~5.1 ms even with nothing to draw; the 49-cube PBR field adds only ~0.6 ms. The 1497 → 176 fps
-drop from the hand-written wgpu loop is ECS/extract/prepare/render-graph overhead, not the scene.
-`--transfer` measured the dma-buf export at ~0.2–0.4 ms/frame and the `paint_surface` import at
-~0.03 ms, so transport is not the explanation either.
-
-In the windowed runs the Bevy step was ~2.0–4.0 ms, `paint_texture`/`paint_surface` ~0.03–0.09 ms
-and layout ~1.3–3.0 ms. The draw/present split shows why the interval is ~32 ms on a window that
-is not focused: the pipeline's `draw` is ~9 ms, the platform's `present wait` is the rest, and the
-`window active` row reads `no` until it is focused. GPUI caps an inactive window at 33.3 ms. The
-`gpui` and `bevy` tick counters are printed together and stay equal, so Bevy runs exactly once per
-GPUI paint; it has no pacing of its own. Removing `.cached()` from the header and sidebar raised
-layout to 9–11 ms and cost ~6 fps on the Intel adapter. The headless rows are engine ceilings, not
-the display path. `--transfer` adds ~0.2–0.4 ms for the export and ~0.03 ms for the import, and
-presents at the same rate as the image path.
+In the windowed release runs the Bevy step was ~1.2–3.5 ms, `paint_texture`/`paint_surface`
+~0.01–0.05 ms, layout ~0.1–1.3 ms, and the whole `draw` 2–5 ms. The interval settles at
+15–20 ms — the display's 60 Hz cadence, with `present wait` taking the rest. The `gpui` and
+`bevy` tick counters are printed together and stay equal, so Bevy runs exactly once per GPUI
+paint; it has no pacing of its own. A window that is *not* focused reads `active false` and a
+~33 ms interval, because GPUI caps an inactive window at 33.3 ms; focus it before judging rate.
+Removing `.cached()` from the header and sidebar raised layout to 9–11 ms and cost ~6 fps on the
+Intel adapter. The headless rows are engine ceilings, not the display path. `--transfer` adds
+~0.14–0.8 ms for the export and ~0.02 ms for the import, and presents at the same rate as the
+image path. The debug profile (Bevy and wgpu crates at `opt-level = 3`, the rest at 0) measured
+522.7 / 1497.3 fps for `interop_wgpu` and 121.5 / 176.1 fps for Bevy, with the windowed draw over
+budget at ~45 fps; the conclusions are the same, only the absolute numbers move.
 
 `interop_bevy` renders at the canvas's current **physical** size: the viewport is `flex_1`, and the
 paint callback resizes the target when its bounds or the window scale factor changes. In the

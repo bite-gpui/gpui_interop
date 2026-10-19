@@ -47,8 +47,13 @@
 //! `--transfer` is the dma-buf shape: Bevy renders into a `WgpuSharedBuffer` through a manual
 //! texture view, the buffer's `sync_file` is exported after each update, and `paint_surface`
 //! imports it. The default (no flag) is the same-device shape, where GPUI samples the image's
-//! `TextureView` with `paint_texture`. The transfer export costs ~0.2–0.4 ms/frame here, so it is
-//! not what separates a hand-written wgpu pipeline from Bevy.
+//! `TextureView` with `paint_texture`. The transfer export costs ~0.14–0.8 ms/frame here and the
+//! import ~0.02 ms, so transport is not what separates a hand-written wgpu pipeline from Bevy.
+//!
+//! In release on the test laptop the engine floor is ~5.8 ms/frame on the Intel HD 520 and
+//! ~3.6 ms on the NVIDIA 930M; the 49-cube field adds only ~0.5 ms. The same field as a
+//! hand-written wgpu producer costs 1.08 ms and 0.31 ms, which is where the producer gap lives.
+//! Both paths present at the display's 60 Hz in a window.
 //!
 //! # Sizing
 //!
