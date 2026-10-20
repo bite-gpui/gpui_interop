@@ -45,6 +45,11 @@
 //! of two images recycles a slot only after the renderer signals the `eventfd`
 //! it was handed, so drawing frame N+1 never races GPUI sampling frame N.
 //!
+//! The renderer polls that fence for only 16 ms and drops the surface if it has
+//! not signalled, so the producer waits for it here before the hand-off — the
+//! CPU read-back's wait without the copy. A Helio frame slower than 16 ms then
+//! presents as a frame, not as black.
+//!
 //! # Scene
 //!
 //! The scene is the standalone demo's: a sky, a reflective floor, four
@@ -116,6 +121,13 @@ mod demo {
     const SLOTS: usize = 2;
     /// How long a handed-out slot waits for the renderer's release before it is reclaimed.
     const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
+    /// How long the producer waits for its own acquire fence before handing a frame over.
+    ///
+    /// The renderer polls the fence for only 16 ms (`ACQUIRE_FENCE_TIMEOUT` in `gpui_wgpu`) and
+    /// drops the surface for that frame otherwise. A Helio frame is regularly slower than that, so
+    /// the hand-off would lose almost every frame; waiting here — the CPU read-back's wait without
+    /// the copy — is what keeps the viewport stable.
+    const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Orbit/zoom, the same feel as the other two demos.
     const SENSITIVITY: f32 = 0.007;
@@ -225,6 +237,7 @@ mod demo {
         fps: f32,
         render_ms: f32,
         export_ms: f32,
+        fence_ms: f32,
         width: u32,
         height: u32,
         adapter: String,
@@ -233,10 +246,18 @@ mod demo {
     }
 
     impl Metrics {
-        fn record(&mut self, render: Duration, export: Duration, width: u32, height: u32) {
+        fn record(
+            &mut self,
+            render: Duration,
+            export: Duration,
+            fence: Duration,
+            width: u32,
+            height: u32,
+        ) {
             self.frames += 1;
             self.render_ms = render.as_secs_f32() * 1000.0;
             self.export_ms = export.as_secs_f32() * 1000.0;
+            self.fence_ms = fence.as_secs_f32() * 1000.0;
             self.width = width;
             self.height = height;
 
@@ -439,7 +460,10 @@ mod demo {
 
         /// Render one frame into a free slot and export it, or `None` when every slot is still in
         /// flight — a dropped frame rather than a write into a buffer the compositor is sampling.
-        fn render(&mut self, camera: &Camera) -> anyhow::Result<Option<(Duration, Duration)>> {
+        fn render(
+            &mut self,
+            camera: &Camera,
+        ) -> anyhow::Result<Option<(Duration, Duration, Duration)>> {
             let Some(index) = (0..self.slots.len()).find(|&index| self.slots[index].released())
             else {
                 self.dropped += 1;
@@ -458,6 +482,25 @@ mod demo {
 
             let export_start = Instant::now();
             let mut handle = self.slots[index].target.submit(&self.queue)?;
+            let export = export_start.elapsed();
+
+            // The renderer polls this fence for at most 16 ms and drops the surface if it has not
+            // signalled. Helio's graph is slower than that, so complete the frame here before the
+            // hand-off: the read-back path's wait, without the copy.
+            let fence_start = Instant::now();
+            let ready = handle
+                .acquire_fence
+                .as_ref()
+                .is_none_or(|fence| wait_for_fence(fence, HANDOFF_TIMEOUT));
+            let fence = fence_start.elapsed();
+            if !ready {
+                anyhow::bail!(
+                    "the frame's acquire fence did not signal within {HANDOFF_TIMEOUT:?}"
+                );
+            }
+            // The GPU has finished; the renderer need not wait on the fence again.
+            handle.acquire_fence = None;
+
             let release = release_descriptor()?;
             handle.release = Some(Arc::clone(&release));
             let slot = &mut self.slots[index];
@@ -465,9 +508,8 @@ mod demo {
             slot.handed_at = Some(Instant::now());
             self.presented = Some(handle);
             self.frames += 1;
-            let export = export_start.elapsed();
 
-            Ok(Some((render, export)))
+            Ok(Some((render, export, fence)))
         }
 
         /// Composite the last exported frame into the canvas. Cheap: GPUI imports the dma-buf on
@@ -888,13 +930,32 @@ mod demo {
 
     /// Whether the renderer has signalled `release` — a non-blocking `poll`.
     fn release_signalled(release: &OwnedFd) -> bool {
+        wait_for_fence(release, Duration::ZERO)
+    }
+
+    /// Wait, up to `timeout`, for a `sync_file` (or `eventfd`) to become readable; `true` if it
+    /// signalled in time. A `sync_file` becomes readable when its fence signals.
+    fn wait_for_fence(fence: &OwnedFd, timeout: Duration) -> bool {
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut descriptor = libc::pollfd {
-            fd: release.as_raw_fd(),
+            fd: fence.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        (unsafe { libc::poll(&mut descriptor, 1, 0) }) > 0
+        loop {
+            match unsafe { libc::poll(&mut descriptor, 1, timeout_ms) } {
+                ready if ready > 0 => return true,
+                0 => return false,
+                _ => {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
     }
+
     fn readback_buffer(device: &wgpu30::Device, width: u32, height: u32) -> wgpu30::Buffer {
         let padded = padded_bytes_per_row(width);
         device.create_buffer(&wgpu30::BufferDescriptor {
@@ -1406,8 +1467,8 @@ mod demo {
                     .child(format!("{:.1} FPS", metrics.fps)),
             )
             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                "{:.2} ms · Helio {:.2} · export {:.2}",
-                metrics.interval_ms, metrics.render_ms, metrics.export_ms
+                "{:.2} ms · Helio {:.2} · fence {:.2}",
+                metrics.interval_ms, metrics.render_ms, metrics.fence_ms
             )))
             .child(div().h(px(4.)).flex_none())
             .child(section_label("Frame"))
@@ -1420,6 +1481,10 @@ mod demo {
                 format!("{:.2} ms", metrics.render_ms),
             ))
             .child(metric_row("export", format!("{:.2} ms", metrics.export_ms)))
+            .child(metric_row(
+                "fence wait",
+                format!("{:.2} ms", metrics.fence_ms),
+            ))
             .child(div().h(px(4.)).flex_none())
             .child(section_label("Producer"))
             .child(metric_row(
@@ -1491,10 +1556,14 @@ mod demo {
                     distance_for_camera.get(),
                 );
                 match scene.render(&camera) {
-                    Ok(Some((render, export))) => {
-                        metrics
-                            .borrow_mut()
-                            .record(render, export, scene.width, scene.height);
+                    Ok(Some((render, export, fence))) => {
+                        metrics.borrow_mut().record(
+                            render,
+                            export,
+                            fence,
+                            scene.width,
+                            scene.height,
+                        );
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -1514,13 +1583,14 @@ mod demo {
                     let metrics = metrics.borrow();
                     eprintln!(
                         "interop_helio: window {} frames ({} dropped) — {:.1} fps, {:.2} ms \
-                         interval, helio {:.2} ms, export {:.2} ms, {}x{}",
+                         interval, helio {:.2} ms, export {:.2} ms, fence {:.2} ms, {}x{}",
                         metrics.frames,
                         scene.dropped,
                         metrics.fps,
                         metrics.interval_ms,
                         metrics.render_ms,
                         metrics.export_ms,
+                        metrics.fence_ms,
                         scene.width,
                         scene.height,
                     );
