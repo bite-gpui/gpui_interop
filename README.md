@@ -240,15 +240,19 @@ HAL rather than `request_device`, so `VK_KHR_external_semaphore_fd` is added bef
 `vkCreateDevice`; the renderer's own device already enables it together with
 `VK_EXT_image_drm_format_modifier`. And because Helio submits the frame internally (a clear, then
 the 39-pass graph), the acquire semaphore rides an empty submission after `render()` returns, which
-is ordered after every submission Helio made. On an Intel HD 520 at 677 × 686, a release build
-measures about 21 fps with 13–14 ms in Helio, 0.05–0.09 ms for the export, and 25–28 ms waiting for
-the acquire fence; the frame interval is ~45 ms.
+is ordered after every submission Helio made.
+
+On an Intel HD 520 at 677 × 686, a release build spends 13–24 ms in Helio's CPU recording, 0.05–0.12
+ms exporting the fence, 25–50 ms waiting for the GPU to finish the graph, and 6–14 ms in GPUI's own
+layout/paint/pacing. The frame interval is their sum (45–80 ms under load). The Helio figure is CPU
+time: `Renderer::render` records and submits the graph and returns, so the fence wait is the GPU half
+of the same frame, not duplicate work. The number varies with GPU load and thermals.
 
 The renderer polls a dma-buf's acquire fence for only 16 ms and drops the surface if it has not
 signalled, so the example waits for the fence itself before the hand-off. The wait is the read-back
-path's wait without the copy. It is reported separately because it is the GPU's tail, not a second
-render: on this hardware Helio records for ~14 ms and the GPU finishes ~26 ms later, so the wait is
-longer than the renderer's 16 ms budget and a hand-off without it loses almost every frame. The window is still a normal
+path's wait without the copy, and it is reported separately. A hand-off without it loses almost every
+frame, because the GPU tail here is longer than the renderer's budget. The metrics panel shows the
+same breakdown as `Helio`, `export`, `fence wait` and `GPUI + pacing`. The window is still a normal
 GPUI window — Wayland in a Wayland session, X11 in an X11 one; Helio is offscreen and ignores the
 session type.
 

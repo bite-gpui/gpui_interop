@@ -238,6 +238,9 @@ mod demo {
         render_ms: f32,
         export_ms: f32,
         fence_ms: f32,
+        /// The part of the interval outside the producer: GPUI's own layout, text, compositing and
+        /// the wait for the next animation frame.
+        gpui_ms: f32,
         width: u32,
         height: u32,
         adapter: String,
@@ -270,6 +273,8 @@ mod demo {
                 }
             }
             self.interval_ms = self.intervals.back().copied().unwrap_or(0.0);
+            self.gpui_ms =
+                (self.interval_ms - self.render_ms - self.export_ms - self.fence_ms).max(0.0);
             self.fps = if self.intervals.is_empty() {
                 0.0
             } else {
@@ -1485,6 +1490,10 @@ mod demo {
                 "fence wait",
                 format!("{:.2} ms", metrics.fence_ms),
             ))
+            .child(metric_row(
+                "GPUI + pacing",
+                format!("{:.2} ms", metrics.gpui_ms),
+            ))
             .child(div().h(px(4.)).flex_none())
             .child(section_label("Producer"))
             .child(metric_row(
@@ -1583,7 +1592,8 @@ mod demo {
                     let metrics = metrics.borrow();
                     eprintln!(
                         "interop_helio: window {} frames ({} dropped) — {:.1} fps, {:.2} ms \
-                         interval, helio {:.2} ms, export {:.2} ms, fence {:.2} ms, {}x{}",
+                         interval, helio {:.2} ms, export {:.2} ms, fence {:.2} ms, gpui {:.2} \
+                         ms, {}x{}",
                         metrics.frames,
                         scene.dropped,
                         metrics.fps,
@@ -1591,6 +1601,7 @@ mod demo {
                         metrics.render_ms,
                         metrics.export_ms,
                         metrics.fence_ms,
+                        metrics.gpui_ms,
                         scene.width,
                         scene.height,
                     );
