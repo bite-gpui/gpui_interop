@@ -6,7 +6,7 @@
 //!    grid floor. It is a full-screen triangle whose fragment shader rebuilds
 //!    the view ray from the camera uniform and intersects it with the floor
 //!    plane; there is no grid texture.
-//! 2. [`CadPass`] draws one rounded, gold, metallic cube with Cook-Torrance
+//! 2. [`CadPass`] draws one chamfered, gold, metallic cube with Cook-Torrance
 //!    direct lighting and a small analytic studio environment for reflections.
 //!
 //! There is no shadow, GI, ambient-occlusion, SSR, atmosphere or post-process
@@ -14,7 +14,9 @@
 //! (generated once on the CPU at construction), the vertex/index buffers, the
 //! light/material block and both pipelines are all created once. Helio already
 //! writes the camera uniform each frame, so nothing in this module touches a
-//! buffer after the first frame.
+//! buffer after the first frame. Both passes draw into one shared 4x
+//! multisampled colour target, which the cube pass resolves into the exported
+//! image, so the antialiasing costs one resolve and no separate AA pass.
 
 use std::sync::Arc;
 
@@ -24,11 +26,10 @@ use helio_core::{
 };
 use wgpu30::util::DeviceExt;
 
-/// The cube: half-extent (so the edge is `2 * HALF`), bevel radius and the
-/// number of quads per cube edge before the edge-dense warp.
+/// The cube: half-extent (so the edge is `2 * CUBE_HALF`) and the width of
+/// the 45-degree chamfer cut along every edge.
 const CUBE_HALF: f32 = 1.1;
-const CUBE_RADIUS: f32 = 0.16;
-const CUBE_DIVISIONS: u32 = 48;
+const CUBE_CHAMFER: f32 = 0.12;
 
 /// Vertex layout: position(12) | normal(12).
 #[repr(C)]
@@ -76,28 +77,93 @@ impl CadParams {
 
 // ── Mesh ─────────────────────────────────────────────────────────────────────
 
-/// `[-1, 1] -> [-1, 1]`, dense near the ends.
-///
-/// A uniform grid spends most of its quads on the flat faces and only a couple
-/// on a bevel 7% of the face wide. Warping the parameter concentrates samples
-/// exactly where the curvature is, so a 48-quad edge resolves the bevel with
-/// roughly a dozen quads and leaves the flat centre coarse.
-fn warp(t: f32) -> f32 {
-    t.signum() * (1.0 - (1.0 - t.abs()).powi(3))
+type Point = [f32; 3];
+
+fn vec3_sub(a: Point, b: Point) -> Point {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// A rounded box: the Minkowski sum of a box of half-extent `half - radius`
-/// and a sphere of `radius`.
+fn vec3_dot(a: Point, b: Point) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn vec3_cross(a: Point, b: Point) -> Point {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn vec3_normalize(v: Point) -> Point {
+    let length = vec3_dot(v, v).sqrt().max(1e-6);
+    [v[0] / length, v[1] / length, v[2] / length]
+}
+
+/// Appends a triangle, flipping its winding if it would face away from `normal`.
+fn push_triangle(
+    vertices: &mut Vec<CadVertex>,
+    indices: &mut Vec<u32>,
+    mut corners: [Point; 3],
+    normal: Point,
+) {
+    let facing = vec3_dot(
+        vec3_cross(
+            vec3_sub(corners[1], corners[0]),
+            vec3_sub(corners[2], corners[0]),
+        ),
+        normal,
+    );
+    if facing < 0.0 {
+        corners.swap(1, 2);
+    }
+    let base = vertices.len() as u32;
+    for position in corners {
+        vertices.push(CadVertex { position, normal });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+/// Appends a quad, flipping its winding if it would face away from `normal`.
+fn push_quad(
+    vertices: &mut Vec<CadVertex>,
+    indices: &mut Vec<u32>,
+    mut corners: [Point; 4],
+    normal: Point,
+) {
+    let facing = vec3_dot(
+        vec3_cross(
+            vec3_sub(corners[1], corners[0]),
+            vec3_sub(corners[2], corners[0]),
+        ),
+        normal,
+    );
+    if facing < 0.0 {
+        corners.reverse();
+    }
+    let base = vertices.len() as u32;
+    for position in corners {
+        vertices.push(CadVertex { position, normal });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// A chamfered box: each of the twelve edges is replaced by a flat 45-degree
+/// strip, and each of the eight corners by a triangle.
 ///
-/// Each of the six outer faces is sampled on a warped grid; a sample `p` is
-/// snapped to the inner box (`q`) and pushed back out by `radius` along
-/// `p - q`. That offset is exactly the rounded box's surface normal, so the
-/// bevel and corner normals are smooth without a normal-smoothing pass.
-fn rounded_cube(half: f32, radius: f32, divisions: u32) -> (Vec<CadVertex>, Vec<u32>) {
-    let inner = half - radius;
-    // (outward normal, u axis, v axis) with u × v = normal, so every face is
-    // wound counter-clockwise seen from outside.
-    let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+/// The original cube's six faces shrink to half-extent `half - chamfer`; the
+/// strips lie on planes like `x + y = 2 * half - chamfer` and the corner
+/// triangles on `x + y + z = 3 * half - 2 * chamfer`. Every facet gets its own
+/// flat normal, which is what makes the bevels read as crisp cuts rather than
+/// a rounded-over edge. 96 vertices, 132 indices, generated once.
+fn chamfered_cube(half: f32, chamfer: f32) -> (Vec<CadVertex>, Vec<u32>) {
+    let face_half = half - chamfer;
+    let mut vertices = Vec::with_capacity(96);
+    let mut indices = Vec::with_capacity(132);
+
+    // Six flat faces. `u x v = normal`, so the table's order is already
+    // counter-clockwise; `push_quad` checks instead of trusting that.
+    let faces: [(Point, Point, Point); 6] = [
         ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
         ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
         ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
@@ -105,51 +171,85 @@ fn rounded_cube(half: f32, radius: f32, divisions: u32) -> (Vec<CadVertex>, Vec<
         ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
         ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
     ];
-
-    let stride = divisions + 1;
-    let mut vertices = Vec::with_capacity((6 * stride * stride) as usize);
-    let mut indices = Vec::with_capacity((6 * divisions * divisions * 6) as usize);
-
     for (normal, u_axis, v_axis) in faces {
-        let base = vertices.len() as u32;
-        for j in 0..=divisions {
-            let v = warp(-1.0 + 2.0 * j as f32 / divisions as f32) * half;
-            for i in 0..=divisions {
-                let u = warp(-1.0 + 2.0 * i as f32 / divisions as f32) * half;
-                let p = [
-                    normal[0] * half + u_axis[0] * u + v_axis[0] * v,
-                    normal[1] * half + u_axis[1] * u + v_axis[1] * v,
-                    normal[2] * half + u_axis[2] * u + v_axis[2] * v,
-                ];
-                let q = [
-                    p[0].clamp(-inner, inner),
-                    p[1].clamp(-inner, inner),
-                    p[2].clamp(-inner, inner),
-                ];
-                let offset = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-                let length =
-                    (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2])
-                        .sqrt()
-                        .max(1e-6);
-                let n = [offset[0] / length, offset[1] / length, offset[2] / length];
-                vertices.push(CadVertex {
-                    position: [
-                        q[0] + n[0] * radius,
-                        q[1] + n[1] * radius,
-                        q[2] + n[2] * radius,
+        let center = [normal[0] * half, normal[1] * half, normal[2] * half];
+        let corner = |u: f32, v: f32| {
+            [
+                center[0] + u_axis[0] * u + v_axis[0] * v,
+                center[1] + u_axis[1] * u + v_axis[1] * v,
+                center[2] + u_axis[2] * u + v_axis[2] * v,
+            ]
+        };
+        push_quad(
+            &mut vertices,
+            &mut indices,
+            [
+                corner(-face_half, -face_half),
+                corner(face_half, -face_half),
+                corner(face_half, face_half),
+                corner(-face_half, face_half),
+            ],
+            normal,
+        );
+    }
+
+    // Twelve edge strips, one per pair of faces and sign combination. The
+    // strip's long axis is the third axis; its short axis is the face
+    // diagonal, and it reaches `chamfer / sqrt(2)` either side of the edge's
+    // midpoint.
+    let axes: [Point; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let across_half = chamfer * std::f32::consts::FRAC_1_SQRT_2;
+    for (i, j) in [(0usize, 1usize), (0, 2), (1, 2)] {
+        let k = 3 - i - j;
+        for si in [-1.0_f32, 1.0] {
+            for sj in [-1.0_f32, 1.0] {
+                let normal = vec3_normalize([
+                    axes[i][0] * si + axes[j][0] * sj,
+                    axes[i][1] * si + axes[j][1] * sj,
+                    axes[i][2] * si + axes[j][2] * sj,
+                ]);
+                let along = axes[k];
+                let across = vec3_cross(normal, along);
+                let mut center = [0.0_f32; 3];
+                center[i] = si * (half + face_half) * 0.5;
+                center[j] = sj * (half + face_half) * 0.5;
+                let corner = |a: f32, b: f32| {
+                    [
+                        center[0] + along[0] * a + across[0] * b,
+                        center[1] + along[1] * a + across[1] * b,
+                        center[2] + along[2] * a + across[2] * b,
+                    ]
+                };
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    [
+                        corner(-face_half, -across_half),
+                        corner(face_half, -across_half),
+                        corner(face_half, across_half),
+                        corner(-face_half, across_half),
                     ],
-                    normal: n,
-                });
+                    normal,
+                );
             }
         }
+    }
 
-        for j in 0..divisions {
-            for i in 0..divisions {
-                let v00 = base + j * stride + i;
-                let v10 = v00 + 1;
-                let v01 = v00 + stride;
-                let v11 = v01 + 1;
-                indices.extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
+    // Eight corner triangles, each a corner of the original cube cut off by a
+    // plane whose normal is the space diagonal.
+    for sx in [-1.0_f32, 1.0] {
+        for sy in [-1.0_f32, 1.0] {
+            for sz in [-1.0_f32, 1.0] {
+                push_triangle(
+                    &mut vertices,
+                    &mut indices,
+                    [
+                        [sx * half, sy * face_half, sz * face_half],
+                        [sx * face_half, sy * half, sz * face_half],
+                        [sx * face_half, sy * face_half, sz * half],
+                    ],
+                    vec3_normalize([sx, sy, sz]),
+                );
             }
         }
     }
@@ -157,17 +257,67 @@ fn rounded_cube(half: f32, radius: f32, divisions: u32) -> (Vec<CadVertex>, Vec<
     (vertices, indices)
 }
 
+/// Anti-aliasing: both passes draw into one shared 4x multisampled colour
+/// target, and the cube pass resolves it into the exported image. No separate
+/// AA pass and no additional 1x colour target are needed.
+const SAMPLES: u32 = 4;
+
+/// The shared multisampled colour target.
+///
+/// `cad_graph`'s rebuilder constructs fresh passes on every resize, so this
+/// texture's size is fixed for a pass instance's lifetime.
+pub(crate) struct MsaaTarget {
+    #[allow(dead_code)]
+    texture: wgpu30::Texture,
+    view: wgpu30::TextureView,
+}
+
+impl MsaaTarget {
+    fn new(
+        device: &wgpu30::Device,
+        format: wgpu30::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu30::TextureDescriptor {
+            label: Some("CAD MSAA Colour"),
+            size: wgpu30::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: SAMPLES,
+            dimension: wgpu30::TextureDimension::D2,
+            format,
+            usage: wgpu30::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu30::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+
+    fn view(&self) -> &wgpu30::TextureView {
+        &self.view
+    }
+}
+
 // ── Backdrop ─────────────────────────────────────────────────────────────────
 
 pub struct GridPass {
     pipeline: wgpu30::RenderPipeline,
     bgl: wgpu30::BindGroupLayout,
+    msaa: Arc<MsaaTarget>,
     bind_group: Option<wgpu30::BindGroup>,
     bind_group_key: Option<wgpu30::Buffer>,
 }
 
 impl GridPass {
-    pub fn new(device: &wgpu30::Device, surface_format: wgpu30::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu30::Device,
+        surface_format: wgpu30::TextureFormat,
+        msaa: Arc<MsaaTarget>,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu30::ShaderModuleDescriptor {
             label: Some("CAD Grid Shader"),
             source: wgpu30::ShaderSource::Wgsl(include_str!("../shaders/cad_grid.wgsl").into()),
@@ -220,7 +370,10 @@ impl GridPass {
             },
             // The backdrop covers every pixel, so it needs no depth buffer.
             depth_stencil: None,
-            multisample: wgpu30::MultisampleState::default(),
+            multisample: wgpu30::MultisampleState {
+                count: SAMPLES,
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -228,6 +381,7 @@ impl GridPass {
         Self {
             pipeline,
             bgl,
+            msaa,
             bind_group: None,
             bind_group_key: None,
         }
@@ -241,16 +395,16 @@ impl RenderPass for GridPass {
 
     fn render_pass_descriptor_with_storage<'a>(
         &'a self,
-        target: &'a wgpu30::TextureView,
+        _target: &'a wgpu30::TextureView,
         _depth: &'a wgpu30::TextureView,
         _resources: &'a ResourceRegistry<'a>,
         storage: &'a mut RenderFrameStorage,
     ) -> Option<wgpu30::RenderPassDescriptor<'a>> {
-        // Opaque clear: the grid pass is the first writer, and the cube pass
-        // loads its result.
+        // Opaque clear of the shared MSAA target: the grid pass is the first
+        // writer, and the cube pass loads its samples.
         let color_attachments: &'a [Option<wgpu30::RenderPassColorAttachment<'a>>] = storage
             .retain_boxed_slice(Box::new([Some(wgpu30::RenderPassColorAttachment {
-                view: target,
+                view: self.msaa.view(),
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu30::Operations {
@@ -305,6 +459,7 @@ impl RenderPass for GridPass {
 pub struct CadPass {
     pipeline: wgpu30::RenderPipeline,
     bgl: wgpu30::BindGroupLayout,
+    msaa: Arc<MsaaTarget>,
     /// Written once at construction and never again.
     params: wgpu30::Buffer,
     bind_group: Option<wgpu30::BindGroup>,
@@ -315,7 +470,11 @@ pub struct CadPass {
 }
 
 impl CadPass {
-    pub fn new(device: &wgpu30::Device, surface_format: wgpu30::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu30::Device,
+        surface_format: wgpu30::TextureFormat,
+        msaa: Arc<MsaaTarget>,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu30::ShaderModuleDescriptor {
             label: Some("CAD Cube Shader"),
             source: wgpu30::ShaderSource::Wgsl(include_str!("../shaders/cad_cube.wgsl").into()),
@@ -394,12 +553,15 @@ impl CadPass {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu30::MultisampleState::default(),
+            multisample: wgpu30::MultisampleState {
+                count: SAMPLES,
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
 
-        let (vertices, indices) = rounded_cube(CUBE_HALF, CUBE_RADIUS, CUBE_DIVISIONS);
+        let (vertices, indices) = chamfered_cube(CUBE_HALF, CUBE_CHAMFER);
         let vertex_buffer = device.create_buffer_init(&wgpu30::util::BufferInitDescriptor {
             label: Some("CAD Cube VB"),
             contents: bytemuck::cast_slice(&vertices),
@@ -419,6 +581,7 @@ impl CadPass {
         Self {
             pipeline,
             bgl,
+            msaa,
             params,
             bind_group: None,
             bind_group_key: None,
@@ -441,7 +604,8 @@ impl RenderPass for CadPass {
         _resources: &'a ResourceRegistry<'a>,
         storage: &'a mut RenderFrameStorage,
     ) -> Option<wgpu30::RenderPassDescriptor<'a>> {
-        // Load the grid pass's colour. The graph records passes in declaration
+        // Load the grid pass's samples and resolve them into the exported
+        // image when the pass ends. The graph records passes in declaration
         // order and neither pass declares a read or write of the other's
         // resources, so the two are never fused into a subpass chain and the
         // load is a real, ordered load.
@@ -451,12 +615,14 @@ impl RenderPass for CadPass {
         // at the internal render scale while this target is at output size.
         let color_attachments: &'a [Option<wgpu30::RenderPassColorAttachment<'a>>] = storage
             .retain_boxed_slice(Box::new([Some(wgpu30::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
+                view: self.msaa.view(),
+                resolve_target: Some(target),
                 depth_slice: None,
                 ops: wgpu30::Operations {
                     load: wgpu30::LoadOp::Load,
-                    store: wgpu30::StoreOp::Store,
+                    // The resolve reads the samples; keeping them past that
+                    // is pure bandwidth.
+                    store: wgpu30::StoreOp::Discard,
                 },
             })]));
         Some(wgpu30::RenderPassDescriptor {
@@ -504,26 +670,45 @@ impl RenderPass for CadPass {
 
 // ── Graph ────────────────────────────────────────────────────────────────────
 
-/// The whole render graph: backdrop, then cube. Both passes render straight
-/// into the exported target, so the scene costs two draws and no blits.
+/// The whole render graph: backdrop, then cube. Both passes render into one
+/// shared 4x MSAA target, which the cube pass resolves into the exported
+/// image: two draws and one resolve, with no post-process AA pass.
 pub fn cad_graph(ctx: PassBuildContext<'_>) -> RenderGraph {
+    let msaa = Arc::new(MsaaTarget::new(
+        ctx.device,
+        ctx.config.surface_format,
+        ctx.config.width,
+        ctx.config.height,
+    ));
     let mut graph = RenderGraph::new_with_external_device(ctx.device, ctx.queue);
     graph.add_pass(Box::new(GridPass::new(
         ctx.device,
         ctx.config.surface_format,
+        Arc::clone(&msaa),
     )));
     graph.add_pass(Box::new(CadPass::new(
         ctx.device,
         ctx.config.surface_format,
+        msaa,
     )));
 
     // A resize rebuilds the graph through this closure; it must lock the new
     // graph itself, because `RendererBuilder::build` panics on an unlocked one.
     let rebuilder: GraphRebuilder = Arc::new(
         |device, queue, config, _debug_state, _camera, _debug_camera, _cull| {
+            let msaa = Arc::new(MsaaTarget::new(
+                device,
+                config.surface_format,
+                config.width,
+                config.height,
+            ));
             let mut graph = RenderGraph::new_with_external_device(device, queue);
-            graph.add_pass(Box::new(GridPass::new(device, config.surface_format)));
-            graph.add_pass(Box::new(CadPass::new(device, config.surface_format)));
+            graph.add_pass(Box::new(GridPass::new(
+                device,
+                config.surface_format,
+                Arc::clone(&msaa),
+            )));
+            graph.add_pass(Box::new(CadPass::new(device, config.surface_format, msaa)));
             graph.lock(config.internal_width(), config.internal_height());
             graph
         },

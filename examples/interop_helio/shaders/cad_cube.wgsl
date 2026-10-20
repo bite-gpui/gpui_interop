@@ -134,6 +134,12 @@ fn environment(direction: vec3<f32>) -> vec3<f32> {
     let top_box = pow(max(dot(direction, normalize(vec3<f32>(-0.52, 0.30, -0.80))), 0.0), 10.0);
     color += vec3<f32>(0.80, 0.68, 0.40) * top_box;
 
+    // A fill in the gap between the two floor bounces. The front vertical
+    // chamfer's mirror ray lands exactly there; without this it renders as a
+    // dark crease, which reads as a crack rather than a bevel.
+    let front_fill = pow(max(dot(direction, normalize(vec3<f32>(0.68, -0.55, 0.45))), 0.0), 6.0);
+    color += vec3<f32>(0.45, 0.40, 0.30) * front_fill;
+
     return color;
 }
 

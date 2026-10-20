@@ -86,7 +86,7 @@
 //! # The CAD scene
 //!
 //! `--scene cad` (or `--graph cad`) swaps in a graph of two custom passes from
-//! `cad.rs`: a full-screen grid backdrop and one rounded, gold, metallic cube
+//! `cad.rs`: a full-screen grid backdrop and one chamfered, gold, metallic cube
 //! lit by a single Cook-Torrance fragment shader. It uses no SceneDB rows and
 //! none of the engine's shadow, GI, SSR, atmosphere or post-process passes, and
 //! every buffer it draws from is fixed at construction — so a frame adds two
@@ -240,7 +240,7 @@ mod demo {
         Default,
         Simple,
         Forward,
-        /// Two custom passes: a grid backdrop and one metallic rounded cube.
+        /// Two custom passes: a grid backdrop and one metallic chamfered cube.
         Cad,
     }
 
@@ -271,7 +271,7 @@ mod demo {
         Field,
         /// No actors: the graph's own per-frame cost.
         Clear,
-        /// The custom-pass CAD scene: one metallic rounded cube over a grid. It has no SceneDB
+        /// The custom-pass CAD scene: one metallic chamfered cube over a grid. It has no SceneDB
         /// actors — the cube and the backdrop are the two custom passes' static buffers — so the
         /// world stays empty and the graph is the scene.
         Cad,
