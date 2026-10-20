@@ -30,6 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: steps::checkout_core
+        shell: bash
+        run: git clone --depth 1 --single-branch --branch bite_1.23.305 https://github.com/bite-gpui/bite-gpui.git ../bite-gpui
       - name: steps::install_vulkan
         run: |
           sudo apt-get update
@@ -58,6 +61,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: steps::checkout_core
+        shell: bash
+        run: git clone --depth 1 --single-branch --branch bite_1.23.305 https://github.com/bite-gpui/bite-gpui.git ../bite-gpui
       - shell: bash
         run: |
           set -o pipefail

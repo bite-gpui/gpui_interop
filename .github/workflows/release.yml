@@ -73,6 +73,10 @@ jobs:
         with:
           ref: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
 
+      - name: Check out the core
+        shell: bash
+        run: git clone --depth 1 --single-branch --branch bite_1.23.305 https://github.com/bite-gpui/bite-gpui.git ../bite-gpui
+
       - uses: ./.github/actions/linux-deps
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
