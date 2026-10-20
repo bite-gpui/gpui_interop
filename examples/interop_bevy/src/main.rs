@@ -47,13 +47,28 @@
 //! `--transfer` is the dma-buf shape: Bevy renders into a `WgpuSharedBuffer` through a manual
 //! texture view, the buffer's `sync_file` is exported after each update, and `paint_surface`
 //! imports it. The default (no flag) is the same-device shape, where GPUI samples the image's
-//! `TextureView` with `paint_texture`. The transfer export costs ~0.14–0.8 ms/frame here and the
-//! import ~0.02 ms, so transport is not what separates a hand-written wgpu pipeline from Bevy.
+//! `TextureView` with `paint_texture`. The export costs ~0.15–0.8 ms/frame; on top of that the
+//! consumer polls the fence and samples through the renderer's imported-surface path, while the
+//! same-device path relies only on queue ordering. That is why `--transfer` is a little slower on
+//! a tight frame budget even though the producer's own timings barely move. The same-device path
+//! is the default.
 //!
-//! In release on the test laptop the engine floor is ~5.9 ms/frame on the Intel HD 520 and
-//! ~3.6 ms on the NVIDIA 930M; the 49-cube field adds only ~0.4 ms. The same field as a
-//! hand-written wgpu producer costs 1.29 ms and 0.41 ms, which is where the producer gap lives.
-//! Both paths present at the display's 60 Hz in a window.
+//! In release on the test laptop every Bevy scene — 49 cubes, one, or clear — lands in the same
+//! ~4–6 ms/frame band on the Intel HD 520 and ~4 ms on the NVIDIA 930M, while the same field as a
+//! hand-written wgpu producer costs ~1.25 ms and ~0.45 ms. The rate is engine overhead, not the
+//! scene; run-to-run variance is large because the loop is CPU-bound. Both paths present at the
+//! display's 60 Hz in a window.
+//!
+//! # The scene and the controls
+//!
+//! The scene matches `interop_wgpu`: a 7 × 7 field at 1.75 spacing, the same cube scale and phase,
+//! the same camera start (yaw 0.55, pitch 0.42, distance 11) and 0.9 rad vertical field of view,
+//! and the palettes in `interop_demo`. PBR's metallic 0, full roughness and no reflectance
+//! approximate the wgpu shader's Lambert term, and tonemapping is off so the palette is not curved.
+//! Both demos have Pause, Speed, Palette and Reset view; this one adds Probe, and both orbit on a
+//! drag and zoom on the wheel. One deliberate difference: the wgpu shader pulses each cube for
+//! free, while mutating 49 `StandardMaterial` assets per frame cost ~1.2 ms and pushed the window
+//! off 60 Hz, so the PBR scene keeps the gradient without the pulse.
 //!
 //! # Sizing
 //!
@@ -114,7 +129,10 @@ mod demo {
         Update,
     };
     use bevy::asset::{Assets, Handle, RenderAssetUsages};
-    use bevy::camera::{Camera3d, ClearColor, ManualTextureViewHandle, RenderTarget};
+    use bevy::camera::{
+        Camera3d, ClearColor, ManualTextureViewHandle, PerspectiveProjection, Projection,
+        RenderTarget,
+    };
     use bevy::color::Color;
     use bevy::core_pipeline::tonemapping::Tonemapping;
     use bevy::diagnostic::DiagnosticsPlugin;
@@ -123,6 +141,7 @@ mod demo {
     // `bevy_ecs` dependency. This example depends on the `bevy` umbrella, so the re-export is
     // aliased to the name the macros expand to.
     use bevy::ecs as bevy_ecs;
+    use bevy::ecs::change_detection::DetectChanges;
     use bevy::ecs::component::Component;
     use bevy::ecs::message::MessageWriter;
     use bevy::ecs::resource::Resource;
@@ -141,20 +160,21 @@ mod demo {
     use bevy::render::settings::{RenderCreation, WgpuSettings};
     use bevy::render::texture::{GpuImage, ManualTextureView, ManualTextureViews};
     use bevy::render::{Render as BevyRender, RenderApp, RenderPlugin, RenderSystems};
-    use bevy::time::Time;
     use bevy::transform::components::Transform;
     use bevy::window::{ExitCondition, WindowPlugin};
     use gpui::{
         AnyElement, App, Bounds, Context, Corners, Entity, FocusId, FramePipeline,
-        FramePipelineExt, IntoElement, PhaseMetrics, PreparedRoots, Render,
+        FramePipelineExt, IntoElement, PhaseMetrics, PreparedRoots, Render, ScrollDelta,
         StandardImmediatePipeline, Window as GpuiWindow, WindowBounds, WindowMetrics,
         WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
     };
     use gpui_engine::DmaBufHandle;
-    use gpui_interop::{WgpuSharedBuffer, attach};
+    use gpui_interop::{
+        SurfaceEvent, SurfaceInput, SurfacePoint, WgpuSharedBuffer, attach, surface_input,
+    };
     use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
     use interop_demo::{
-        ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
+        ACCENT, LEFT_WIDTH, MUTED, PALETTES, control, error_panel, histogram, histogram_caption,
         histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
         page, panel, section_label, title, viewport_frame,
     };
@@ -169,6 +189,12 @@ mod demo {
     const BENCH_HEIGHT: u32 = VIEW_HEIGHT;
 
     const GRID: i32 = 7;
+
+    /// How far the camera orbits per physical pixel dragged, and how far the wheel moves it per
+    /// notch. The same values as `interop_wgpu`.
+    const SENSITIVITY: f32 = 0.007;
+    const ZOOM_PER_NOTCH: f32 = 1.12;
+    const PIXELS_PER_LINE: f32 = 40.0;
 
     /// The CLI. `selector` is kept raw as well as lowered to a `GpuPreference`: the windowed path
     /// uses the preference before a renderer exists, while `--bench` has no GPUI application and
@@ -394,6 +420,62 @@ mod demo {
     #[derive(Component)]
     struct Floating {
         phase: f32,
+        /// The palette gradient coordinate, fixed for the cube's place in the field.
+        t: f32,
+    }
+
+    /// The window's controls, shared between the view and the canvas. The canvas syncs the Bevy
+    /// resources from these cells before each step, so a button only has to set a cell.
+    #[derive(Clone)]
+    struct Controls {
+        paused: Rc<Cell<bool>>,
+        speed: Rc<Cell<f32>>,
+        palette: Rc<Cell<u8>>,
+        probe: Rc<Cell<bool>>,
+    }
+
+    impl Controls {
+        fn new() -> Self {
+            Self {
+                paused: Rc::new(Cell::new(false)),
+                speed: Rc::new(Cell::new(1.0)),
+                palette: Rc::new(Cell::new(0)),
+                probe: Rc::new(Cell::new(false)),
+            }
+        }
+    }
+
+    /// The animation clock. `interop_wgpu` advances a fixed 16 ms per frame rather than reading
+    /// wall time, so the two demos animate at the same rate and the speed control means the same
+    /// thing in both.
+    #[derive(Resource)]
+    struct Animation {
+        seconds: f32,
+        speed: f32,
+    }
+
+    /// Which palette the field uses.
+    #[derive(Resource, Default)]
+    struct Palette(usize);
+
+    /// The orbit camera. The defaults are `interop_wgpu`'s: yaw 0.55, pitch 0.42, distance 11.
+    #[derive(Resource)]
+    struct CameraRig {
+        yaw: f32,
+        pitch: f32,
+        distance: f32,
+        dirty: bool,
+    }
+
+    impl Default for CameraRig {
+        fn default() -> Self {
+            Self {
+                yaw: 0.55,
+                pitch: 0.42,
+                distance: 11.0,
+                dirty: false,
+            }
+        }
     }
 
     /// Render one Bevy frame per GPUI paint, then wait for the GPU so the view GPUI samples is the
@@ -418,6 +500,7 @@ mod demo {
             width: u32,
             height: u32,
             config: ViewConfig,
+            controls: &Controls,
         ) -> anyhow::Result<Self> {
             let interop = attach(gpu.try_device::<WgpuRenderer>())
                 .map_err(|unavailable| anyhow::anyhow!("{unavailable:?}"))?;
@@ -455,7 +538,15 @@ mod demo {
                         UVec2::new(width, height),
                     ),
                 );
-                add_scene(&mut app, width, height, None, config.scene, Some(manual));
+                add_scene(
+                    &mut app,
+                    width,
+                    height,
+                    None,
+                    config.scene,
+                    Some(manual),
+                    controls,
+                );
                 SceneOutput::Transfer(Box::new(TransferOutput {
                     buffer,
                     handle: None,
@@ -469,6 +560,7 @@ mod demo {
                     Some(frame.clone()),
                     config.scene,
                     None,
+                    controls,
                 );
                 SceneOutput::Image(frame)
             };
@@ -735,6 +827,53 @@ mod demo {
             );
             Ok(())
         }
+
+        /// Copy the window's controls into Bevy's resources. Returns whether a resource changed,
+        /// so a paused canvas can step once to apply it.
+        fn sync_controls(&mut self, controls: &Controls) -> bool {
+            let mut changed = false;
+            let world = self.sub_apps.main.world_mut();
+            {
+                let mut animation = world.resource_mut::<Animation>();
+                let speed = controls.speed.get();
+                if animation.speed != speed {
+                    animation.speed = speed;
+                    changed = true;
+                }
+            }
+            {
+                let mut palette = world.resource_mut::<Palette>();
+                let index = usize::from(controls.palette.get()) % PALETTES.len();
+                if palette.0 != index {
+                    palette.0 = index;
+                    changed = true;
+                }
+            }
+            changed
+        }
+
+        fn camera_dirty(&self) -> bool {
+            self.sub_apps.main.world().resource::<CameraRig>().dirty
+        }
+
+        fn orbit(&mut self, dx: f32, dy: f32) {
+            let mut rig = self.sub_apps.main.world_mut().resource_mut::<CameraRig>();
+            rig.yaw += dx;
+            rig.pitch = (rig.pitch - dy).clamp(-1.2, 1.2);
+            rig.dirty = true;
+        }
+
+        fn zoom(&mut self, factor: f32) {
+            let mut rig = self.sub_apps.main.world_mut().resource_mut::<CameraRig>();
+            rig.distance = (rig.distance * factor).clamp(5.0, 30.0);
+            rig.dirty = true;
+        }
+
+        fn reset_view(&mut self) {
+            let mut rig = self.sub_apps.main.world_mut().resource_mut::<CameraRig>();
+            *rig = CameraRig::default();
+            rig.dirty = true;
+        }
     }
 
     /// Build the headless app: no `winit`, no window, and the caller's choice of who creates the
@@ -781,6 +920,7 @@ mod demo {
         publisher: Option<SharedFrame>,
         scene: SceneKind,
         manual: Option<ManualTextureViewHandle>,
+        controls: &Controls,
     ) {
         if let Some(manual) = manual {
             app.insert_resource(SessionTarget::Manual(manual));
@@ -807,15 +947,23 @@ mod demo {
 
         app.insert_resource(GlobalAmbientLight {
             color: Color::WHITE,
-            brightness: 180.0,
+            brightness: 60.0,
             ..default()
         });
         app.insert_resource(scene);
         // A dark blue that is recognisably not the GPUI background, so a rendered-but-empty
         // image is distinguishable from one the canvas never sampled.
-        app.insert_resource(ClearColor(Color::srgb(0.035, 0.055, 0.10)));
+        // `interop_wgpu` clears with these linear values; `wgpu::Color` is linear and the target
+        // encodes it, so the Bevy clear matches the same numbers rather than an sRGB guess.
+        app.insert_resource(ClearColor(Color::linear_rgb(0.005, 0.008, 0.014)));
+        app.insert_resource(Animation {
+            seconds: 0.0,
+            speed: controls.speed.get(),
+        });
+        app.insert_resource(Palette(usize::from(controls.palette.get())));
+        app.insert_resource(CameraRig::default());
         app.add_systems(Startup, spawn_scene);
-        app.add_systems(Update, animate);
+        app.add_systems(Update, (advance, animate, recolour, drive_camera).chain());
 
         if let Some(frame) = publisher {
             let target = match app.world().resource::<SessionTarget>() {
@@ -863,6 +1011,20 @@ mod demo {
     ) {
         let cube = meshes.add(bevy::math::primitives::Cuboid::new(1.0, 1.0, 1.0));
         let half = (GRID - 1) as f32 / 2.0;
+        let (_, from, to) = PALETTES[0];
+        let material = |t: f32| StandardMaterial {
+            base_color: Color::linear_rgb(
+                from[0] + (to[0] - from[0]) * t,
+                from[1] + (to[1] - from[1]) * t,
+                from[2] + (to[2] - from[2]) * t,
+            ),
+            // The hand-written pipeline lights with a Lambert term and no specular; metallic zero,
+            // full roughness and no reflectance get closest to that with PBR.
+            metallic: 0.0,
+            perceptual_roughness: 1.0,
+            reflectance: 0.0,
+            ..default()
+        };
 
         let count = match *scene {
             SceneKind::Field => GRID,
@@ -872,37 +1034,22 @@ mod demo {
         if count == 1 {
             commands.spawn((
                 Mesh3d(cube),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.55, 0.75, 1.0),
-                    metallic: 0.35,
-                    perceptual_roughness: 0.28,
-                    ..default()
-                })),
+                MeshMaterial3d(materials.add(material(0.5))),
                 Transform::from_xyz(0.0, 0.0, 0.0),
-                Floating { phase: 0.0 },
+                Floating { phase: 0.0, t: 0.5 },
             ));
         } else {
             for y in 0..count {
                 for x in 0..count {
                     let (fx, fy) = (x as f32 - half, y as f32 - half);
                     let t = ((fx + fy + GRID as f32) / (2.0 * GRID as f32)).clamp(0.0, 1.0);
-                    // `interop_wgpu`'s "Ember" palette: a warm-to-cool gradient across the field.
-                    let colour = Color::srgb(
-                        1.00 + (0.15 - 1.00) * t,
-                        0.42 + (0.55 - 0.42) * t,
-                        0.15 + (1.00 - 0.15) * t,
-                    );
                     commands.spawn((
                         Mesh3d(cube.clone()),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: colour,
-                            metallic: 0.35,
-                            perceptual_roughness: 0.28,
-                            ..default()
-                        })),
+                        MeshMaterial3d(materials.add(material(t))),
                         Transform::from_xyz(fx * 1.75, fy * 1.75, 0.0),
                         Floating {
                             phase: fx * 0.42 + fy * 0.31,
+                            t,
                         },
                     ));
                 }
@@ -911,11 +1058,13 @@ mod demo {
 
         commands.spawn((
             DirectionalLight {
-                illuminance: 12_000.0,
+                illuminance: 3_000.0,
                 shadow_maps_enabled: false,
                 ..default()
             },
-            Transform::from_xyz(6.0, 10.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
+            // Exactly `interop_wgpu`'s light direction: the shader's `light` vector points from
+            // the surface towards (0.38, 0.82, 0.44).
+            Transform::from_xyz(0.38, 0.82, 0.44).looking_at(Vec3::ZERO, Vec3::Y),
         ));
 
         commands.spawn((
@@ -924,22 +1073,73 @@ mod demo {
                 SessionTarget::Image(handle) => RenderTarget::Image(handle.clone().into()),
                 SessionTarget::Manual(handle) => RenderTarget::TextureView(*handle),
             },
-            // AcesFitted is a shader-only curve: `TonyMcMapface` would want the LUT assets that
-            // the `tonemapping_luts` feature embeds, which a default-features-off app does not
-            // carry.
-            Tonemapping::AcesFitted,
+            // Match `interop_wgpu`'s 0.9 rad vertical field of view; the default is π/4, which
+            // frames the field noticeably tighter.
+            Projection::Perspective(PerspectiveProjection {
+                fov: 0.9,
+                ..default()
+            }),
+            // `interop_wgpu` writes its palette straight to an sRGB target; a filmic curve here
+            // would bend the same colours into a different image.
+            Tonemapping::None,
             Transform::from_xyz(5.24, 4.49, 8.56).looking_at(Vec3::ZERO, Vec3::Y),
         ));
     }
 
-    fn animate(time: Res<Time>, mut cubes: Query<(&mut Transform, &Floating)>) {
-        let elapsed = time.elapsed_secs();
+    fn advance(mut animation: ResMut<Animation>) {
+        animation.seconds += 0.016 * animation.speed;
+    }
+
+    fn animate(animation: Res<Animation>, mut cubes: Query<(&mut Transform, &Floating)>) {
+        let elapsed = animation.seconds;
         for (mut transform, floating) in &mut cubes {
             let phase = elapsed * 1.25 + floating.phase;
             transform.translation.z = phase.sin() * 0.42;
             transform.rotation = Quat::from_euler(EulerRot::YXZ, phase * 0.62, phase * 0.44, 0.0);
             transform.scale = Vec3::splat(0.40 + 0.05 * (phase * 0.9).sin());
         }
+    }
+
+    /// Apply the selected palette's gradient. This runs only when the palette resource changes:
+    /// mutating 49 `StandardMaterial` assets every frame re-extracts and re-prepares each of them,
+    /// which measured ~1.2 ms/frame here and pushed the windowed demo off 60 Hz. `interop_wgpu`
+    /// pulses each cube in its shader for free; a PBR scene would need a custom per-instance
+    /// material to match that, so the Bevy scene keeps the gradient and drops the pulse.
+    fn recolour(
+        palette: Res<Palette>,
+        mut materials: ResMut<Assets<StandardMaterial>>,
+        cubes: Query<(&MeshMaterial3d<StandardMaterial>, &Floating)>,
+    ) {
+        if !palette.is_changed() {
+            return;
+        }
+        let (_, from, to) = PALETTES[palette.0 % PALETTES.len()];
+        for (material, floating) in &cubes {
+            let (r, g, b) = (
+                from[0] + (to[0] - from[0]) * floating.t,
+                from[1] + (to[1] - from[1]) * floating.t,
+                from[2] + (to[2] - from[2]) * floating.t,
+            );
+            if let Some(mut material) = materials.get_mut(&material.0) {
+                material.base_color = Color::linear_rgb(r, g, b);
+            }
+        }
+    }
+
+    /// Turn the rig's yaw/pitch/distance into the camera's transform.
+    fn drive_camera(mut rig: ResMut<CameraRig>, mut cameras: Query<&mut Transform>) {
+        if !rig.dirty {
+            return;
+        }
+        let eye = Vec3::new(
+            rig.distance * rig.pitch.cos() * rig.yaw.sin(),
+            rig.distance * rig.pitch.sin(),
+            rig.distance * rig.pitch.cos() * rig.yaw.cos(),
+        );
+        for mut transform in &mut cameras {
+            *transform = Transform::from_translation(eye).looking_at(Vec3::ZERO, Vec3::Y);
+        }
+        rig.dirty = false;
     }
 
     /// Build render resources on GPUI's device.
@@ -1070,7 +1270,16 @@ mod demo {
             ..default()
         };
         let mut app = base_app(RenderCreation::Automatic(Box::new(settings)));
-        add_scene(&mut app, BENCH_WIDTH, BENCH_HEIGHT, None, scene, None);
+        let controls = Controls::new();
+        add_scene(
+            &mut app,
+            BENCH_WIDTH,
+            BENCH_HEIGHT,
+            None,
+            scene,
+            None,
+            &controls,
+        );
 
         let report = Arc::new(Mutex::new(None));
         app.insert_resource(Bench {
@@ -1313,10 +1522,8 @@ mod demo {
         displayed_at: Option<Instant>,
         config: ViewConfig,
         logged: Rc<RefCell<Instant>>,
-        /// Whether Bevy is stopped. Paused, the canvas keeps presenting the last frame.
-        paused: Rc<Cell<bool>>,
-        /// A one-shot read-back requested from the left panel.
-        probe_requested: Rc<Cell<bool>>,
+        /// The window's controls. Paused, the canvas keeps presenting the last frame.
+        controls: Controls,
     }
 
     impl BevyDemo {
@@ -1346,8 +1553,7 @@ mod demo {
                 displayed_at: None,
                 config,
                 logged: Rc::new(RefCell::new(Instant::now())),
-                paused: Rc::new(Cell::new(false)),
-                probe_requested: Rc::new(Cell::new(false)),
+                controls: Controls::new(),
             }
         }
     }
@@ -1355,7 +1561,7 @@ mod demo {
     impl Render for BevyDemo {
         fn render(&mut self, window: &mut GpuiWindow, cx: &mut Context<Self>) -> impl IntoElement {
             let failed = self.error.borrow().is_some();
-            if !failed && !self.paused.get() {
+            if !failed && !self.controls.paused.get() {
                 // The canvas must run every frame: its paint is what advances Bevy and samples
                 // the produced texture. Paused, only a control asks for another frame.
                 window.request_animation_frame();
@@ -1363,7 +1569,7 @@ mod demo {
 
             if self
                 .displayed_at
-                .is_none_or(|at| at.elapsed() >= Duration::from_millis(200))
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(500))
             {
                 let (gpu, backend, hand_off) = {
                     let scene = self.scene.borrow();
@@ -1402,12 +1608,7 @@ mod demo {
             }
 
             page(
-                controls_panel(
-                    cx,
-                    self.paused.clone(),
-                    self.probe_requested.clone(),
-                    self.histogram_panel.clone(),
-                ),
+                controls_panel(cx, self.controls.clone(), self.histogram_panel.clone()),
                 viewport(
                     self.scene.clone(),
                     self.error.clone(),
@@ -1415,37 +1616,81 @@ mod demo {
                     self.phase_costs.clone(),
                     self.config,
                     self.logged.clone(),
-                    self.paused.clone(),
-                    self.probe_requested.clone(),
+                    self.controls.clone(),
                 ),
                 self.metrics_panel.clone().cached(metrics_panel_style()),
             )
         }
     }
 
-    /// The left column: the pause and probe controls, and the cached interval histogram.
+    /// The left column: the same controls as `interop_wgpu`, plus the one-shot probe. The
+    /// listeners only set cells; the canvas syncs them into Bevy before the next step.
     fn controls_panel(
         cx: &mut Context<BevyDemo>,
-        paused: Rc<Cell<bool>>,
-        probe_requested: Rc<Cell<bool>>,
+        controls: Controls,
         histogram_panel: Entity<HistogramPanel>,
     ) -> AnyElement {
-        let pause_label = if paused.get() { "Resume" } else { "Pause" };
-        let pause =
-            control("pause", pause_label).on_click(cx.listener(move |_this, _, window, cx| {
-                paused.set(!paused.get());
-                window.request_animation_frame();
+        let pause_label = if controls.paused.get() {
+            "Resume"
+        } else {
+            "Pause"
+        };
+        let pause = control("pause", pause_label).on_click(cx.listener({
+            let controls = controls.clone();
+            move |_this, _, _window, cx| {
+                controls.paused.set(!controls.paused.get());
                 cx.notify();
-            }));
-        let probe = control("probe", "Probe").on_click(cx.listener(move |_this, _, window, cx| {
-            probe_requested.set(true);
-            window.request_animation_frame();
+            }
+        }));
+
+        let speed_label = format!("Speed {:.1}×", controls.speed.get());
+        let speed_button = control("speed", speed_label).on_click(cx.listener({
+            let controls = controls.clone();
+            move |_this, _, _window, cx| {
+                let next = match controls.speed.get() {
+                    s if s < 1.0 => 1.0,
+                    s if s < 2.0 => 2.0,
+                    _ => 0.5,
+                };
+                controls.speed.set(next);
+                cx.notify();
+            }
+        }));
+
+        let palette_index = controls.palette.get() as usize % PALETTES.len();
+        let palette_button = control(
+            "palette",
+            format!("Palette · {}", PALETTES[palette_index].0),
+        )
+        .on_click(cx.listener({
+            let controls = controls.clone();
+            move |_this, _, _window, cx| {
+                controls
+                    .palette
+                    .set((controls.palette.get() + 1) % PALETTES.len() as u8);
+                cx.notify();
+            }
+        }));
+
+        let reset = control("reset", "Reset view").on_click(cx.listener(|this, _, _, cx| {
+            if let Some(scene) = this.scene.borrow_mut().as_mut() {
+                scene.reset_view();
+            }
             cx.notify();
         }));
+
+        let probe =
+            control("probe", "Probe").on_click(cx.listener(move |_this, _, _window, cx| {
+                controls.probe.set(true);
+                cx.notify();
+            }));
 
         panel(LEFT_WIDTH)
             .child(section_label("Controls"))
             .child(pause)
+            .child(speed_button)
+            .child(palette_button)
+            .child(reset)
             .child(probe)
             .child(div().h(px(8.)).flex_none())
             .child(histogram_panel.cached(histogram_style()))
@@ -1560,15 +1805,17 @@ mod demo {
         phase_costs: Rc<RefCell<PhaseCosts>>,
         config: ViewConfig,
         logged: Rc<RefCell<Instant>>,
-        paused: Rc<Cell<bool>>,
-        probe_requested: Rc<Cell<bool>>,
+        controls: Controls,
     ) -> AnyElement {
         let drawing_error = error.clone();
         let overlay_error = error;
-        let paused_for_canvas = paused.clone();
+        let paused_for_hint = controls.paused.clone();
+        let controls_for_canvas = controls;
+        let zooming = scene.clone();
+        let interactive = scene.clone();
         let canvas = gpu_canvas(move |gpu| {
             // The canvas is a physical-pixel producer: follow its current bounds, not the size it
-            // happened to have when the app was built. A resize recreates the backing texture.
+            // had when the app was built. A resize recreates the backing texture.
             let bounds = gpu.bounds();
             let scale = gpu.scale_factor();
             let width = (bounds.size.width.0 * scale).round().max(1.0) as u32;
@@ -1576,7 +1823,7 @@ mod demo {
 
             let mut slot = scene.borrow_mut();
             if slot.is_none() && drawing_error.borrow().is_none() {
-                match BevyScene::build(gpu, width, height, config) {
+                match BevyScene::build(gpu, width, height, config, &controls_for_canvas) {
                     Ok(built) => *slot = Some(built),
                     Err(build) => {
                         let message = format!("{build:#}");
@@ -1597,7 +1844,10 @@ mod demo {
                 return;
             }
 
-            let stepped = !paused_for_canvas.get();
+            // Apply the left panel's controls before deciding whether to step. A paused canvas
+            // still steps once when a control or the camera changed, so the change is visible.
+            let changed = scene.sync_controls(&controls_for_canvas);
+            let stepped = !controls_for_canvas.paused.get() || changed || scene.camera_dirty();
             let (update, wait, transport) = if stepped {
                 match scene.step() {
                     Ok(timings) => timings,
@@ -1612,7 +1862,7 @@ mod demo {
                 (Duration::ZERO, Duration::ZERO, Duration::ZERO)
             };
 
-            if let Err(error) = scene.probe(probe_requested.take()) {
+            if let Err(error) = scene.probe(controls_for_canvas.probe.take()) {
                 eprintln!("interop_bevy: probe failed: {error:#}");
             }
 
@@ -1661,10 +1911,48 @@ mod demo {
                 }
             }
         })
+        .on_scroll_wheel(move |event, window, _cx| {
+            let notches = match event.delta {
+                ScrollDelta::Lines(lines) => lines.y,
+                ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / PIXELS_PER_LINE,
+            };
+            if let Some(scene) = zooming.borrow_mut().as_mut() {
+                scene.zoom(ZOOM_PER_NOTCH.powf(notches));
+            }
+            window.refresh();
+        })
         .size_full();
 
+        let last = Rc::new(Cell::new(None::<SurfacePoint>));
+        let grab = Rc::new(Cell::new(false));
+        let handler = move |input: SurfaceInput| {
+            let mut slot = interactive.borrow_mut();
+            let Some(scene) = slot.as_mut() else {
+                return;
+            };
+            match input.event {
+                SurfaceEvent::PointerDown { position, .. } => {
+                    grab.set(true);
+                    last.set(Some(position));
+                }
+                SurfaceEvent::PointerMove { position, .. } if grab.get() => {
+                    if let Some(previous) = last.replace(Some(position)) {
+                        scene.orbit(
+                            (position.x - previous.x) * SENSITIVITY,
+                            (position.y - previous.y) * SENSITIVITY,
+                        );
+                    }
+                }
+                SurfaceEvent::PointerMove { .. } => {}
+                SurfaceEvent::PointerUp { .. } => {
+                    grab.set(false);
+                    last.set(None);
+                }
+            }
+        };
+
         viewport_frame()
-            .child(canvas)
+            .child(surface_input(canvas, handler))
             .children(overlay_error.borrow().clone().map(|message| {
                 error_panel(
                     "The Bevy viewport could not start",
@@ -1678,14 +1966,13 @@ mod demo {
             } else {
                 "bevy · same-device texture · 0 CPU copies"
             }))
-            .child(overlay_hint(if paused.get() {
+            .child(overlay_hint(if paused_for_hint.get() {
                 "paused · GPUI presents the last frame"
             } else {
-                "headless bevy 0.19 · pumped by GPUI's paint"
+                "drag to orbit · scroll to zoom"
             }))
             .into_any_element()
     }
-
     pub fn run() {
         let cli = parse_args();
         if let Some(limit) = cli.bench {

@@ -189,7 +189,7 @@ build only the producer they name, and both enable the same library features.
 | `interop_cube` | Embedded 3D engine: an independent Vulkan pipeline renders a spinning cube into a `SharedBuffer` and composites it into GPUI with zero CPU copies. |
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
 | `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting. |
-| `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause and Probe controls. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
+| `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause, Speed, Palette, Reset view and Probe, and the viewport orbits/zooms. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
 
 ```sh
 cargo run -p gpui_interop --example interop_linux     --features example
@@ -247,33 +247,42 @@ sequentially rather than concurrently:
 
 | Path | Intel HD 520 | NVIDIA 930M |
 | --- | --- | --- |
-| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 773.1 fps · 1.29 ms/frame | 2453.2 fps · 0.41 ms/frame |
-| `interop_bevy --bench 5` (Bevy only, GPU waited) | 160.4 fps · 6.24 ms/frame | 247.7 fps · 4.04 ms/frame |
-| `interop_bevy --scene one --bench 5` | 158.0 fps · 6.33 ms/frame | 266.8 fps · 3.75 ms/frame |
-| `interop_bevy --scene clear --bench 5` (engine only) | 169.2 fps · 5.91 ms/frame | 277.4 fps · 3.60 ms/frame |
-| Windowed `--stats` (image, presented) | ~58–60 fps | ~60 fps |
-| Windowed `--transfer --stats` (dma-buf, presented) | ~56–59 fps | ~60 fps |
+| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 798.6 fps · 1.25 ms/frame | 2209.0 fps · 0.45 ms/frame |
+| `interop_bevy --bench 10` (Bevy only, GPU waited) | 196.4 fps · 5.09 ms/frame | 250.1 fps · 4.00 ms/frame |
+| `interop_bevy --scene one --bench 10` | 157.2 fps · 6.36 ms/frame | 267.9 fps · 3.73 ms/frame |
+| `interop_bevy --scene clear --bench 10` (engine only) | 169.1 fps · 5.91 ms/frame | 239.9 fps · 4.17 ms/frame |
+| Windowed `--stats` (image, presented) | ~58–59 fps | ~60 fps |
+| Windowed `--transfer --stats` (dma-buf, presented) | ~56–58 fps | ~60 fps |
 
-Release confirms the attribution the debug run suggested. Bevy's *engine loop* costs ~5.9 ms on
-the Intel adapter and ~3.6 ms on the NVIDIA one even with an empty scene. The 49-cube PBR field
-adds ~0.33 ms and ~0.44 ms. The 2453 → 248 fps gap is therefore ECS/extract/prepare/render-graph
-overhead, not the scene, PBR, or transport. The hand-written instanced pipeline is still
-4.8–9.9× faster as a producer, so Bevy has a real per-frame floor; it is simply far below the
-display budget.
+Release confirms the attribution: every Bevy scene — 49 cubes, one cube, or nothing — lands in
+the same ~4–6 ms/frame band, while the hand-written producer costs 1.25 ms and 0.45 ms. The
+rate is set by ECS/extract/prepare/render-graph work, not by the scene. Run-to-run variance is
+large (±20%) because the loop is CPU-bound and the clear or one-cube run can measure slower than
+the field as CPU frequency and the pipelined renderer change; these are 10 s runs, not a
+controlled clock. The producer remains 4–9× faster.
 
 In the windowed release runs the Bevy step was ~1.2–3.5 ms, `paint_texture`/`paint_surface`
-~0.01–0.05 ms, layout ~0.2–1.3 ms, and the whole `draw` 2–5 ms. The interval settles at
+~0.01–0.05 ms, layout ~0.2–1.5 ms, and the whole `draw` 2–5 ms. The interval settles at
 15–20 ms — the display's 60 Hz cadence, with `present wait` taking the rest. The `gpui` and
 `bevy` tick counters are printed together and stay equal, so Bevy runs exactly once per GPUI
 paint; it has no pacing of its own. A window that is *not* focused reads `active false` and a
 ~33 ms interval, because GPUI caps an inactive window at 33.3 ms; focus it before judging rate.
 Removing `.cached()` from the right panel and the histogram raised layout to 9–11 ms and cost
-~6 fps on the Intel adapter. The headless rows are engine ceilings, not the display path.
-`--transfer` adds ~0.15–0.7 ms for the export and ~0.02 ms for the import, and presents at the
-same rate as the image path. The debug profile (Bevy and wgpu crates at `opt-level = 3`, the rest
-at 0) measured 493.8 / 1310.3 fps for `interop_wgpu` and 121.8 / 179.5 fps for Bevy, with the
-windowed draw over budget at ~37 fps; the conclusions are the same, only the absolute numbers
-move.
+~6 fps on the Intel adapter. The headless rows are engine ceilings, not the display path. The
+debug profile (Bevy and wgpu crates at `opt-level = 3`, the rest at 0) measured 493.8 / 1310.3 fps
+for `interop_wgpu` and 121.8 / 179.5 fps for Bevy, with the windowed draw over budget at ~37 fps;
+the conclusions are the same, only the absolute numbers move.
+
+`--transfer` is deliberately the slower shape. The same-device path hands GPUI a texture view that
+is already on the renderer's device: the queue orders Bevy's write before GPUI's sample, and no CPU
+or fence is involved. The dma-buf path adds, every frame, a Vulkan semaphore signal and `sync_file`
+export on the producer (0.15–0.8 ms here), a consumer-side `poll` on that fence, and the renderer's
+separate imported-surface path. The imported texture itself is cached — the plane descriptors are
+stable, so the importer reuses its image — meaning the cost is the export and the per-frame
+synchronisation, not a fresh allocation. On the Intel adapter that is enough to turn an occasional
+16.7 ms frame into 18–20 ms: Bevy already spends ~10 ms of the budget, while the hand-written wgpu
+producer at ~1.3 ms has plenty of headroom. The same-device path is the default; `--transfer`
+exists to inspect the cross-device shape.
 
 Both producer demos render at the canvas's current **physical** size: the viewport is `flex_1`, and
 the paint callback resizes the target when its bounds or the window scale factor changes. The probe
@@ -283,6 +292,18 @@ canvas changes size; `interop_bevy` changes the `Image` descriptor in place, or 
 `WgpuSharedBuffer` and its manual view on the transfer path. Resizing therefore never stretches the
 source to a different aspect. The headless bench keeps a fixed 960 × 600 on both demos so producer
 runs are comparable.
+
+Both demos share the scene description: the same 7 × 7 grid at 1.75 spacing, the same cube scale
+and per-cube phase, the same camera start (yaw 0.55, pitch 0.42, distance 11) and 0.9 rad vertical
+field of view, and the same three palettes from `interop_demo`. The Bevy scene uses PBR with
+metallic 0, full roughness and no reflectance to approximate the wgpu shader's Lambert term, and
+disables tonemapping so the palette is not bent through a filmic curve. The directional light uses
+the shader's (0.38, 0.82, 0.44) direction, and its illuminance and the ambient light are scaled so
+the linear palette stays in range without clipping. Both have Pause, Speed,
+Palette and Reset view; Bevy adds Probe because it has an image to read back, and both orbit on a
+drag and zoom on the wheel. One deliberate difference: the wgpu shader pulses each cube's
+brightness for free, while mutating 49 `StandardMaterial` assets per frame measured ~1.2 ms and
+pushed the Bevy window off 60 Hz, so the Bevy scene keeps the gradient without the pulse.
 
 Build the demos with `--release` for representative frame numbers. A debug build runs the GPUI
 authoring and layout crates at `opt-level = 0`; the same panel measured ~15 ms per frame in debug

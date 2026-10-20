@@ -41,6 +41,14 @@ pub const AMBER: u32 = 0xf59e0b;
 /// A slower interval.
 pub const RED: u32 = 0xef4444;
 
+/// The three colour pairs the field interpolates between, cycled by the palette control. The same
+/// table drives both producers, so the palettes compare directly.
+pub const PALETTES: [(&str, [f32; 3], [f32; 3]); 3] = [
+    ("Ember", [1.00, 0.42, 0.15], [0.15, 0.55, 1.00]),
+    ("Tide", [0.10, 0.90, 0.72], [0.16, 0.32, 1.00]),
+    ("Mono", [0.92, 0.93, 1.00], [0.34, 0.36, 0.46]),
+];
+
 /// The left column's width, in logical pixels.
 pub const LEFT_WIDTH: f32 = 260.0;
 /// The right column's width, in logical pixels.
@@ -219,7 +227,7 @@ pub fn histogram_caption(show_work: bool) -> AnyElement {
     let text = if show_work {
         "bar: interval · green: pipeline draw · newest right"
     } else {
-        "bar: frame interval · updates 5/s, newest right"
+        "bar: frame interval · updates 2/s, newest right"
     };
     div()
         .text_xs()

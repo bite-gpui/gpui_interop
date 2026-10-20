@@ -89,7 +89,7 @@ mod demo {
     };
     use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
     use interop_demo::{
-        ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
+        ACCENT, LEFT_WIDTH, MUTED, PALETTES, control, error_panel, histogram, histogram_caption,
         histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
         page, panel, section_label, title, viewport_frame,
     };
@@ -110,14 +110,6 @@ mod demo {
     const PIXELS_PER_LINE: f32 = 40.0;
 
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-
-    /// Three colour pairs the instances interpolate between, cycled by the left panel's palette
-    /// button.
-    const PALETTES: [(&str, [f32; 3], [f32; 3]); 3] = [
-        ("Ember", [1.00, 0.42, 0.15], [0.15, 0.55, 1.00]),
-        ("Tide", [0.10, 0.90, 0.72], [0.16, 0.32, 1.00]),
-        ("Mono", [0.92, 0.93, 1.00], [0.34, 0.36, 0.46]),
-    ];
 
     /// The same WGSL a standalone wgpu application would use: a cube mesh with normals, per-instance
     /// model matrices and colours, one directional light, and the camera's view-projection.
@@ -695,7 +687,7 @@ mod demo {
                     None => (0, "—".to_owned(), "—"),
                 }
             };
-            let refresh = self.display.is_none() || self.displayed_at.elapsed().as_millis() >= 200;
+            let refresh = self.display.is_none() || self.displayed_at.elapsed().as_millis() >= 500;
             if refresh {
                 let mut metrics = Metrics::new(&self.stats.borrow(), produced);
                 metrics.gpu = gpu;
