@@ -4722,6 +4722,7 @@ name = "interop_helio"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ash",
  "glam 0.33.12",
  "gpui",
  "gpui_interop",
@@ -4729,8 +4730,8 @@ dependencies = [
  "helio",
  "helio-default-graphs",
  "interop_demo",
+ "libc",
  "pollster 0.4.0",
- "wgpu 29.0.4",
  "wgpu 30.0.1",
 ]
 

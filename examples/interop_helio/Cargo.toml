@@ -9,18 +9,23 @@ workspace = true
 
 # Experimental: Helio is not on crates.io yet, and its renderer is built against wgpu 30 while the
 # GPUI stack is wgpu 29. Both majors coexist in this binary because no wgpu type crosses between
-# them; the frame is copied on the CPU for this first scaffold. See the module documentation.
+# them: Helio's frame leaves as a dma-buf and is imported by GPUI's own device. See the module
+# documentation.
 [[bin]]
 name = "interop_helio"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow.workspace = true
+# The exporter in `gpui_interop` is expressed in Vulkan handles, so this example names the same
+# `ash` (0.38) that `gpui_interop` and wgpu-hal 30 use.
+ash = "0.38"
 gpui.workspace = true
 gpui_interop = { workspace = true, features = ["example"] }
 gpui_wgpu.workspace = true
 interop_demo.workspace = true
-wgpu.workspace = true
+# The release descriptor is an `eventfd` the renderer writes to once it has sampled a frame.
+libc = "0.2"
 
 # Helio's own renderer. The revision is the one the `Helio_Standalone_Demo` pins.
 wgpu30 = { package = "wgpu", version = "30.0.0", features = [

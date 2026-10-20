@@ -21,19 +21,29 @@
 //! # The hand-off
 //!
 //! Helio owns its wgpu 30 instance, adapter, device and queue, just as the
-//! standalone demo does. It renders into an ordinary offscreen `wgpu 30`
-//! texture. This first scaffold then:
+//! standalone demo does. It renders into an **exportable** image: the image
+//! and its memory are allocated by `gpui_interop`'s Vulkan exporter (the same
+//! allocation `WgpuSharedBuffer` makes for wgpu 29), wrapped into a wgpu 30
+//! texture with `texture_from_raw`, and exported as a dma-buf with its DRM
+//! modifier and plane layout. GPUI imports it on its own wgpu 29 device with
+//! `paint_surface`, so no pixel crosses the CPU.
 //!
-//! 1. copies that texture into a read-back buffer and waits for the GPU,
-//! 2. copies the rows on the CPU into a tightly packed image, and
-//! 3. writes it with `queue.write_texture` into a `wgpu 29` texture on GPUI's
-//!    device, which GPUI samples with `paint_texture`.
+//! Two things make this cross the version boundary without a shim inside
+//! `gpui_wgpu`:
 //!
-//! That is deliberately the simple bridge, not the fast one: it costs a
-//! GPU→CPU→GPU round trip per frame. The next step is the dma-buf export the
-//! other producer demos use, which needs the `WgpuSharedBuffer` Vulkan
-//! allocation ported from wgpu 29's HAL to wgpu 30's HAL. Keeping the copy
-//! here means the Helio integration can be proved independently of that port.
+//! - Only **raw Vulkan handles and file descriptors** cross it. An `ash::Device`
+//!   from wgpu 30's HAL is the same `ash::Device` `gpui_interop` was compiled
+//!   against; no `wgpu` 30 type is visible to wgpu 29.
+//! - The device is created through wgpu 30's HAL, not `request_device`, so the
+//!   one extension wgpu-hal does not enable by itself —
+//!   `VK_KHR_external_semaphore_fd` — is added before `vkCreateDevice`. The
+//!   renderer's own device already enables it (with
+//!   `VK_EXT_image_drm_format_modifier`), so the consumer half needs no change.
+//!
+//! The frame is ordered by a `sync_file` exported from a binary semaphore that
+//! an empty submission on Helio's queue signals after the graph has run. A ring
+//! of two images recycles a slot only after the renderer signals the `eventfd`
+//! it was handed, so drawing frame N+1 never races GPUI sampling frame N.
 //!
 //! # Scene
 //!
@@ -43,14 +53,14 @@
 //! post-processing — rather than a single forward pass.
 //!
 //! Drag to orbit the camera, scroll to zoom. Pause stops the clock but keeps
-//! the last frame on screen. `--stats` prints the frame rate and the two copy
-//! timings; `--probe` prints the copied image's centre pixel once.
+//! the last frame on screen. `--stats` prints the frame rate and the render and
+//! export timings; `--probe` reads the exported image back once.
 //!
-//! # Cost of the scaffold
+//! # Build profile
 //!
-//! The read-back waits for the full 39-pass graph to finish. On an Intel HD
-//! 520 at 677x686 that is 30–46 ms/frame in a debug build, so the window runs
-//! at ~13 fps; the dma-buf export removes the wait and the CPU copy.
+//! Run it with `--release`. Helio's 39-pass graph and shader compilation are
+//! compiled at opt-level 0 in a debug build; the debug numbers measure the
+//! build, not the bridge.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -69,17 +79,22 @@ fn main() {
 mod demo {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use ash::vk;
     use glam::{Mat4, Quat, Vec3};
     use gpui::{
-        AnyElement, App, Bounds, Context, Corners, Entity, IntoElement, Render, ScrollDelta,
-        Window, WindowBounds, WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
+        AnyElement, App, Bounds, Context, Entity, IntoElement, Render, ScrollDelta, Window,
+        WindowBounds, WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
+    };
+    use gpui_interop::vulkan_export::{
+        DmaBufHandle, ExportDevice, SurfaceFormatKind, Tiling, allocate_export_image,
     };
     use gpui_interop::{SurfaceEvent, SurfaceInput, SurfacePoint, attach, surface_input};
-    use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
+    use gpui_wgpu::WgpuRenderer;
     use helio::{
         Camera, GpuLight, GpuMaterial, GroupMask, LightId, LightType, MaterialId, MeshId,
         MeshUpload, Movability, ObjectDescriptor, ObjectId, PackedVertex, Renderer,
@@ -92,9 +107,15 @@ mod demo {
         page, panel, section_label, title, viewport_frame,
     };
 
-    /// Helio's output format. GPUI samples `Rgba8UnormSrgb` directly.
+    /// Helio's output format. GPUI imports the exported image as `rgba8`.
     const FORMAT: wgpu30::TextureFormat = wgpu30::TextureFormat::Rgba8UnormSrgb;
-    const GPUI_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+    /// The Vulkan form of `FORMAT`: `_SRGB`, the form a shader's linear output is stored in.
+    const VK_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+    /// How many exportable images the producer cycles: one in flight with GPUI while the next is
+    /// rendered. A release that never comes costs a timeout, not the frame loop.
+    const SLOTS: usize = 2;
+    /// How long a handed-out slot waits for the renderer's release before it is reclaimed.
+    const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
 
     /// Orbit/zoom, the same feel as the other two demos.
     const SENSITIVITY: f32 = 0.007;
@@ -110,7 +131,6 @@ mod demo {
     struct Cli {
         list: bool,
         preference: Option<gpui::GpuPreference>,
-        adapter: Option<usize>,
         probe: bool,
         stats: bool,
     }
@@ -119,7 +139,6 @@ mod demo {
         let mut cli = Cli {
             list: false,
             preference: None,
-            adapter: None,
             probe: false,
             stats: false,
         };
@@ -139,7 +158,6 @@ mod demo {
                     cli.preference = Some(gpui::GpuPreference::Custom(Arc::new(
                         move |gpus: &[gpui::GpuAdapterInfo]| (index < gpus.len()).then_some(index),
                     )));
-                    cli.adapter = Some(index);
                 }
                 "-h" | "--help" => {
                     print_help();
@@ -164,7 +182,7 @@ mod demo {
             "Usage: interop_helio [OPTIONS]\n",
             "\n",
             "  --list-gpus          enumerate the adapters this process can render on, then exit\n",
-            "  --gpu <INDEX>        use the adapter at INDEX from --list-gpus\n",
+            "  --gpu <INDEX>        select the window adapter at INDEX from --list-gpus (Helio follows it)\n",
             "  --stats              print the frame rate and the copy timings once a second\n",
             "  --probe              print the copied image's centre pixel and mean once\n",
             "  -h, --help           show this help\n",
@@ -187,15 +205,15 @@ mod demo {
         for (index, gpu) in gpus.iter().enumerate() {
             let software = if gpu.is_software { " (software)" } else { "" };
             println!(
-                "{index:<3} {:<46} {:<8} {:<11} cpu-copy{software}",
+                "{index:<3} {:<46} {:<8} {:<11} dma-buf{software}",
                 gpu.name,
                 format!("{:?}", gpu.backend),
                 format!("{:?}", gpu.device_type),
             );
         }
         println!(
-            "\nHelio owns its own wgpu 30 device; the window's renderer is wgpu 29. Select with \
-             --gpu <#>."
+            "\nHelio opens its own wgpu 30 device and exports a dma-buf; the window's renderer is \
+             wgpu 29. Select the window's adapter with --gpu <#>."
         );
     }
 
@@ -206,8 +224,7 @@ mod demo {
         interval_ms: f32,
         fps: f32,
         render_ms: f32,
-        readback_ms: f32,
-        upload_ms: f32,
+        export_ms: f32,
         width: u32,
         height: u32,
         adapter: String,
@@ -216,18 +233,10 @@ mod demo {
     }
 
     impl Metrics {
-        fn record(
-            &mut self,
-            render: Duration,
-            readback: Duration,
-            upload: Duration,
-            width: u32,
-            height: u32,
-        ) {
+        fn record(&mut self, render: Duration, export: Duration, width: u32, height: u32) {
             self.frames += 1;
             self.render_ms = render.as_secs_f32() * 1000.0;
-            self.readback_ms = readback.as_secs_f32() * 1000.0;
-            self.upload_ms = upload.as_secs_f32() * 1000.0;
+            self.export_ms = export.as_secs_f32() * 1000.0;
             self.width = width;
             self.height = height;
 
@@ -249,27 +258,46 @@ mod demo {
         }
     }
 
-    /// The Helio producer plus the two textures that bridge wgpu 30 to wgpu 29.
+    /// The Helio producer and its ring of exportable images.
+    ///
+    /// Declaration order is load-bearing: the slots own the raw images and their drop callbacks, so
+    /// they are dropped before the `Renderer` and the `Arc<wgpu::Device>` that created them.
     struct HelioScene {
-        device: Arc<wgpu30::Device>,
-        queue: Arc<wgpu30::Queue>,
+        slots: Vec<Slot>,
         renderer: Renderer,
-        target: wgpu30::Texture,
-        target_view: wgpu30::TextureView,
-        readback: wgpu30::Buffer,
+        queue: Arc<wgpu30::Queue>,
+        device: Arc<wgpu30::Device>,
+        /// The handle last handed to GPUI; re-presented while paused.
+        presented: Option<DmaBufHandle>,
         width: u32,
         height: u32,
         spinner: ObjectId,
         lights: [LightId; 4],
         started: Instant,
         adapter: String,
-        gpui_device: Arc<wgpu::Device>,
-        gpui_queue: Arc<wgpu::Queue>,
-        gpui_texture: wgpu::Texture,
-        gpui_view: wgpu::TextureView,
-        pixels: Vec<u8>,
         frames: u64,
+        dropped: u64,
         probe: bool,
+    }
+
+    /// One exportable image, and the release the renderer signals when it has sampled it.
+    struct Slot {
+        target: HelioTarget,
+        release: Option<Arc<OwnedFd>>,
+        handed_at: Option<Instant>,
+    }
+
+    impl Slot {
+        /// Whether the renderer has finished sampling this slot, or its release has timed out.
+        fn released(&self) -> bool {
+            match (&self.release, self.handed_at) {
+                (None, _) => true,
+                (Some(release), Some(at)) => {
+                    release_signalled(release) || at.elapsed() >= RELEASE_TIMEOUT
+                }
+                (Some(_), None) => true,
+            }
+        }
     }
 
     impl HelioScene {
@@ -277,89 +305,72 @@ mod demo {
             gpu: &mut gpui::GpuCanvasContext,
             width: u32,
             height: u32,
-            adapter_index: Option<usize>,
             probe: bool,
         ) -> anyhow::Result<Self> {
             let interop = attach(gpu.try_device::<WgpuRenderer>())
                 .map_err(|unavailable| anyhow::anyhow!("{unavailable:?}"))?;
-            let (gpui_device, gpui_queue) = interop
-                .adapter()
-                .wgpu()
-                .ok_or_else(|| anyhow::anyhow!("the window's renderer is not wgpu"))?;
-
-            let (gpui_texture, gpui_view) = gpui_target(&gpui_device, width, height)?;
+            // The consumer's GPU identity. A dma-buf is importable only on the physical device it
+            // was exported from, and a DRM modifier is meaningful only to that device's driver.
+            let renderer_gpu = interop.adapter().gpu_id().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the window's renderer is not Vulkan: a dma-buf surface needs a Vulkan consumer"
+                )
+            })?;
 
             let instance = wgpu30::Instance::new(wgpu30::InstanceDescriptor {
-                backends: wgpu30::Backends::VULKAN | wgpu30::Backends::GL,
+                backends: wgpu30::Backends::VULKAN,
                 flags: wgpu30::InstanceFlags::empty(),
                 ..wgpu30::InstanceDescriptor::new_without_display_handle()
             });
-            let adapters = pollster::block_on(
-                instance.enumerate_adapters(wgpu30::Backends::VULKAN | wgpu30::Backends::GL),
-            );
+            let adapters =
+                pollster::block_on(instance.enumerate_adapters(wgpu30::Backends::VULKAN));
             if adapters.is_empty() {
-                anyhow::bail!("Helio found no wgpu 30 adapter");
+                anyhow::bail!("Helio found no Vulkan adapter");
             }
-            let index = adapter_index
-                .filter(|index| *index < adapters.len())
-                .unwrap_or_else(|| {
-                    adapters
-                        .iter()
-                        .position(|adapter| {
-                            adapter.get_info().device_type != wgpu30::DeviceType::Cpu
-                        })
-                        .unwrap_or(0)
-                });
-            let adapter = &adapters[index];
+            let adapter = adapters
+                .iter()
+                .find(|adapter| adapter.get_info().name == renderer_gpu.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no Vulkan adapter named {}: Helio must render on the window's GPU for a \
+                         dma-buf to import",
+                        renderer_gpu.name,
+                    )
+                })?;
             let info = adapter.get_info();
             eprintln!(
-                "interop_helio: Helio on {} ({:?}), GPUI on wgpu 29, CPU copy",
+                "interop_helio: Helio and the window share {} ({:?}), dma-buf hand-off",
                 info.name, info.backend
             );
 
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu30::DeviceDescriptor {
-                    label: Some("interop_helio"),
-                    required_features: helio::required_wgpu_features(adapter.features()),
-                    required_limits: helio::required_wgpu_limits(adapter.limits()),
-                    experimental_features: helio::required_experimental_features(
-                        adapter.features(),
-                    ),
-                    ..Default::default()
-                }))?;
+            let (device, queue) = helio_device(adapter)?;
             let (device, queue) = (Arc::new(device), Arc::new(queue));
 
             let mut renderer = RendererBuilder::new(RendererConfig::new(width, height, FORMAT))
                 .with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
                     build_default_graph_external(d, q, s, c, ds, cb, csb, None)
                 }))
+                // Helio shares a device it did not create: no owned-device readbacks, no teardown.
+                .with_external_device()
                 .build(device.clone(), queue.clone(), width, height, FORMAT);
 
             let (spinner, lights) = populate(&mut renderer);
-
-            let (target, target_view) = helio_target(&device, width, height)?;
-            let readback = readback_buffer(&device, width, height);
-            let pixels = vec![0u8; width as usize * height as usize * 4];
+            let slots = slots(&device, width, height)?;
 
             Ok(Self {
-                device,
-                queue,
+                slots,
                 renderer,
-                target,
-                target_view,
-                readback,
+                queue,
+                device,
+                presented: None,
                 width,
                 height,
                 spinner,
                 lights,
                 started: Instant::now(),
                 adapter: info.name,
-                gpui_device,
-                gpui_queue,
-                gpui_texture,
-                gpui_view,
-                pixels,
                 frames: 0,
+                dropped: 0,
                 probe,
             })
         }
@@ -372,14 +383,8 @@ mod demo {
             }
 
             self.renderer.set_render_size(width, height);
-            let (target, target_view) = helio_target(&self.device, width, height)?;
-            self.target = target;
-            self.target_view = target_view;
-            self.readback = readback_buffer(&self.device, width, height);
-            let (texture, view) = gpui_target(&self.gpui_device, width, height)?;
-            self.gpui_texture = texture;
-            self.gpui_view = view;
-            self.pixels = vec![0u8; width as usize * height as usize * 4];
+            self.slots = slots(&self.device, width, height)?;
+            self.presented = None;
             self.width = width;
             self.height = height;
             Ok(())
@@ -432,30 +437,66 @@ mod demo {
             }
         }
 
-        /// Render one frame, copy it across the version boundary, and return the three timings.
-        fn render(&mut self, camera: &Camera) -> anyhow::Result<(Duration, Duration, Duration)> {
+        /// Render one frame into a free slot and export it, or `None` when every slot is still in
+        /// flight — a dropped frame rather than a write into a buffer the compositor is sampling.
+        fn render(&mut self, camera: &Camera) -> anyhow::Result<Option<(Duration, Duration)>> {
+            let Some(index) = (0..self.slots.len()).find(|&index| self.slots[index].released())
+            else {
+                self.dropped += 1;
+                return Ok(None);
+            };
+
             let render_start = Instant::now();
             self.renderer
-                .render(camera, &self.target_view)
+                .render(camera, self.slots[index].target.view())
                 .map_err(|error| anyhow::anyhow!("Helio render: {error}"))?;
             let render = render_start.elapsed();
 
-            let readback_start = Instant::now();
+            if self.probe && self.frames + 1 == 60 {
+                self.probe_slot(index)?;
+            }
+
+            let export_start = Instant::now();
+            let mut handle = self.slots[index].target.submit(&self.queue)?;
+            let release = release_descriptor()?;
+            handle.release = Some(Arc::clone(&release));
+            let slot = &mut self.slots[index];
+            slot.release = Some(release);
+            slot.handed_at = Some(Instant::now());
+            self.presented = Some(handle);
+            self.frames += 1;
+            let export = export_start.elapsed();
+
+            Ok(Some((render, export)))
+        }
+
+        /// Composite the last exported frame into the canvas. Cheap: GPUI imports the dma-buf on
+        /// its own device, and the handle carries the acquire fence.
+        fn paint(&self, gpu: &mut gpui::GpuCanvasContext) {
+            if let Some(handle) = &self.presented {
+                gpu.paint_surface(handle.clone());
+            }
+        }
+
+        /// Read the exported image back once, to prove it is not blank. This is the only path that
+        /// touches the CPU, and it is opt-in.
+        fn probe_slot(&self, index: usize) -> anyhow::Result<()> {
             let padded = padded_bytes_per_row(self.width);
+            let buffer = readback_buffer(&self.device, self.width, self.height);
             let mut encoder =
                 self.device
                     .create_command_encoder(&wgpu30::CommandEncoderDescriptor {
-                        label: Some("interop_helio_readback"),
+                        label: Some("interop_helio_probe"),
                     });
             encoder.copy_texture_to_buffer(
                 wgpu30::TexelCopyTextureInfo {
-                    texture: &self.target,
+                    texture: self.slots[index].target.texture(),
                     mip_level: 0,
                     origin: wgpu30::Origin3d::ZERO,
                     aspect: wgpu30::TextureAspect::All,
                 },
                 wgpu30::TexelCopyBufferInfo {
-                    buffer: &self.readback,
+                    buffer: &buffer,
                     layout: wgpu30::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(padded),
@@ -474,9 +515,9 @@ mod demo {
                     submission_index: None,
                     timeout: Some(Duration::from_secs(10)),
                 })
-                .map_err(|error| anyhow::anyhow!("waiting for the readback copy: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("waiting for the probe copy: {error}"))?;
 
-            let slice = self.readback.slice(..);
+            let slice = buffer.slice(..);
             let (sender, receiver) = std::sync::mpsc::channel();
             slice.map_async(wgpu30::MapMode::Read, move |result| {
                 let _ = sender.send(result);
@@ -486,132 +527,374 @@ mod demo {
                     submission_index: None,
                     timeout: Some(Duration::from_secs(10)),
                 })
-                .map_err(|error| anyhow::anyhow!("waiting for the readback map: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("waiting for the probe map: {error}"))?;
             receiver
                 .recv()
-                .map_err(|error| anyhow::anyhow!("readback channel: {error}"))?
-                .map_err(|error| anyhow::anyhow!("mapping the readback buffer: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("probe channel: {error}"))?
+                .map_err(|error| anyhow::anyhow!("mapping the probe buffer: {error}"))?;
 
             let row = self.width as usize * 4;
-            {
-                let mapped = slice
-                    .get_mapped_range()
-                    .map_err(|error| anyhow::anyhow!("mapping the readback range: {error}"))?;
-                for y in 0..self.height as usize {
-                    let source = y * padded as usize;
-                    self.pixels[y * row..(y + 1) * row]
-                        .copy_from_slice(&mapped[source..source + row]);
-                }
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|error| anyhow::anyhow!("mapping the probe range: {error}"))?;
+            let mut pixels = vec![0u8; row * self.height as usize];
+            for y in 0..self.height as usize {
+                let source = y * padded as usize;
+                pixels[y * row..(y + 1) * row].copy_from_slice(&mapped[source..source + row]);
             }
-            self.readback.unmap();
-            let readback = readback_start.elapsed();
+            drop(mapped);
+            buffer.unmap();
 
-            self.frames += 1;
-            if self.probe && self.frames == 60 {
-                let row = self.width as usize * 4;
-                let centre_at = (self.height as usize / 2) * row + (self.width as usize / 2) * 4;
-                let centre = &self.pixels[centre_at..centre_at + 4];
-                let sum: u64 = self
-                    .pixels
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|[r, g, b, _]| u64::from(*r) + u64::from(*g) + u64::from(*b))
-                    .sum();
-                let samples = self.pixels.len() as u64 / 4 * 3;
-                eprintln!(
-                    "interop_helio: probe {}x{}: centre {:?}, mean channel {:.2}",
-                    self.width,
-                    self.height,
-                    centre,
-                    sum as f64 / samples.max(1) as f64,
-                );
-            }
-
-            let upload_start = Instant::now();
-            self.gpui_queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.gpui_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.width * 4),
-                    rows_per_image: Some(self.height),
-                },
-                wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
+            let centre_at = (self.height as usize / 2) * row + (self.width as usize / 2) * 4;
+            let centre = &pixels[centre_at..centre_at + 4];
+            let sum: u64 = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|[r, g, b, _]| u64::from(*r) + u64::from(*g) + u64::from(*b))
+                .sum();
+            let samples = pixels.len() as u64 / 4 * 3;
+            eprintln!(
+                "interop_helio: probe {}x{}: centre {:?}, mean channel {:.2}",
+                self.width,
+                self.height,
+                centre,
+                sum as f64 / samples.max(1) as f64,
             );
-            let upload = upload_start.elapsed();
-
-            Ok((render, readback, upload))
-        }
-
-        fn paint(&self, gpu: &mut gpui::GpuCanvasContext) -> anyhow::Result<()> {
-            let handle = self.gpui_view.to_imported_handle()?;
-            gpu.paint_texture(handle, Corners::default(), 1.0, false);
             Ok(())
         }
     }
 
-    fn gpui_target(
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<(wgpu::Texture, wgpu::TextureView)> {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("interop_helio_gpui_target"),
-            size: wgpu::Extent3d {
+    /// Create the wgpu 30 device with the one export extension wgpu-hal does not enable itself.
+    ///
+    /// `request_device` would enable `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`
+    /// and `VK_EXT_image_drm_format_modifier` (wgpu-hal adds those when the driver supports them),
+    /// but not `VK_KHR_external_semaphore_fd`, which the acquire fence needs. `open_with_callback`
+    /// mutates the extension list before `vkCreateDevice`, and `create_device_from_hal` adopts the
+    /// result back into wgpu — the same escape hatch `gpui_wgpu` uses on the consumer side, and it
+    /// keeps every `wgpu` 30 type on Helio's side of the boundary.
+    fn helio_device(adapter: &wgpu30::Adapter) -> anyhow::Result<(wgpu30::Device, wgpu30::Queue)> {
+        use wgpu30::hal::vulkan::Api;
+
+        let features = helio::required_wgpu_features(adapter.features())
+            | wgpu30::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        if !adapter
+            .features()
+            .contains(wgpu30::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            anyhow::bail!(
+                "{} lacks VK_EXT_external_memory_dma_buf or VK_EXT_image_drm_format_modifier; a \
+                 dma-buf export is not available on it",
+                adapter.get_info().name,
+            );
+        }
+        let descriptor = wgpu30::DeviceDescriptor {
+            label: Some("interop_helio"),
+            required_features: features,
+            required_limits: helio::required_wgpu_limits(adapter.limits()),
+            memory_hints: wgpu30::MemoryHints::MemoryUsage,
+            trace: wgpu30::Trace::Off,
+            experimental_features: helio::required_experimental_features(adapter.features()),
+        };
+
+        // SAFETY: the HAL device is opened from this adapter with exactly the descriptor's features
+        // and limits, and the callback only adds an extension the physical device reports. The
+        // `OpenDevice` is adopted back into wgpu before this function returns.
+        unsafe {
+            let hal = adapter
+                .as_hal::<Api>()
+                .ok_or_else(|| anyhow::anyhow!("Helio's adapter is not Vulkan"))?;
+            if !hal
+                .physical_device_capabilities()
+                .supports_extension(vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME)
+            {
+                anyhow::bail!(
+                    "{} does not support VK_KHR_external_semaphore_fd; the frame cannot carry an \
+                     acquire fence",
+                    adapter.get_info().name,
+                );
+            }
+            let open = hal
+                .open_with_callback(
+                    features,
+                    &descriptor.required_limits,
+                    &descriptor.memory_hints,
+                    Some(Box::new(|args| {
+                        args.extensions.push(vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME);
+                    })),
+                )
+                .map_err(|error| anyhow::anyhow!("opening the Helio device: {error}"))?;
+            adapter
+                .create_device_from_hal::<Api>(open, &descriptor)
+                .map_err(|error| anyhow::anyhow!("adopting the Helio device: {error}"))
+        }
+    }
+
+    /// A shareable image on Helio's device, wrapped back into wgpu 30 so the renderer draws into it.
+    struct HelioTarget {
+        texture: wgpu30::Texture,
+        view: wgpu30::TextureView,
+        handle: DmaBufHandle,
+        device: ash::Device,
+        semaphore: vk::Semaphore,
+        external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
+    }
+
+    impl HelioTarget {
+        fn new(device: &wgpu30::Device, width: u32, height: u32) -> anyhow::Result<Self> {
+            // SAFETY: the HAL device is borrowed only for this call; the image and memory outlive
+            // it inside the wgpu texture's drop callback.
+            let hal_guard = unsafe { device.as_hal::<wgpu30::hal::vulkan::Api>() }
+                .ok_or_else(|| anyhow::anyhow!("a dma-buf target needs a Vulkan wgpu device"))?;
+            let hal: &wgpu30::hal::vulkan::Device = &hal_guard;
+            let instance = hal.shared_instance().raw_instance();
+            let raw_device = hal.raw_device();
+            for required in [
+                vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME,
+                vk::KHR_EXTERNAL_MEMORY_FD_NAME,
+                vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME,
+                vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME,
+            ] {
+                if !hal.enabled_device_extensions().contains(&required) {
+                    anyhow::bail!(
+                        "Helio's device does not have {} enabled; it cannot export a dma-buf",
+                        required.to_string_lossy(),
+                    );
+                }
+            }
+
+            let external_memory_fd =
+                ash::khr::external_memory_fd::Device::new(instance, raw_device);
+            let drm_format_modifier =
+                ash::ext::image_drm_format_modifier::Device::new(instance, raw_device);
+            let export_device = HelioExportDevice {
+                hal,
+                external_memory_fd,
+                drm_format_modifier,
+            };
+            let (image, memory, handle) = allocate_export_image(
+                &export_device,
+                width,
+                height,
+                SurfaceFormatKind::rgba8(),
+                VK_FORMAT,
+                Tiling::Tiled,
+                true,
+            )?;
+
+            // The acquire fence. A `SYNC_FD` export moves the signal into a `sync_file`, which is
+            // exactly what `DmaBufHandle::acquire_fence` takes; the same semaphore is reused once
+            // the export has consumed its signal.
+            let mut export_semaphore = vk::ExportSemaphoreCreateInfo::default()
+                .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            // SAFETY: the semaphore is created on this device and destroyed when this value drops.
+            let semaphore = match unsafe {
+                raw_device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut export_semaphore),
+                    None,
+                )
+            } {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    // SAFETY: neither image nor memory is wrapped or bound to anything else yet.
+                    unsafe {
+                        raw_device.free_memory(memory, None);
+                        raw_device.destroy_image(image, None);
+                    }
+                    return Err(anyhow::anyhow!("creating the acquire semaphore: {error:?}"));
+                }
+            };
+
+            let size = wgpu30::Extent3d {
                 width,
                 height,
                 depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: GPUI_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("interop_helio_gpui_target_view"),
-            ..Default::default()
-        });
-        Ok((texture, view))
+            };
+            let hal_descriptor = wgpu30::hal::TextureDescriptor {
+                label: Some("interop_helio_target"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu30::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu30::TextureUses::COLOR_TARGET | wgpu30::TextureUses::COPY_SRC,
+                memory_flags: wgpu30::hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            };
+            // The texture owns the raw image and memory: wgpu does not free either through
+            // `destroy_texture` when a drop callback is supplied, so the callback does, in reverse
+            // order, after the last view is gone.
+            let owner = raw_device.clone();
+            let drop_callback: wgpu30::hal::DropCallback = Box::new(move || {
+                // SAFETY: created by this device and freed exactly once, by the texture's drop.
+                unsafe {
+                    owner.destroy_image(image, None);
+                    owner.free_memory(memory, None);
+                }
+            });
+            // SAFETY: the image was created with this descriptor's extent, format, usage and
+            // tiling on this device, and its memory is bound.
+            let hal_texture = unsafe {
+                hal.texture_from_raw(
+                    image,
+                    &hal_descriptor,
+                    Some(drop_callback),
+                    wgpu30::hal::vulkan::TextureMemory::External,
+                )
+            };
+            // SAFETY: the HAL texture came from this device and the descriptor matches.
+            let texture = unsafe {
+                device.create_texture_from_hal::<wgpu30::hal::vulkan::Api>(
+                    hal_texture,
+                    &wgpu30::TextureDescriptor {
+                        label: Some("interop_helio_target"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu30::TextureDimension::D2,
+                        format: FORMAT,
+                        usage: wgpu30::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu30::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    },
+                    wgpu30::TextureUses::UNINITIALIZED,
+                )
+            };
+            let view = texture.create_view(&wgpu30::TextureViewDescriptor {
+                label: Some("interop_helio_target_view"),
+                ..Default::default()
+            });
+
+            Ok(Self {
+                texture,
+                view,
+                handle,
+                device: raw_device.clone(),
+                semaphore,
+                external_semaphore_fd: ash::khr::external_semaphore_fd::Device::new(
+                    instance, raw_device,
+                ),
+            })
+        }
+
+        fn texture(&self) -> &wgpu30::Texture {
+            &self.texture
+        }
+
+        fn view(&self) -> &wgpu30::TextureView {
+            &self.view
+        }
+
+        /// Signal the acquire semaphore after every submission Helio made for this frame, then
+        /// export the signal as the `sync_file` the renderer waits on.
+        ///
+        /// Helio submits internally (a clear, then the graph), so the semaphore cannot ride the
+        /// graph's own submission. An empty submission on the same queue is ordered after all of
+        /// them, and is the only ordering `vkQueueSubmit` offers a producer that does not own the
+        /// submission the frame was recorded in.
+        fn submit(&mut self, queue: &wgpu30::Queue) -> anyhow::Result<DmaBufHandle> {
+            let hal_queue = unsafe { queue.as_hal::<wgpu30::hal::vulkan::Api>() }
+                .ok_or_else(|| anyhow::anyhow!("a dma-buf export needs a Vulkan wgpu queue"))?;
+            hal_queue.add_signal_semaphore(self.semaphore, None);
+            queue.submit(std::iter::empty::<wgpu30::CommandBuffer>());
+
+            // SAFETY: the semaphore is live and was given to this device; `SYNC_FD` moves the
+            // signal into the returned descriptor, whose ownership passes to the handle.
+            let fd = unsafe {
+                self.external_semaphore_fd.get_semaphore_fd(
+                    &vk::SemaphoreGetFdInfoKHR::default()
+                        .semaphore(self.semaphore)
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                )
+            }
+            .map_err(|error| anyhow::anyhow!("exporting the acquire fence: {error:?}"))?;
+            // SAFETY: `fd` is a fresh descriptor, owned by the handle from here.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+            let mut handle = self.handle.clone();
+            handle.acquire_fence = Some(Arc::new(fd));
+            Ok(handle)
+        }
     }
 
-    fn helio_target(
-        device: &wgpu30::Device,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<(wgpu30::Texture, wgpu30::TextureView)> {
-        let texture = device.create_texture(&wgpu30::TextureDescriptor {
-            label: Some("interop_helio_target"),
-            size: wgpu30::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu30::TextureDimension::D2,
-            format: FORMAT,
-            usage: wgpu30::TextureUsages::RENDER_ATTACHMENT | wgpu30::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu30::TextureViewDescriptor {
-            label: Some("interop_helio_target_view"),
-            ..Default::default()
-        });
-        Ok((texture, view))
+    impl Drop for HelioTarget {
+        fn drop(&mut self) {
+            // SAFETY: the semaphore was created by this value's device and is destroyed once. A
+            // `SYNC_FD` export has already moved any pending signal into the fence's descriptor.
+            unsafe { self.device.destroy_semaphore(self.semaphore, None) };
+        }
     }
 
+    /// The Vulkan handles Helio's wgpu 30 device lends the exporter in `gpui_interop`.
+    struct HelioExportDevice<'a> {
+        hal: &'a wgpu30::hal::vulkan::Device,
+        external_memory_fd: ash::khr::external_memory_fd::Device,
+        drm_format_modifier: ash::ext::image_drm_format_modifier::Device,
+    }
+
+    impl ExportDevice for HelioExportDevice<'_> {
+        fn instance(&self) -> &ash::Instance {
+            self.hal.shared_instance().raw_instance()
+        }
+
+        fn physical_device(&self) -> vk::PhysicalDevice {
+            self.hal.raw_physical_device()
+        }
+
+        fn device(&self) -> &ash::Device {
+            self.hal.raw_device()
+        }
+
+        fn external_memory_fd(&self) -> &ash::khr::external_memory_fd::Device {
+            &self.external_memory_fd
+        }
+
+        fn drm_format_modifier(&self) -> &ash::ext::image_drm_format_modifier::Device {
+            &self.drm_format_modifier
+        }
+
+        fn renderer_bound(&self) -> bool {
+            // The adapter was matched to the window's `GpuId`, so this is the physical device the
+            // renderer samples on; a modifier read from it is the one the importer can take.
+            true
+        }
+    }
+
+    fn slots(device: &wgpu30::Device, width: u32, height: u32) -> anyhow::Result<Vec<Slot>> {
+        (0..SLOTS)
+            .map(|_| {
+                Ok(Slot {
+                    target: HelioTarget::new(device, width, height)?,
+                    release: None,
+                    handed_at: None,
+                })
+            })
+            .collect()
+    }
+
+    /// A fresh `eventfd` the renderer signals once it has finished sampling a frame.
+    fn release_descriptor() -> anyhow::Result<Arc<OwnedFd>> {
+        // SAFETY: `eventfd` returns a fresh descriptor this process owns.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!(
+                "creating a release descriptor: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `fd` is fresh and ownership moves into the value.
+        Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Whether the renderer has signalled `release` — a non-blocking `poll`.
+    fn release_signalled(release: &OwnedFd) -> bool {
+        let mut descriptor = libc::pollfd {
+            fd: release.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        (unsafe { libc::poll(&mut descriptor, 1, 0) }) > 0
+    }
     fn readback_buffer(device: &wgpu30::Device, width: u32, height: u32) -> wgpu30::Buffer {
         let padded = padded_bytes_per_row(width);
         device.create_buffer(&wgpu30::BufferDescriptor {
@@ -971,14 +1254,13 @@ mod demo {
         metrics_panel: Entity<MetricsPanel>,
         histogram_panel: Entity<HistogramPanel>,
         displayed_at: Option<Instant>,
-        adapter: Option<usize>,
         probe: bool,
         stats: bool,
         logged: Rc<RefCell<Instant>>,
     }
 
     impl Demo {
-        fn new(cx: &mut Context<Self>, adapter: Option<usize>, probe: bool, stats: bool) -> Self {
+        fn new(cx: &mut Context<Self>, probe: bool, stats: bool) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
             let metrics_panel = cx.new(|_| MetricsPanel {
                 metrics: panel_metrics.clone(),
@@ -1000,7 +1282,6 @@ mod demo {
                 metrics_panel,
                 histogram_panel,
                 displayed_at: None,
-                adapter,
                 probe,
                 stats,
                 logged: Rc::new(RefCell::new(Instant::now())),
@@ -1048,7 +1329,6 @@ mod demo {
                     self.yaw.clone(),
                     self.pitch.clone(),
                     self.distance.clone(),
-                    self.adapter,
                     self.probe,
                     self.stats,
                     self.logged.clone(),
@@ -1116,7 +1396,7 @@ mod demo {
             .gap_1()
             .child(title(
                 "Helio, inside GPUI",
-                "Helio's wgpu 30 renderer, bridged to GPUI's wgpu 29 texture.",
+                "Helio's wgpu 30 renderer, exported as a dma-buf to GPUI's wgpu 29 device.",
             ))
             .child(div().h(px(2.)).flex_none())
             .child(
@@ -1126,8 +1406,8 @@ mod demo {
                     .child(format!("{:.1} FPS", metrics.fps)),
             )
             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                "{:.2} ms · Helio {:.2} · copy {:.2} · upload {:.2}",
-                metrics.interval_ms, metrics.render_ms, metrics.readback_ms, metrics.upload_ms
+                "{:.2} ms · Helio {:.2} · export {:.2}",
+                metrics.interval_ms, metrics.render_ms, metrics.export_ms
             )))
             .child(div().h(px(4.)).flex_none())
             .child(section_label("Frame"))
@@ -1139,11 +1419,7 @@ mod demo {
                 "Helio render",
                 format!("{:.2} ms", metrics.render_ms),
             ))
-            .child(metric_row(
-                "readback",
-                format!("{:.2} ms", metrics.readback_ms),
-            ))
-            .child(metric_row("upload", format!("{:.2} ms", metrics.upload_ms)))
+            .child(metric_row("export", format!("{:.2} ms", metrics.export_ms)))
             .child(div().h(px(4.)).flex_none())
             .child(section_label("Producer"))
             .child(metric_row(
@@ -1151,7 +1427,7 @@ mod demo {
                 format!("{} × {}", metrics.width, metrics.height),
             ))
             .child(metric_row("adapter", metrics.adapter.clone()))
-            .child(metric_row("hand-off", "CPU copy · wgpu 30 → 29".to_owned()))
+            .child(metric_row("hand-off", "dma-buf · zero copy".to_owned()))
             .child(metric_row("frames", metrics.frames.to_string()))
             .into_any_element()
     }
@@ -1167,7 +1443,6 @@ mod demo {
         yaw: Rc<Cell<f32>>,
         pitch: Rc<Cell<f32>>,
         distance: Rc<Cell<f32>>,
-        adapter: Option<usize>,
         probe: bool,
         stats: bool,
         logged: Rc<RefCell<Instant>>,
@@ -1186,7 +1461,7 @@ mod demo {
 
             let mut slot = scene.borrow_mut();
             if slot.is_none() && drawing_error.borrow().is_none() {
-                match HelioScene::build(gpu, width, height, adapter, probe) {
+                match HelioScene::build(gpu, width, height, probe) {
                     Ok(built) => *slot = Some(built),
                     Err(build) => {
                         let message = format!("{build:#}");
@@ -1216,15 +1491,12 @@ mod demo {
                     distance_for_camera.get(),
                 );
                 match scene.render(&camera) {
-                    Ok((render, readback, upload)) => {
-                        metrics.borrow_mut().record(
-                            render,
-                            readback,
-                            upload,
-                            scene.width,
-                            scene.height,
-                        );
+                    Ok(Some((render, export))) => {
+                        metrics
+                            .borrow_mut()
+                            .record(render, export, scene.width, scene.height);
                     }
+                    Ok(None) => {}
                     Err(error) => {
                         let message = format!("{error:#}");
                         eprintln!("interop_helio: cannot render: {message}");
@@ -1241,25 +1513,21 @@ mod demo {
                     *last = now;
                     let metrics = metrics.borrow();
                     eprintln!(
-                        "interop_helio: window {} frames — {:.1} fps, {:.2} ms interval, \
-                         helio {:.2} ms, readback {:.2} ms, upload {:.2} ms, {}x{}",
+                        "interop_helio: window {} frames ({} dropped) — {:.1} fps, {:.2} ms \
+                         interval, helio {:.2} ms, export {:.2} ms, {}x{}",
                         metrics.frames,
+                        scene.dropped,
                         metrics.fps,
                         metrics.interval_ms,
                         metrics.render_ms,
-                        metrics.readback_ms,
-                        metrics.upload_ms,
+                        metrics.export_ms,
                         scene.width,
                         scene.height,
                     );
                 }
             }
 
-            if let Err(error) = scene.paint(gpu) {
-                let message = format!("{error:#}");
-                eprintln!("interop_helio: cannot hand the frame to GPUI: {message}");
-                *drawing_error.borrow_mut() = Some(message);
-            }
+            scene.paint(gpu);
         })
         .on_scroll_wheel(move |event, window, _cx| {
             let notches = match event.delta {
@@ -1301,7 +1569,7 @@ mod demo {
                     "Helio needs a Vulkan adapter; --list-gpus shows the adapters this process sees.",
                 )
             }))
-            .child(overlay_badge("helio · wgpu 30 → CPU copy → GPUI"))
+            .child(overlay_badge("helio · wgpu 30 → dma-buf → GPUI"))
             .child(overlay_hint(if paused_for_hint.get() {
                 "paused · GPUI presents the last frame"
             } else {
@@ -1328,7 +1596,7 @@ mod demo {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|cx| Demo::new(cx, cli.adapter, cli.probe, cli.stats)),
+                move |_, cx| cx.new(|cx| Demo::new(cx, cli.probe, cli.stats)),
             )
             .expect("a window to composite into");
             cx.activate(true);

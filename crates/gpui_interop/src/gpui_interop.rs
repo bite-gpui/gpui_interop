@@ -39,6 +39,10 @@
 //!   layout the producer declares — the shape a decoder or capture pipeline whose layout comes from
 //!   elsewhere needs. A wgpu producer does **not** use it: it renders into a `WgpuSharedBuffer` (or,
 //!   same-device, a `WgpuSurface`).
+//! - On Linux, `vulkan_export` is the raw-Vulkan seam for a producer on a **different `wgpu`
+//!   major** — a renderer whose own `wgpu` types this crate cannot name. It allocates the same
+//!   exportable image and returns the `vk::Image` and memory, which the producer wraps with its own
+//!   HAL and exports. No `wgpu` type crosses the version boundary, only Vulkan handles and fds.
 //! - On Windows, [`SharedSurface`] / [`Fence`] are the producer half of the Direct3D transport: a
 //!   Direct3D 12 producer renders into a shared texture and signals a fence, and hands GPUI the
 //!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
@@ -113,6 +117,23 @@ pub use linux::{
 };
 #[cfg(all(target_os = "linux", feature = "wgpu"))]
 pub use wgpu_dmabuf::WgpuSharedBuffer;
+
+/// The raw Vulkan half of a dma-buf export, for a producer on a **foreign** `wgpu` major.
+///
+/// [`WgpuSharedBuffer`] is the convenient form, but its `wgpu` types belong to the version this
+/// crate builds against. A producer on another `wgpu` major cannot name them, and yet the Vulkan
+/// handles underneath are the same objects: an `ash::Device` from `wgpu-hal`'s re-export is the
+/// `ash::Device` this crate uses. These items let such a producer allocate the exportable image on
+/// its own device, wrap the returned `vk::Image` with its own `wgpu` HAL, and export the memory —
+/// the same allocation [`WgpuSharedBuffer`] makes, without a `wgpu` type crossing the boundary.
+///
+/// The caller owns the returned image and memory: free them together on the device that allocated
+/// them, after the texture that wraps the image is gone.
+#[cfg(target_os = "linux")]
+pub mod vulkan_export {
+    pub use crate::linux::{ExportDevice, Tiling, allocate_export_image};
+    pub use gpui_engine::{DmaBufHandle, SurfaceFormatKind};
+}
 #[cfg(feature = "wgpu")]
 pub use wgpu_surface::WgpuSurface;
 #[cfg(target_os = "windows")]

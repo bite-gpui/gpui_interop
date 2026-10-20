@@ -545,7 +545,7 @@ impl Drop for GpuDevice {
 /// Only what `vkCreateImage`, the modifier query and the memory allocation read is here; the
 /// queue and command pool belong to [`GpuDevice`]'s submission helpers and are not part of an
 /// export.
-pub(crate) trait ExportDevice {
+pub trait ExportDevice {
     fn instance(&self) -> &ash::Instance;
     fn physical_device(&self) -> vk::PhysicalDevice;
     fn device(&self) -> &ash::Device;
@@ -615,7 +615,7 @@ impl ExportDevice for GpuDevice {
 /// `tiling` is honoured as [`SharedBuffer::new`] honours it: a modifier is picked only where the
 /// device's layout is the consumer's (`renderer_bound`), otherwise the buffer is linear with a
 /// warning.
-pub(crate) fn allocate_export_image<D: ExportDevice + ?Sized>(
+pub fn allocate_export_image<D: ExportDevice + ?Sized>(
     device: &D,
     width: u32,
     height: u32,

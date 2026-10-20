@@ -191,7 +191,7 @@ library features.
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
 | `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting. |
 | `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause, Speed, Palette, Reset view and Probe, and the viewport orbits/zooms. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
-| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, rendered offscreen and copied into a wgpu 29 texture on GPUI's device; the window itself is an ordinary GPUI Wayland/X11 window. Helio is pinned to a git revision, not crates.io. `--stats` prints the frame rate and copy timings; `--probe` checks the copied image. The dma-buf export (removing the CPU copy) is the next step. |
+| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, exported as a dma-buf and imported by GPUI's wgpu 29 renderer with `paint_surface` — no CPU copy. Two exportable images cycle, and a slot is reused only after GPUI signals the `eventfd` release it was handed, so drawing frame N+1 never races frame N. Helio is pinned to a git revision, not crates.io. Run it with `--release`: a debug build measures Helio's unoptimised graph and shaders. `--stats` prints the frame rate and the render/export timings; `--probe` reads the exported image back once. |
 
 ```sh
 cargo run -p gpui_interop --example interop_linux     --features example
@@ -199,7 +199,7 @@ cargo run -p gpui_interop --example interop_cube      --features example
 cargo run -p gpui_interop --example interop_cube_drag --features example
 cargo run -p interop_wgpu
 cargo run -p interop_bevy
-cargo run -p interop_helio
+cargo run --release -p interop_helio
 
 # The wgpu and Bevy demos also enumerate and select their adapter:
 cargo run -p interop_wgpu -- --list-gpus
@@ -208,7 +208,7 @@ cargo run -p interop_bevy -- --list-gpus
 cargo run -p interop_bevy -- --gpu 1 --stats
 cargo run -p interop_bevy -- --probe
 cargo run -p interop_bevy -- --transfer --stats
-cargo run -p interop_helio -- --stats --probe
+cargo run --release -p interop_helio -- --stats --probe
 
 # Raw producer throughput, one adapter at a time (no presentation):
 cargo run -p interop_wgpu -- --gpu 0 --bench 10
@@ -229,11 +229,22 @@ demos cannot drift while the producers stay independent.
 `interop_helio` is experimental and lives on the `helio-interop` branch. Helio and its default
 graphs are pinned to the git revision of `Helio_Standalone_Demo` because they are not on crates.io,
 and Helio's renderer is wgpu 30 while this workspace is wgpu 29. Cargo keeps both majors in one
-graph; no wgpu type crosses between them. The example creates Helio's own Vulkan device, renders
-into an offscreen wgpu 30 texture, and copies the frame on the CPU into a wgpu 29 texture for
-`paint_texture`. That copy is the scaffold's cost (30–46 ms/frame on an Intel HD 520), and the
-dma-buf export is the planned replacement. The window is still a normal GPUI window — Wayland in a
-Wayland session, X11 in an X11 one; the renderer is offscreen and ignores the session type.
+graph; no wgpu type crosses between them. Helio creates its own Vulkan device on the **same physical
+GPU as the window**, matched through `Adapter::gpu_id`, and its frame leaves as a dma-buf: the image
+is allocated by `gpui_interop`'s Vulkan exporter, wrapped into wgpu 30 with `texture_from_raw`, and
+imported by GPUI's wgpu 29 device. Only raw Vulkan handles and file descriptors cross the version
+boundary.
+
+Two details make that work without touching `gpui_wgpu`. The device is created through wgpu 30's
+HAL rather than `request_device`, so `VK_KHR_external_semaphore_fd` is added before
+`vkCreateDevice`; the renderer's own device already enables it together with
+`VK_EXT_image_drm_format_modifier`. And because Helio submits the frame internally (a clear, then
+the 39-pass graph), the acquire semaphore rides an empty submission after `render()` returns, which
+is ordered after every submission Helio made. On an Intel HD 520 at 677 × 686, a release build
+measures about 18 fps with 13–20 ms in Helio and 0.07–0.17 ms for the export; the frame interval is
+~50–60 ms, so the remaining gap is GPUI's presentation cadence, not the bridge. The window is still
+a normal GPUI window — Wayland in a Wayland session, X11 in an X11 one; Helio is offscreen and
+ignores the session type.
 
 `--bench` measures the producer: the wgpu render plus, on the dma-buf path, the export and fence,
 with the GPU waited on each frame. It does not present, so it is independent of vsync and the
