@@ -36,5 +36,7 @@ wgpu30 = { package = "wgpu", version = "30.0.0", features = [
 ] }
 helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "4356a855e33b691aac10621e712bd973d8c4b68b" }
 helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "4356a855e33b691aac10621e712bd973d8c4b68b" }
+# The one-pass micro graph: Helio's `SimpleCubePass`, used for the `--graph simple` baseline.
+helio-pass-simple-cube = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "4356a855e33b691aac10621e712bd973d8c4b68b" }
 glam = { version = "0.33", features = ["bytemuck"] }
 pollster = "0.4"

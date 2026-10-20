@@ -101,11 +101,12 @@ mod demo {
     use gpui_interop::{SurfaceEvent, SurfaceInput, SurfacePoint, attach, surface_input};
     use gpui_wgpu::WgpuRenderer;
     use helio::{
-        Camera, GpuLight, GpuMaterial, GroupMask, LightId, LightType, MaterialId, MeshId,
-        MeshUpload, Movability, ObjectDescriptor, ObjectId, PackedVertex, Renderer,
-        RendererBuilder, RendererConfig, SceneActor, SkyActor,
+        Camera, GpuLight, GpuMaterial, GraphRebuilder, GroupMask, LightId, LightType, MaterialId,
+        MeshId, MeshUpload, Movability, ObjectDescriptor, ObjectId, PackedVertex, RenderGraph,
+        Renderer, RendererBuilder, RendererConfig, SceneActor, SkyActor,
     };
-    use helio_default_graphs::build_default_graph_external;
+    use helio_default_graphs::{build_default_graph_external, build_forward_only_graph_external};
+    use helio_pass_simple_cube::SimpleCubePass;
     use interop_demo::{
         ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
         histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
@@ -153,6 +154,31 @@ mod demo {
         /// `None` keeps the scene's default: shadows on for the standalone scene, off for the
         /// field (Bevy's light has shadow maps disabled).
         shadows: Option<bool>,
+        graph: GraphKind,
+    }
+
+    /// Which render graph Helio runs.
+    ///
+    /// The default graph is the 39-pass standalone one. `Forward` is Helio's forward-mode graph:
+    /// fewer passes, but still its shadows, GI and fog. `Simple` is a single pass drawing one
+    /// debug cube — the micro baseline, comparable to `interop_wgpu`'s hand-written scene.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum GraphKind {
+        #[default]
+        Default,
+        Forward,
+        Simple,
+    }
+
+    fn parse_graph(value: &str) -> GraphKind {
+        match value {
+            "default" | "full" => GraphKind::Default,
+            "forward" => GraphKind::Forward,
+            "simple" | "cube" => GraphKind::Simple,
+            other => usage_error(&format!(
+                "--graph: {other:?} is not default, forward, or simple"
+            )),
+        }
     }
 
     /// Which scene to build.
@@ -189,6 +215,7 @@ mod demo {
             stats: false,
             scene: SceneKind::default(),
             shadows: None,
+            graph: GraphKind::default(),
         };
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -211,6 +238,12 @@ mod demo {
                         "off" | "false" => false,
                         other => usage_error(&format!("--shadows: {other:?} is not on or off")),
                     });
+                }
+                "--graph" => {
+                    let value = args.next().unwrap_or_else(|| {
+                        usage_error("--graph needs default, forward, or simple")
+                    });
+                    cli.graph = parse_graph(&value);
                 }
                 "--gpu" => {
                     let value = args
@@ -251,6 +284,7 @@ mod demo {
             "  --probe              read the exported image back once and print its centre pixel\n",
             "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear\n",
             "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
+            "  --graph <KIND>       default (39 passes), forward (fewer), simple (one cube)\n",
             "  -h, --help           show this help\n",
             "\n",
             "Helio's wgpu 30 frame leaves as a dma-buf and GPUI imports it on its own wgpu 29\n",
@@ -402,6 +436,7 @@ mod demo {
             probe: bool,
             scene: SceneKind,
             shadows: Option<bool>,
+            graph: GraphKind,
         ) -> anyhow::Result<Self> {
             let interop = attach(gpu.try_device::<WgpuRenderer>())
                 .map_err(|unavailable| anyhow::anyhow!("{unavailable:?}"))?;
@@ -442,10 +477,19 @@ mod demo {
             let (device, queue) = helio_device(adapter)?;
             let (device, queue) = (Arc::new(device), Arc::new(queue));
 
-            let mut renderer = RendererBuilder::new(RendererConfig::new(width, height, FORMAT))
-                .with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
+            let builder = RendererBuilder::new(RendererConfig::new(width, height, FORMAT));
+            let builder = match graph {
+                GraphKind::Default => builder.with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
                     build_default_graph_external(d, q, s, c, ds, cb, csb, None)
-                }))
+                })),
+                GraphKind::Forward => builder.with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
+                    build_forward_only_graph_external(d, q, s, c, ds, cb, csb, None)
+                })),
+                GraphKind::Simple => builder.with_graph(Box::new(|d, q, _s, c, _ds, _cb, _csb| {
+                    simple_graph(d, q, c)
+                })),
+            };
+            let mut renderer = builder
                 // Helio shares a device it did not create: no owned-device readbacks, no teardown.
                 .with_external_device()
                 .build(device.clone(), queue.clone(), width, height, FORMAT);
@@ -717,6 +761,31 @@ mod demo {
             );
             Ok(())
         }
+    }
+
+    /// The micro graph: one pass drawing `SimpleCubePass`'s debug cube.
+    ///
+    /// Helio's `build_simple_graph` creates the same pass but its rebuilder returns an unlocked
+    /// graph, so a resize (or the renderer's first rebuild) panics in `execute`. This version locks
+    /// the initial graph and every rebuild.
+    fn simple_graph(
+        device: &Arc<wgpu30::Device>,
+        queue: &Arc<wgpu30::Queue>,
+        config: RendererConfig,
+    ) -> RenderGraph {
+        let mut graph = RenderGraph::new_with_external_device(device, queue);
+        graph.add_pass(Box::new(SimpleCubePass::new(device, FORMAT)));
+        let rebuilder: GraphRebuilder = Arc::new(
+            move |device, queue, _scene, config, _debug_state, _camera, _cull| {
+                let mut graph = RenderGraph::new_with_external_device(device, queue);
+                graph.add_pass(Box::new(SimpleCubePass::new(device, FORMAT)));
+                graph.lock(config.internal_width(), config.internal_height());
+                graph
+            },
+        );
+        graph.set_graph_data(rebuilder);
+        graph.lock(config.internal_width(), config.internal_height());
+        graph
     }
 
     /// Create the wgpu 30 device with the one export extension wgpu-hal does not enable itself.
@@ -1526,6 +1595,7 @@ mod demo {
         stats: bool,
         scene_kind: SceneKind,
         shadows: Option<bool>,
+        graph: GraphKind,
         logged: Rc<RefCell<Instant>>,
     }
 
@@ -1536,6 +1606,7 @@ mod demo {
             stats: bool,
             scene: SceneKind,
             shadows: Option<bool>,
+            graph: GraphKind,
         ) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
             let metrics_panel = cx.new(|_| MetricsPanel {
@@ -1562,6 +1633,7 @@ mod demo {
                 stats,
                 scene_kind: scene,
                 shadows,
+                graph,
                 logged: Rc::new(RefCell::new(Instant::now())),
             }
         }
@@ -1609,6 +1681,7 @@ mod demo {
                     self.distance.clone(),
                     self.scene_kind,
                     self.shadows,
+                    self.graph,
                     self.probe,
                     self.stats,
                     self.logged.clone(),
@@ -1733,6 +1806,7 @@ mod demo {
         distance: Rc<Cell<f32>>,
         scene_kind: SceneKind,
         shadows: Option<bool>,
+        graph: GraphKind,
         probe: bool,
         stats: bool,
         logged: Rc<RefCell<Instant>>,
@@ -1751,7 +1825,7 @@ mod demo {
 
             let mut slot = scene.borrow_mut();
             if slot.is_none() && drawing_error.borrow().is_none() {
-                match HelioScene::build(gpu, width, height, probe, scene_kind, shadows) {
+                match HelioScene::build(gpu, width, height, probe, scene_kind, shadows, graph) {
                     Ok(built) => *slot = Some(built),
                     Err(build) => {
                         let message = format!("{build:#}");
@@ -1894,7 +1968,9 @@ mod demo {
                     ..Default::default()
                 },
                 move |_, cx| {
-                    cx.new(|cx| Demo::new(cx, cli.probe, cli.stats, cli.scene, cli.shadows))
+                    cx.new(|cx| {
+                        Demo::new(cx, cli.probe, cli.stats, cli.scene, cli.shadows, cli.graph)
+                    })
                 },
             )
             .expect("a window to composite into");

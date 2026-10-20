@@ -4729,6 +4729,7 @@ dependencies = [
  "gpui_wgpu",
  "helio",
  "helio-default-graphs",
+ "helio-pass-simple-cube",
  "interop_demo",
  "libc",
  "pollster 0.4.0",
