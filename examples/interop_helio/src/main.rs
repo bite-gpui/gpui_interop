@@ -85,6 +85,7 @@ mod demo {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -117,9 +118,10 @@ mod demo {
     const FORMAT: wgpu30::TextureFormat = wgpu30::TextureFormat::Rgba8UnormSrgb;
     /// The Vulkan form of `FORMAT`: `_SRGB`, the form a shader's linear output is stored in.
     const VK_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
-    /// How many exportable images the producer cycles: one in flight with GPUI while the next is
-    /// rendered. A release that never comes costs a timeout, not the frame loop.
-    const SLOTS: usize = 2;
+    /// How many exportable images the producer cycles: one presented, one GPUI may still be
+    /// sampling, and one free to render into. A release that never comes costs a timeout, not the
+    /// frame loop.
+    const SLOTS: usize = 3;
     /// How long a handed-out slot waits for the renderer's release before it is reclaimed.
     const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
     /// How long the producer waits for its own acquire fence before handing a frame over.
@@ -396,6 +398,10 @@ mod demo {
         device: Arc<wgpu30::Device>,
         /// The handle last handed to GPUI; re-presented while paused.
         presented: Option<DmaBufHandle>,
+        /// The slot `presented` belongs to. It is never chosen for rendering while it is the
+        /// presented image: GPUI may still be sampling a re-presentation even after the release
+        /// from the previous one has arrived.
+        presented_slot: Option<usize>,
         width: u32,
         height: u32,
         animation: Animation,
@@ -406,6 +412,9 @@ mod demo {
         frames: u64,
         dropped: u64,
         probe: bool,
+        /// `INTEROP_HELIO_DUMP=/path/frame.bmp` writes one rendered frame once, for diagnosing what
+        /// the producer actually drew rather than what the metrics say.
+        dump: Option<PathBuf>,
     }
 
     /// One exportable image, and the release the renderer signals when it has sampled it.
@@ -513,6 +522,7 @@ mod demo {
                 queue,
                 device,
                 presented: None,
+                presented_slot: None,
                 width,
                 height,
                 animation,
@@ -522,6 +532,7 @@ mod demo {
                 frames: 0,
                 dropped: 0,
                 probe,
+                dump: std::env::var_os("INTEROP_HELIO_DUMP").map(PathBuf::from),
             })
         }
 
@@ -535,6 +546,7 @@ mod demo {
             self.renderer.set_render_size(width, height);
             self.slots = slots(&self.device, width, height)?;
             self.presented = None;
+            self.presented_slot = None;
             self.width = width;
             self.height = height;
             Ok(())
@@ -620,7 +632,8 @@ mod demo {
             &mut self,
             camera: &Camera,
         ) -> anyhow::Result<Option<(Duration, Duration, Duration)>> {
-            let Some(index) = (0..self.slots.len()).find(|&index| self.slots[index].released())
+            let Some(index) = (0..self.slots.len())
+                .find(|&index| Some(index) != self.presented_slot && self.slots[index].released())
             else {
                 self.dropped += 1;
                 return Ok(None);
@@ -634,6 +647,11 @@ mod demo {
 
             if self.probe && self.frames + 1 == 60 {
                 self.probe_slot(index)?;
+            }
+            if self.frames + 1 == 30
+                && let Some(path) = self.dump.clone()
+            {
+                self.dump_slot(index, &path)?;
             }
 
             let export_start = Instant::now();
@@ -663,6 +681,7 @@ mod demo {
             slot.release = Some(release);
             slot.handed_at = Some(Instant::now());
             self.presented = Some(handle);
+            self.presented_slot = Some(index);
             self.frames += 1;
 
             Ok(Some((render, export, fence)))
@@ -678,7 +697,8 @@ mod demo {
 
         /// Read the exported image back once, to prove it is not blank. This is the only path that
         /// touches the CPU, and it is opt-in.
-        fn probe_slot(&self, index: usize) -> anyhow::Result<()> {
+        /// Copy the slot's image back to the CPU, tightly packed RGBA from the top row down.
+        fn read_slot(&self, index: usize) -> anyhow::Result<Vec<u8>> {
             let padded = padded_bytes_per_row(self.width);
             let buffer = readback_buffer(&self.device, self.width, self.height);
             let mut encoder =
@@ -742,7 +762,12 @@ mod demo {
             }
             drop(mapped);
             buffer.unmap();
+            Ok(pixels)
+        }
 
+        fn probe_slot(&self, index: usize) -> anyhow::Result<()> {
+            let pixels = self.read_slot(index)?;
+            let row = self.width as usize * 4;
             let centre_at = (self.height as usize / 2) * row + (self.width as usize / 2) * 4;
             let centre = &pixels[centre_at..centre_at + 4];
             let sum: u64 = pixels
@@ -758,6 +783,18 @@ mod demo {
                 self.height,
                 centre,
                 sum as f64 / samples.max(1) as f64,
+            );
+            Ok(())
+        }
+
+        fn dump_slot(&self, index: usize, path: &Path) -> anyhow::Result<()> {
+            let pixels = self.read_slot(index)?;
+            write_bmp(path, self.width, self.height, &pixels)?;
+            eprintln!(
+                "interop_helio: wrote {}x{} to {}",
+                self.width,
+                self.height,
+                path.display()
             );
             Ok(())
         }
@@ -908,23 +945,16 @@ mod demo {
             // drivers but a notoriously slow render target; a non-preferred tiled one can be slow
             // too. The graph's GPU tail is the fence wait, so this is the first thing to check when
             // the tail is much larger than the same scene on a wgpu-allocated texture.
-            static REPORTED: std::sync::Once = std::sync::Once::new();
-            REPORTED.call_once(|| {
-                let linear = handle.modifier == DmaBufHandle::LINEAR;
-                eprintln!(
-                    "interop_helio: export target {}x{}: modifier {:#018x}{}, stride {}{}",
-                    width,
-                    height,
-                    handle.modifier,
-                    if linear { " (LINEAR)" } else { "" },
-                    handle.planes[0].stride,
-                    if linear {
-                        " — rendering to a linear image is slow"
-                    } else {
-                        ""
-                    },
-                );
-            });
+            let linear = handle.modifier == DmaBufHandle::LINEAR;
+            eprintln!(
+                "interop_helio: export target {}x{}: modifier {:#018x}{}, offset {}, stride {}",
+                width,
+                height,
+                handle.modifier,
+                if linear { " (LINEAR)" } else { "" },
+                handle.planes[0].offset,
+                handle.planes[0].stride,
+            );
 
             // The acquire fence. A `SYNC_FD` export moves the signal into a `sync_file`, which is
             // exactly what `DmaBufHandle::acquire_fence` takes; the same semaphore is reused once
@@ -1166,6 +1196,40 @@ mod demo {
             usage: wgpu30::BufferUsages::COPY_DST | wgpu30::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         })
+    }
+
+    /// Write a tightly packed RGBA image as a 24-bit BMP, for looking at what the producer drew.
+    fn write_bmp(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+        let row = width as usize * 3;
+        let padded = (row + 3) & !3;
+        let image_size = padded * height as usize;
+        let file_size = 54 + image_size;
+        let mut out = Vec::with_capacity(file_size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(file_size as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(width as i32).to_le_bytes());
+        out.extend_from_slice(&(height as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(image_size as u32).to_le_bytes());
+        out.extend_from_slice(&2835i32.to_le_bytes());
+        out.extend_from_slice(&2835i32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        // BMP rows are bottom-up.
+        for y in (0..height as usize).rev() {
+            let start = y * width as usize * 4;
+            for x in 0..width as usize {
+                let index = start + x * 4;
+                out.extend_from_slice(&[rgba[index + 2], rgba[index + 1], rgba[index]]);
+            }
+            out.resize(out.len() + (padded - row), 0);
+        }
+        std::fs::write(path, out)
     }
 
     fn padded_bytes_per_row(width: u32) -> u32 {
