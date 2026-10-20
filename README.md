@@ -178,10 +178,11 @@ your application can fall back cleanly.
 
 ## Examples
 
-Five Linux examples show how to pass frames and input between an external renderer and GPUI. The
+Six Linux examples show how to pass frames and input between an external renderer and GPUI. The
 three small ones are `[[example]]` targets in the library crate and need its `example` feature. The
-two producer demos are separate crates, so `cargo run -p interop_wgpu` and `cargo run -p interop_bevy`
-build only the producer they name, and both enable the same library features.
+three producer demos are separate crates, so `cargo run -p interop_wgpu`, `cargo run -p interop_bevy`
+and `cargo run -p interop_helio` build only the producer they name; the first two share the same
+library features.
 
 | Example | Description |
 | --- | --- |
@@ -190,6 +191,7 @@ build only the producer they name, and both enable the same library features.
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
 | `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting. |
 | `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause, Speed, Palette, Reset view and Probe, and the viewport orbits/zooms. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
+| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, rendered offscreen and copied into a wgpu 29 texture on GPUI's device; the window itself is an ordinary GPUI Wayland/X11 window. Helio is pinned to a git revision, not crates.io. `--stats` prints the frame rate and copy timings; `--probe` checks the copied image. The dma-buf export (removing the CPU copy) is the next step. |
 
 ```sh
 cargo run -p gpui_interop --example interop_linux     --features example
@@ -197,6 +199,7 @@ cargo run -p gpui_interop --example interop_cube      --features example
 cargo run -p gpui_interop --example interop_cube_drag --features example
 cargo run -p interop_wgpu
 cargo run -p interop_bevy
+cargo run -p interop_helio
 
 # The wgpu and Bevy demos also enumerate and select their adapter:
 cargo run -p interop_wgpu -- --list-gpus
@@ -205,6 +208,7 @@ cargo run -p interop_bevy -- --list-gpus
 cargo run -p interop_bevy -- --gpu 1 --stats
 cargo run -p interop_bevy -- --probe
 cargo run -p interop_bevy -- --transfer --stats
+cargo run -p interop_helio -- --stats --probe
 
 # Raw producer throughput, one adapter at a time (no presentation):
 cargo run -p interop_wgpu -- --gpu 0 --bench 10
@@ -214,13 +218,22 @@ cargo run -p interop_bevy -- --gpu 1 --bench 10
 cargo run -p interop_bevy -- --gpu 1 --scene clear --bench 10
 ```
 
-The two producer demos are separate crates rather than `[[example]]` targets. Cargo unifies a
+The two core producer demos are separate crates rather than `[[example]]` targets. Cargo unifies a
 package's features across an invocation, so running one demo with its own feature set used to
 rebuild the library and every GPUI crate, and switching back rebuilt them again. With one crate per
 producer and the same `gpui_interop/example` feature in both, the library artifacts are shared and
 Bevy is only in `interop_bevy`'s graph. The chrome itself lives in `crates/interop_demo`: the
 palette, the three-column layout, the controls, the histogram and the error panel are shared, so the
-two demos cannot drift while the producers stay independent.
+demos cannot drift while the producers stay independent.
+
+`interop_helio` is experimental and lives on the `helio-interop` branch. Helio and its default
+graphs are pinned to the git revision of `Helio_Standalone_Demo` because they are not on crates.io,
+and Helio's renderer is wgpu 30 while this workspace is wgpu 29. Cargo keeps both majors in one
+graph; no wgpu type crosses between them. The example creates Helio's own Vulkan device, renders
+into an offscreen wgpu 30 texture, and copies the frame on the CPU into a wgpu 29 texture for
+`paint_texture`. That copy is the scaffold's cost (30–46 ms/frame on an Intel HD 520), and the
+dma-buf export is the planned replacement. The window is still a normal GPUI window — Wayland in a
+Wayland session, X11 in an X11 one; the renderer is offscreen and ignores the session type.
 
 `--bench` measures the producer: the wgpu render plus, on the dma-buf path, the export and fence,
 with the GPU waited on each frame. It does not present, so it is independent of vsync and the

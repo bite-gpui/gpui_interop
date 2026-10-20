@@ -5,6 +5,7 @@ members = [
     "crates/interop_demo",
     "examples/interop_wgpu",
     "examples/interop_bevy",
+    "examples/interop_helio",
 ]
 
 [workspace.package]
