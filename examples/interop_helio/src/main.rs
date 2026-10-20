@@ -80,7 +80,8 @@
 //!
 //! Drag to orbit the camera, scroll to zoom. Pause stops the clock but keeps
 //! the last frame on screen. `--stats` prints the frame rate and the render and
-//! export timings; `--probe` reads the exported image back once.
+//! export timings; `--profile` prints Helio's per-pass CPU/GPU timings once a
+//! second; `--probe` reads the exported image back once.
 //!
 //! # Build profile
 //!
@@ -188,6 +189,8 @@ mod demo {
         preference: Option<gpui::GpuPreference>,
         probe: bool,
         stats: bool,
+        /// Print Helio's per-pass CPU/GPU timings once a second.
+        profile: bool,
         scene: SceneKind,
         /// `None` keeps the scene's default: shadows on for the standalone scene, off for the
         /// field (Bevy's light has shadow maps disabled).
@@ -253,6 +256,7 @@ mod demo {
             preference: None,
             probe: false,
             stats: false,
+            profile: false,
             scene: SceneKind::default(),
             shadows: None,
             graph: GraphKind::default(),
@@ -263,6 +267,7 @@ mod demo {
                 "--list-gpus" => cli.list = true,
                 "--probe" => cli.probe = true,
                 "--stats" => cli.stats = true,
+                "--profile" => cli.profile = true,
                 "--scene" => {
                     let value = args
                         .next()
@@ -321,6 +326,7 @@ mod demo {
             "  --list-gpus          enumerate the adapters this process can render on, then exit\n",
             "  --gpu <INDEX>        select the window adapter at INDEX from --list-gpus (Helio follows it)\n",
             "  --stats              print the frame-rate and timing breakdown once a second\n",
+            "  --profile            print Helio's per-pass CPU and GPU timings once a second\n",
             "  --probe              read the exported image back once and print its centre pixel\n",
             "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear\n",
             "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
@@ -2006,6 +2012,7 @@ mod demo {
         displayed_at: Option<Instant>,
         probe: bool,
         stats: bool,
+        profile: bool,
         scene_kind: SceneKind,
         shadows: Option<bool>,
         graph: GraphKind,
@@ -2013,10 +2020,12 @@ mod demo {
     }
 
     impl Demo {
+        #[allow(clippy::too_many_arguments)]
         fn new(
             cx: &mut Context<Self>,
             probe: bool,
             stats: bool,
+            profile: bool,
             scene: SceneKind,
             shadows: Option<bool>,
             graph: GraphKind,
@@ -2047,6 +2056,7 @@ mod demo {
                 displayed_at: None,
                 probe,
                 stats,
+                profile,
                 scene_kind: scene,
                 shadows,
                 graph,
@@ -2112,6 +2122,7 @@ mod demo {
                     self.graph,
                     self.probe,
                     self.stats,
+                    self.profile,
                     self.logged.clone(),
                 ),
                 self.metrics_panel.clone().cached(metrics_panel_style()),
@@ -2180,6 +2191,7 @@ mod demo {
         graph: GraphKind,
         probe: bool,
         stats: bool,
+        profile: bool,
         logged: Rc<RefCell<Instant>>,
     ) -> AnyElement {
         let drawing_error = error.clone();
@@ -2268,25 +2280,56 @@ mod demo {
                 }
             }
 
-            if stats {
+            if stats || profile {
                 let now = Instant::now();
                 let mut last = logged.borrow_mut();
                 if now.duration_since(*last) >= Duration::from_secs(1) {
                     *last = now;
-                    let metrics = metrics.borrow();
-                    eprintln!(
-                        "interop_helio: window {} frames ({} dropped) — {:.1} fps, {:.2} ms \
-                         interval, helio {:.2} ms, export {:.2} ms, gpui {:.2} ms, {}x{}",
-                        metrics.frames,
-                        scene.dropped,
-                        metrics.fps,
-                        metrics.interval_ms,
-                        metrics.render_ms,
-                        metrics.export_ms,
-                        metrics.gpui_ms,
-                        scene.width,
-                        scene.height,
-                    );
+                    if stats {
+                        let metrics = metrics.borrow();
+                        eprintln!(
+                            "interop_helio: window {} frames ({} dropped) — {:.1} fps, {:.2} ms \
+                             interval, helio {:.2} ms, export {:.2} ms, gpui {:.2} ms, {}x{}",
+                            metrics.frames,
+                            scene.dropped,
+                            metrics.fps,
+                            metrics.interval_ms,
+                            metrics.render_ms,
+                            metrics.export_ms,
+                            metrics.gpui_ms,
+                            scene.width,
+                            scene.height,
+                        );
+                    }
+                    if profile {
+                        // Helio's graph records a CPU scope per pass and GPU timestamp queries
+                        // around each one, and publishes the result asynchronously.
+                        let snapshot = scene.renderer.timing_snapshot();
+                        if !snapshot.passes.is_empty() {
+                            eprintln!(
+                                "interop_helio: profile frame {} (gpu {:?}, lag {:?}) — cpu \
+                                 {:.2} ms, gpu {:.2} ms, readback drops {}, overflows {}",
+                                snapshot.cpu_frame_index,
+                                snapshot.gpu_availability,
+                                snapshot.gpu_lag_frames,
+                                snapshot.total_cpu_ms.unwrap_or(0.0),
+                                snapshot.total_gpu_ms.unwrap_or(0.0),
+                                snapshot.readback_drops,
+                                snapshot.query_overflows,
+                            );
+                            let ms = |value: Option<f32>| {
+                                value.map_or_else(|| "—".to_owned(), |value| format!("{value:.2}"))
+                            };
+                            for pass in &snapshot.passes {
+                                eprintln!(
+                                    "    {:<30} cpu {:>7} ms   gpu {:>7} ms",
+                                    pass.name,
+                                    ms(pass.cpu_ms),
+                                    ms(pass.gpu_ms),
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2377,6 +2420,7 @@ mod demo {
                             cx,
                             cli.probe,
                             cli.stats,
+                            cli.profile,
                             cli.scene,
                             cli.shadows,
                             cli.graph,
