@@ -7,10 +7,12 @@
 //!    the view ray from the camera uniform and intersects it with the floor
 //!    plane; there is no grid texture.
 //! 2. [`CadPass`] draws one chamfered, gold, metallic cube with Cook-Torrance
-//!    direct lighting and a small analytic studio environment for reflections,
-//!    then overlays its feature edges as CAD-style lines. The overlay is
-//!    depth-tested against the cube, so hidden edges are culled like a CAD
-//!    viewport's.
+//!    direct lighting and a small analytic studio environment for reflections.
+//!    Its twelve edges are flat chamfers and its eight corners are smooth
+//!    multi-sided blends, with the curvature carried by a barycentric normal
+//!    field rather than a bulge. It then overlays the cube's feature edges as
+//!    soft CAD-style highlights; the overlay is depth-tested against the cube,
+//!    so hidden edges are culled like a CAD viewport's.
 //!
 //! There is no shadow, GI, ambient-occlusion, SSR, atmosphere or post-process
 //! pass, and no per-frame CPU work beyond recording two draws: the mesh
@@ -46,14 +48,15 @@ struct CadVertex {
 
 /// One corner of an edge's screen-space quad.
 ///
-/// `edge_start` and `edge_end` are the same pair on all six vertices of the
-/// quad; `side` picks which side of the projected edge this corner is on.
+/// `previous` and `next` are the neighbouring points on the same polyline, so
+/// the vertex shader can miter the join instead of letting each segment's
+/// quad end square-on (which crosses its neighbour at sharp corners).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct EdgeVertex {
     position: [f32; 3],
-    edge_start: [f32; 3],
-    edge_end: [f32; 3],
+    previous: [f32; 3],
+    next: [f32; 3],
     side: f32,
 }
 
@@ -118,25 +121,28 @@ fn vec3_normalize(v: Point) -> Point {
     [v[0] / length, v[1] / length, v[2] / length]
 }
 
-/// Appends a triangle, flipping its winding if it would face away from `normal`.
-fn push_triangle(
+/// Appends a triangle whose vertices carry their own normals, flipping its
+/// winding if it would face away from `reference`.
+fn push_smooth_triangle(
     vertices: &mut Vec<CadVertex>,
     indices: &mut Vec<u32>,
-    mut corners: [Point; 3],
-    normal: Point,
+    mut points: [Point; 3],
+    mut normals: [Point; 3],
+    reference: Point,
 ) {
     let facing = vec3_dot(
         vec3_cross(
-            vec3_sub(corners[1], corners[0]),
-            vec3_sub(corners[2], corners[0]),
+            vec3_sub(points[1], points[0]),
+            vec3_sub(points[2], points[0]),
         ),
-        normal,
+        reference,
     );
     if facing < 0.0 {
-        corners.swap(1, 2);
+        points.swap(1, 2);
+        normals.swap(1, 2);
     }
     let base = vertices.len() as u32;
-    for position in corners {
+    for (position, normal) in points.into_iter().zip(normals) {
         vertices.push(CadVertex { position, normal });
     }
     indices.extend_from_slice(&[base, base + 1, base + 2]);
@@ -166,18 +172,19 @@ fn push_quad(
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// A chamfered box: each of the twelve edges is replaced by a flat 45-degree
-/// strip, and each of the eight corners by a triangle.
+/// A chamfered box with smooth vertex blends: the twelve edges are flat
+/// 45-degree strips on planes like `x + y = 2 * half - chamfer`, and the eight
+/// corners are flush patches whose normals blend smoothly from each strip's
+/// normal on the shared edges to the space diagonal in the middle.
 ///
-/// The original cube's six faces shrink to half-extent `half - chamfer`; the
-/// strips lie on planes like `x + y = 2 * half - chamfer` and the corner
-/// triangles on `x + y + z = 3 * half - 2 * chamfer`. Every facet gets its own
-/// flat normal, which is what makes the bevels read as crisp cuts rather than
-/// a rounded-over edge. 96 vertices, 132 indices, generated once.
+/// The blend is in the normal field rather than in a bulge, which is what the
+/// reference's CAD corner looks like: a multi-sided patch that distributes the
+/// shading across the corner instead of leaving the bevels to meet in a flat,
+/// pinched, creased triangle. Generated once, at construction.
 fn chamfered_cube(half: f32, chamfer: f32) -> (Vec<CadVertex>, Vec<u32>) {
     let face_half = half - chamfer;
-    let mut vertices = Vec::with_capacity(96);
-    let mut indices = Vec::with_capacity(132);
+    let mut vertices = Vec::with_capacity(4096);
+    let mut indices = Vec::with_capacity(6144);
 
     // Six flat faces. `u x v = normal`, so the table's order is already
     // counter-clockwise; `push_quad` checks instead of trusting that.
@@ -211,10 +218,9 @@ fn chamfered_cube(half: f32, chamfer: f32) -> (Vec<CadVertex>, Vec<u32>) {
         );
     }
 
-    // Twelve edge strips, one per pair of faces and sign combination. The
-    // strip's long axis is the third axis; its short axis is the face
-    // diagonal, and it reaches `chamfer / sqrt(2)` either side of the edge's
-    // midpoint.
+    // Twelve edge strips, one per pair of faces and sign combination. Each
+    // strip is flat; its ends are straight because the corner patch is flush
+    // with it.
     let axes: [Point; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let across_half = chamfer * std::f32::consts::FRAC_1_SQRT_2;
     for (i, j) in [(0usize, 1usize), (0, 2), (1, 2)] {
@@ -253,21 +259,107 @@ fn chamfered_cube(half: f32, chamfer: f32) -> (Vec<CadVertex>, Vec<u32>) {
         }
     }
 
-    // Eight corner triangles, each a corner of the original cube cut off by a
-    // plane whose normal is the space diagonal.
+    // Eight flat corner blend patches. Each sits flush with the three strips,
+    // so it does not bulge into a knob, and its normals come from one smooth
+    // field: every shared edge carries its strip's normal, the middle carries
+    // the space diagonal, and quadratic barycentric weights (`ab`, `bc`,
+    // `ca`) blend the three. A three-sector fan would leave creases along the
+    // sector borders -- the V-shaped shading artifact -- whereas this field is
+    // continuous across the whole patch except at its three corners, where two
+    // strips meet and a crease is correct.
+    const PATCH_RINGS: usize = 8;
     for sx in [-1.0_f32, 1.0] {
         for sy in [-1.0_f32, 1.0] {
             for sz in [-1.0_f32, 1.0] {
-                push_triangle(
-                    &mut vertices,
-                    &mut indices,
+                let corners = [
+                    [sx * half, sy * face_half, sz * face_half],
+                    [sx * face_half, sy * half, sz * face_half],
+                    [sx * face_half, sy * face_half, sz * half],
+                ];
+                // Normals of the three chamfer strips meeting at this corner;
+                // index 0 belongs to edge AB, 1 to BC and 2 to CA.
+                let strip_normals = [
+                    vec3_normalize([sx, sy, 0.0]),
+                    vec3_normalize([0.0, sy, sz]),
+                    vec3_normalize([sx, 0.0, sz]),
+                ];
+                let diagonal = vec3_normalize([sx, sy, sz]);
+
+                let position_at = |a: f32, b: f32, c: f32| {
                     [
-                        [sx * half, sy * face_half, sz * face_half],
-                        [sx * face_half, sy * half, sz * face_half],
-                        [sx * face_half, sy * face_half, sz * half],
-                    ],
-                    vec3_normalize([sx, sy, sz]),
-                );
+                        corners[0][0] * a + corners[1][0] * b + corners[2][0] * c,
+                        corners[0][1] * a + corners[1][1] * b + corners[2][1] * c,
+                        corners[0][2] * a + corners[1][2] * b + corners[2][2] * c,
+                    ]
+                };
+                let normal_at = |a: f32, b: f32, c: f32| {
+                    // Near an edge, use that edge's strip normal; by the middle
+                    // of the patch, use the space diagonal. Keeping the
+                    // transition narrow leaves the patch reading as a bright
+                    // CAD facet instead of a dark well that inherits the
+                    // vertical chamfer's shadow.
+                    let nearest = if a <= b && a <= c {
+                        strip_normals[1]
+                    } else if b <= c {
+                        strip_normals[2]
+                    } else {
+                        strip_normals[0]
+                    };
+                    let distance = a.min(b).min(c);
+                    let x = (distance / 0.10).clamp(0.0, 1.0);
+                    let blend = x * x * (3.0 - 2.0 * x);
+                    vec3_normalize([
+                        nearest[0] + (diagonal[0] - nearest[0]) * blend,
+                        nearest[1] + (diagonal[1] - nearest[1]) * blend,
+                        nearest[2] + (diagonal[2] - nearest[2]) * blend,
+                    ])
+                };
+
+                for ring in 0..PATCH_RINGS {
+                    let c0 = ring as f32 / PATCH_RINGS as f32;
+                    let c1 = (ring + 1) as f32 / PATCH_RINGS as f32;
+                    let columns = PATCH_RINGS - ring;
+                    for column in 0..columns {
+                        let b0 = column as f32 / PATCH_RINGS as f32;
+                        let b1 = (column + 1) as f32 / PATCH_RINGS as f32;
+                        let a0 = 1.0 - b0 - c0;
+                        let a1 = 1.0 - b1 - c0;
+                        let a2 = 1.0 - b0 - c1;
+                        push_smooth_triangle(
+                            &mut vertices,
+                            &mut indices,
+                            [
+                                position_at(a0, b0, c0),
+                                position_at(a1, b1, c0),
+                                position_at(a2, b0, c1),
+                            ],
+                            [
+                                normal_at(a0, b0, c0),
+                                normal_at(a1, b1, c0),
+                                normal_at(a2, b0, c1),
+                            ],
+                            diagonal,
+                        );
+                        if column + 1 < columns {
+                            let a3 = 1.0 - b1 - c1;
+                            push_smooth_triangle(
+                                &mut vertices,
+                                &mut indices,
+                                [
+                                    position_at(a1, b1, c0),
+                                    position_at(a3, b1, c1),
+                                    position_at(a2, b0, c1),
+                                ],
+                                [
+                                    normal_at(a1, b1, c0),
+                                    normal_at(a3, b1, c1),
+                                    normal_at(a2, b0, c1),
+                                ],
+                                diagonal,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -277,13 +369,12 @@ fn chamfered_cube(half: f32, chamfer: f32) -> (Vec<CadVertex>, Vec<u32>) {
 
 /// The feature edges of [`chamfered_cube`], expanded into screen-space quads.
 ///
-/// These are the boundaries between the six faces and the twelve chamfer
-/// strips, plus the boundaries between the strips and the eight corner
-/// triangles: the sharp edges a CAD viewport draws and lets you pick. The
-/// silhouette is made of these too, since every face's perimeter is included.
+/// The sharp edges form closed polylines: the six face perimeters and the
+/// eight corner-patch boundaries. Each polyline is expanded with mitered joins
+/// so a corner is one clean angle, not two overlapping quads.
 fn chamfered_cube_edges(half: f32, chamfer: f32) -> Vec<EdgeVertex> {
     let face_half = half - chamfer;
-    let mut segments: Vec<(Point, Point)> = Vec::with_capacity(48);
+    let mut loops: Vec<Vec<Point>> = Vec::with_capacity(14);
 
     let faces: [(Point, Point, Point); 6] = [
         ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
@@ -302,76 +393,54 @@ fn chamfered_cube_edges(half: f32, chamfer: f32) -> Vec<EdgeVertex> {
                 center[2] + u_axis[2] * u + v_axis[2] * v,
             ]
         };
-        let corners = [
+        loops.push(vec![
             corner(-face_half, -face_half),
             corner(face_half, -face_half),
             corner(face_half, face_half),
             corner(-face_half, face_half),
-        ];
-        for index in 0..4 {
-            segments.push((corners[index], corners[(index + 1) % 4]));
-        }
+        ]);
     }
 
-    let axes: [Point; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    let across_half = chamfer * std::f32::consts::FRAC_1_SQRT_2;
-    for (i, j) in [(0usize, 1usize), (0, 2), (1, 2)] {
-        let k = 3 - i - j;
-        for si in [-1.0_f32, 1.0] {
-            for sj in [-1.0_f32, 1.0] {
-                let normal = vec3_normalize([
-                    axes[i][0] * si + axes[j][0] * sj,
-                    axes[i][1] * si + axes[j][1] * sj,
-                    axes[i][2] * si + axes[j][2] * sj,
+    for sx in [-1.0_f32, 1.0] {
+        for sy in [-1.0_f32, 1.0] {
+            for sz in [-1.0_f32, 1.0] {
+                loops.push(vec![
+                    [sx * half, sy * face_half, sz * face_half],
+                    [sx * face_half, sy * half, sz * face_half],
+                    [sx * face_half, sy * face_half, sz * half],
                 ]);
-                let along = axes[k];
-                let across = vec3_cross(normal, along);
-                let mut center = [0.0_f32; 3];
-                center[i] = si * (half + face_half) * 0.5;
-                center[j] = sj * (half + face_half) * 0.5;
-                // Each strip ends on a corner triangle; that end is the
-                // straight edge between its two long edges.
-                for end in [-1.0_f32, 1.0] {
-                    let base = [
-                        center[0] + along[0] * end * face_half,
-                        center[1] + along[1] * end * face_half,
-                        center[2] + along[2] * end * face_half,
-                    ];
-                    segments.push((
-                        [
-                            base[0] - across[0] * across_half,
-                            base[1] - across[1] * across_half,
-                            base[2] - across[2] * across_half,
-                        ],
-                        [
-                            base[0] + across[0] * across_half,
-                            base[1] + across[1] * across_half,
-                            base[2] + across[2] * across_half,
-                        ],
-                    ));
-                }
             }
         }
     }
 
-    // Two triangles per segment. Culling is off for the line pipeline, so the
-    // winding only has to be consistent enough to cover the quad.
-    let mut vertices = Vec::with_capacity(segments.len() * 6);
-    for (start, end) in segments {
-        for (position, side) in [
-            (start, -1.0),
-            (start, 1.0),
-            (end, -1.0),
-            (end, -1.0),
-            (start, 1.0),
-            (end, 1.0),
-        ] {
-            vertices.push(EdgeVertex {
-                position,
-                edge_start: start,
-                edge_end: end,
-                side,
-            });
+    let mut vertices = Vec::new();
+    for points in loops {
+        let count = points.len();
+        for index in 0..count {
+            let next_index = (index + 1) % count;
+            let previous_index = (index + count - 1) % count;
+            let start = points[index];
+            let end = points[next_index];
+            let start_previous = points[previous_index];
+            let end_next = points[(next_index + 1) % count];
+
+            // Two triangles per segment. Culling is off in the line pipeline,
+            // so the winding only has to cover the quad.
+            for (position, previous, next, side) in [
+                (start, start_previous, end, -1.0),
+                (start, start_previous, end, 1.0),
+                (end, start, end_next, -1.0),
+                (end, start, end_next, -1.0),
+                (start, start_previous, end, 1.0),
+                (end, start, end_next, 1.0),
+            ] {
+                vertices.push(EdgeVertex {
+                    position,
+                    previous,
+                    next,
+                    side,
+                });
+            }
         }
     }
     vertices
@@ -383,7 +452,7 @@ fn chamfered_cube_edges(half: f32, chamfer: f32) -> Vec<EdgeVertex> {
 const SAMPLES: u32 = 4;
 
 /// Half the edge-line width in pixels; the quads are expanded both sides.
-const EDGE_HALF_WIDTH: f32 = 1.0;
+const EDGE_HALF_WIDTH: f32 = 0.75;
 
 /// The shared multisampled colour target.
 ///
@@ -817,7 +886,21 @@ impl CadPass {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu30::ColorTargetState {
                     format: surface_format,
-                    blend: None,
+                    // Additive: the line brightens whatever it crosses, so on a
+                    // lit chamfer it reads as a soft specular glint and on a
+                    // dark edge as a warm, faint line -- not a white wireframe.
+                    blend: Some(wgpu30::BlendState {
+                        color: wgpu30::BlendComponent {
+                            src_factor: wgpu30::BlendFactor::One,
+                            dst_factor: wgpu30::BlendFactor::One,
+                            operation: wgpu30::BlendOperation::Add,
+                        },
+                        alpha: wgpu30::BlendComponent {
+                            src_factor: wgpu30::BlendFactor::One,
+                            dst_factor: wgpu30::BlendFactor::One,
+                            operation: wgpu30::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu30::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu30::PipelineCompilationOptions::default(),

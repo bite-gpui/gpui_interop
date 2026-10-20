@@ -23,36 +23,40 @@ struct Camera {
 @group(0) @binding(1) var<uniform> viewport: vec4<f32>;
 
 struct VertexInput {
-    @location(0) position:   vec3<f32>,
-    @location(1) edge_start: vec3<f32>,
-    @location(2) edge_end:   vec3<f32>,
-    @location(3) side:       f32,
+    @location(0) position: vec3<f32>,
+    @location(1) previous: vec3<f32>,
+    @location(2) next:     vec3<f32>,
+    @location(3) side:     f32,
 };
+
+fn screen_normal(size: vec2<f32>, start: vec4<f32>, end: vec4<f32>) -> vec2<f32> {
+    let delta = (end.xy / end.w - start.xy / start.w) * size;
+    return normalize(vec2<f32>(-delta.y, delta.x) + vec2<f32>(1e-6, 1e-6));
+}
 
 @vertex
 fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {
     let size = max(viewport.xy, vec2<f32>(1.0));
-    let clip_start = cameras[0].view_proj * vec4<f32>(in.edge_start, 1.0);
-    let clip_end = cameras[0].view_proj * vec4<f32>(in.edge_end, 1.0);
-    let delta = (clip_end.xy / clip_end.w - clip_start.xy / clip_start.w) * size;
-
-    var normal = vec2<f32>(-delta.y, delta.x);
-    let length_squared = dot(normal, normal);
-    normal = select(
-        vec2<f32>(1.0, 0.0),
-        normal / sqrt(length_squared),
-        length_squared > 1e-12,
-    );
-
     let clip = cameras[0].view_proj * vec4<f32>(in.position, 1.0);
-    // 2 / size converts pixels to NDC; multiplying by w keeps the width
-    // constant after the perspective divide.
-    let offset = normal * (2.0 * viewport.z / size) * clip.w * in.side;
+    let clip_previous = cameras[0].view_proj * vec4<f32>(in.previous, 1.0);
+    let clip_next = cameras[0].view_proj * vec4<f32>(in.next, 1.0);
+
+    let incoming = screen_normal(size, clip_previous, clip);
+    let outgoing = screen_normal(size, clip, clip_next);
+    let miter = incoming + outgoing;
+    let miter_length = length(miter);
+    let corner = miter_length > 1e-4;
+    let direction = select(outgoing, miter / max(miter_length, 1e-4), corner);
+    // 1 / cos(half the turn) holds the width around the corner; clamping keeps
+    // a very sharp vertex from growing an unbounded spike.
+    let scale = select(1.0, 1.0 / max(dot(direction, incoming), 0.34), corner);
+
+    let offset = direction * (2.0 * viewport.z / size) * clip.w * in.side * scale;
     return vec4<f32>(clip.xy + offset, clip.z, clip.w);
 }
 
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
     // Linear; the sRGB target encodes it into a pale warm line.
-    return vec4<f32>(1.0, 0.90, 0.65, 1.0);
+    return vec4<f32>(0.55, 0.38, 0.10, 1.0);
 }
