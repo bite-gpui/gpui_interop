@@ -87,7 +87,8 @@
 //!
 //! `--scene cad` (or `--graph cad`) swaps in a graph of two custom passes from
 //! `cad.rs`: a full-screen grid backdrop and one chamfered, gold, metallic cube
-//! lit by a single Cook-Torrance fragment shader. It uses no SceneDB rows and
+//! lit by a single Cook-Torrance fragment shader, with its feature edges drawn
+//! as screen-space quads so they stay visible (and pickable) at any zoom. It uses no SceneDB rows and
 //! none of the engine's shadow, GI, SSR, atmosphere or post-process passes, and
 //! every buffer it draws from is fixed at construction — so a frame adds two
 //! draws to the camera update Helio already makes.
@@ -190,9 +191,9 @@ mod demo {
     const TARGET: Vec3 = Vec3::new(0.0, 2.0, 0.0);
     /// The CAD scene's view: the cube is centred on the origin and the camera is close enough
     /// that it fills the viewport, looking down at the top face.
-    const CAD_YAW: f32 = 0.62;
-    const CAD_PITCH: f32 = 0.50;
-    const CAD_DISTANCE: f32 = 5.3;
+    const CAD_YAW: f32 = std::f32::consts::FRAC_PI_4;
+    const CAD_PITCH: f32 = 0.72;
+    const CAD_DISTANCE: f32 = 6.5;
 
     /// The orbit state a scene starts at, and what Reset view returns to.
     fn default_view(scene: SceneKind) -> (f32, f32, f32) {

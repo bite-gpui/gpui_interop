@@ -102,13 +102,11 @@ fn direct_light(
     return (diffuse + specular) * light_color * light.w * n_dot_l;
 }
 
-/// A dim studio with three softboxes.
-///
-/// Both visible side facets mirror the view downwards, so a uniform lower
-/// hemisphere renders them flat. Instead the walls are dark, a warm/cool floor
-/// bounce splits them by azimuth, and each facet mirrors directly into its own
-/// bright panel. The panel's falloff across a facet is the gradient that reads
-/// as brushed metal; without it the same shading looks like painted plastic.
+/// A dim studio built around the reference render: a bright warm bounce where
+/// the left facet's mirror ray lands, a much darker cool one on the right, and
+/// narrow panels for the two top chamfers. The gaps between them are what give
+/// the chamfers their dark bands; a uniform environment washes them out and is
+/// what made the first version look soft.
 fn environment(direction: vec3<f32>) -> vec3<f32> {
     let up = clamp(direction.y, -1.0, 1.0);
     let azimuth = normalize(direction.xz + vec2<f32>(1e-5));
@@ -116,29 +114,34 @@ fn environment(direction: vec3<f32>) -> vec3<f32> {
     // Dim studio walls.
     var color = vec3<f32>(0.050, 0.052, 0.060);
 
-    // Floor bounce, warmer where the left facet looks and cooler on the right.
-    let below = 1.0 - smoothstep(-0.05, 0.15, up);
-    let warm = pow(max(dot(azimuth, vec2<f32>(-0.7, 0.7)), 0.0), 2.0);
-    let cool = pow(max(dot(azimuth, vec2<f32>(0.4, -0.9)), 0.0), 3.0);
-    color += below * (vec3<f32>(0.20, 0.15, 0.07) * warm + vec3<f32>(0.06, 0.07, 0.09) * cool);
+    // Floor bounce: bright to the front-left, dim to the front-right, dark in
+    // the gap between them (where the front vertical chamfer looks).
+    let below = 1.0 - smoothstep(-0.15, 0.10, up);
+    let height = mix(0.55, 1.0, smoothstep(-0.9, 0.05, up));
+    let warm = pow(max(dot(azimuth, vec2<f32>(-0.7, 0.7)), 0.0), 3.0);
+    let cool = pow(max(dot(azimuth, vec2<f32>(0.2, -0.98)), 0.0), 5.0);
+    color += below
+        * height
+        * (vec3<f32>(0.55, 0.45, 0.20) * warm + vec3<f32>(0.16, 0.17, 0.19) * cool);
 
     // A cool sky above the horizon.
-    color = mix(color, vec3<f32>(0.26, 0.28, 0.30), smoothstep(0.0, 0.7, up));
+    color = mix(color, vec3<f32>(0.26, 0.28, 0.31), smoothstep(0.0, 0.7, up));
 
-    // The softboxes: front-left, right and behind. Each side facet's mirror
-    // ray lands almost exactly on one of them.
-    let left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.60, -0.52, 0.60))), 0.0), 12.0);
-    color += vec3<f32>(0.60, 0.54, 0.41) * left_box;
-    let right_box = pow(max(dot(direction, normalize(vec3<f32>(0.36, -0.50, -0.79))), 0.0), 14.0);
-    color += vec3<f32>(0.34, 0.34, 0.30) * right_box;
+    // The softboxes: front-left, right, behind, and one over each top chamfer.
+    let left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.57, -0.71, 0.39))), 0.0), 10.0);
+    color += vec3<f32>(0.45, 0.38, 0.22) * left_box;
+    let right_box = pow(max(dot(direction, normalize(vec3<f32>(0.40, -0.73, -0.59))), 0.0), 12.0);
+    color += vec3<f32>(0.30, 0.26, 0.14) * right_box;
     let top_box = pow(max(dot(direction, normalize(vec3<f32>(-0.52, 0.30, -0.80))), 0.0), 10.0);
-    color += vec3<f32>(0.80, 0.68, 0.40) * top_box;
-
-    // A fill in the gap between the two floor bounces. The front vertical
-    // chamfer's mirror ray lands exactly there; without this it renders as a
-    // dark crease, which reads as a crack rather than a bevel.
-    let front_fill = pow(max(dot(direction, normalize(vec3<f32>(0.68, -0.55, 0.45))), 0.0), 6.0);
-    color += vec3<f32>(0.45, 0.40, 0.30) * front_fill;
+    color += vec3<f32>(0.45, 0.40, 0.24) * top_box;
+    // Narrow, bright strip lights across each top chamfer. These are the edge
+    // highlights: the 45-degree facets mirror them along their whole length,
+    // while the flat faces mirror the much dimmer sky and floor.
+    // The mirror directions of the two top chamfers at this camera angle.
+    let top_left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.66, 0.46, 0.62))), 0.0), 16.0);
+    color += vec3<f32>(3.50, 3.05, 1.70) * top_left_box;
+    let top_right_box = pow(max(dot(direction, normalize(vec3<f32>(0.61, 0.46, -0.65))), 0.0), 16.0);
+    color += vec3<f32>(2.20, 1.95, 1.10) * top_right_box;
 
     return color;
 }
@@ -175,7 +178,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n_dot_v = max(dot(n, v), 0.0);
     let fresnel = f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(1.0 - n_dot_v, 5.0);
     let studio = environment(reflected);
-    color += studio * fresnel * mix(1.0, 0.55, roughness);
+    // A broad left/right and up/down bias in the studio, plus cheap contact
+    // occlusion at the base. Without these, wide flat facets lit by smooth
+    // panels read as flat colour fields and the cube looks soft.
+    let bias = 1.0 + 0.55 * (-reflected.x) + 0.15 * reflected.y;
+    let ao = mix(0.72, 1.0, smoothstep(-1.15, 0.15, in.world_position.y));
+    color += studio * fresnel * mix(1.0, 0.55, roughness) * bias * ao;
 
     // A little floor bounce, for dielectric parts only.
     color += albedo * 0.04 * studio;
