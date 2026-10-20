@@ -191,7 +191,7 @@ library features.
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
 | `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting. |
 | `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause, Speed, Palette, Reset view and Probe, and the viewport orbits/zooms. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
-| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, exported as a dma-buf and imported by GPUI's wgpu 29 renderer with `paint_surface` — no CPU copy. Two exportable images cycle, and a slot is reused only after GPUI signals the `eventfd` release it was handed, so drawing frame N+1 never races frame N. Helio is pinned to a git revision, not crates.io. Run it with `--release`: a debug build measures Helio's unoptimised graph and shaders. `--stats` prints the frame rate and the render/export timings; `--probe` reads the exported image back once. |
+| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, exported as a dma-buf and imported by GPUI's wgpu 29 renderer with `paint_surface` — no CPU copy. Two exportable images cycle, and a slot is reused only after GPUI signals the `eventfd` release it was handed, so drawing frame N+1 never races frame N. Helio is pinned to a git revision, not crates.io. `--scene full\|field\|clear` switches between the standalone scene, `interop_bevy`'s 49-cube field and an empty graph; `--shadows on\|off` overrides the scene's shadow maps. Run it with `--release`: a debug build measures Helio's unoptimised graph and shaders. `--stats` prints the frame-rate and timing breakdown; `--probe` reads the exported image back once. |
 
 ```sh
 cargo run -p gpui_interop --example interop_linux     --features example
@@ -209,6 +209,8 @@ cargo run -p interop_bevy -- --gpu 1 --stats
 cargo run -p interop_bevy -- --probe
 cargo run -p interop_bevy -- --transfer --stats
 cargo run --release -p interop_helio -- --stats --probe
+cargo run --release -p interop_helio -- --scene field --stats
+cargo run --release -p interop_helio -- --scene full --shadows off --stats
 
 # Raw producer throughput, one adapter at a time (no presentation):
 cargo run -p interop_wgpu -- --gpu 0 --bench 10
@@ -247,6 +249,15 @@ ms exporting the fence, 25–50 ms waiting for the GPU to finish the graph, and 
 layout/paint/pacing. The frame interval is their sum (45–80 ms under load). The Helio figure is CPU
 time: `Renderer::render` records and submits the graph and returns, so the fence wait is the GPU half
 of the same frame, not duplicate work. The number varies with GPU load and thermals.
+
+The scene matters far more than the bridge. At the same 677 × 686, release, on the NVIDIA 930M:
+`--scene clear` presents at 60 fps (fence ~6 ms), `--scene field` at ~40 fps (fence ~11 ms),
+`--scene full` at ~18 fps (fence ~43 ms), and `--scene full --shadows off` at ~31 fps (fence
+~21 ms). The standalone scene's four point lights cast shadows by default; the 49-cube field matches
+`interop_bevy`, whose directional light deliberately has shadow maps disabled. The rest of the full
+scene's tail is its sky, reflection, GI and fog content. Intel shows the same ordering: full ~15–21
+fps, full without shadows ~36 fps, field ~43 fps. The bridge itself adds 2–4 ms of CPU and ~0.1 ms
+of export in every case.
 
 The renderer polls a dma-buf's acquire fence for only 16 ms and drops the surface if it has not
 signalled, so the example waits for the fence itself before the hand-off. The wait is the read-back

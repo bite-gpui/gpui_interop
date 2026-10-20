@@ -90,7 +90,7 @@ mod demo {
     use std::time::{Duration, Instant};
 
     use ash::vk;
-    use glam::{Mat4, Quat, Vec3};
+    use glam::{EulerRot, Mat4, Quat, Vec3};
     use gpui::{
         AnyElement, App, Bounds, Context, Entity, IntoElement, Render, ScrollDelta, Window,
         WindowBounds, WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
@@ -139,12 +139,46 @@ mod demo {
     const DEFAULT_PITCH: f32 = 0.32;
     const DEFAULT_DISTANCE: f32 = 11.5;
     const TARGET: Vec3 = Vec3::new(0.0, 2.0, 0.0);
+    /// `interop_bevy`'s field: 7 × 7 cubes of 1.0 at 1.75 spacing.
+    const GRID: usize = 7;
+    const SPACING: f32 = 1.75;
+    const CUBE: f32 = 1.0;
 
     struct Cli {
         list: bool,
         preference: Option<gpui::GpuPreference>,
         probe: bool,
         stats: bool,
+        scene: SceneKind,
+        /// `None` keeps the scene's default: shadows on for the standalone scene, off for the
+        /// field (Bevy's light has shadow maps disabled).
+        shadows: Option<bool>,
+    }
+
+    /// Which scene to build.
+    ///
+    /// `Field` is `interop_bevy`'s scene — a 7 × 7 field of cubes, one directional light, no floor
+    /// or sky — so the two producers can be compared on the same content. `Clear` is the control:
+    /// the same render graph with no actors, which separates the graph's own cost from the scene.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum SceneKind {
+        /// The `Helio_Standalone_Demo` scene: sky, reflective floor, columns, spheres, four moving
+        /// point lights and a crystal spinner.
+        #[default]
+        Full,
+        /// `interop_bevy`'s 7 × 7 field of cubes.
+        Field,
+        /// No actors: the graph's own per-frame cost.
+        Clear,
+    }
+
+    fn parse_scene(value: &str) -> SceneKind {
+        match value {
+            "full" | "standalone" => SceneKind::Full,
+            "field" | "bevy" | "ember" => SceneKind::Field,
+            "clear" => SceneKind::Clear,
+            other => usage_error(&format!("--scene: {other:?} is not full, field, or clear")),
+        }
     }
 
     fn parse_args() -> Cli {
@@ -153,6 +187,8 @@ mod demo {
             preference: None,
             probe: false,
             stats: false,
+            scene: SceneKind::default(),
+            shadows: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -160,6 +196,22 @@ mod demo {
                 "--list-gpus" => cli.list = true,
                 "--probe" => cli.probe = true,
                 "--stats" => cli.stats = true,
+                "--scene" => {
+                    let value = args
+                        .next()
+                        .unwrap_or_else(|| usage_error("--scene needs full, field, or clear"));
+                    cli.scene = parse_scene(&value);
+                }
+                "--shadows" => {
+                    let value = args
+                        .next()
+                        .unwrap_or_else(|| usage_error("--shadows needs on or off"));
+                    cli.shadows = Some(match value.as_str() {
+                        "on" | "true" => true,
+                        "off" | "false" => false,
+                        other => usage_error(&format!("--shadows: {other:?} is not on or off")),
+                    });
+                }
                 "--gpu" => {
                     let value = args
                         .next()
@@ -195,12 +247,14 @@ mod demo {
             "\n",
             "  --list-gpus          enumerate the adapters this process can render on, then exit\n",
             "  --gpu <INDEX>        select the window adapter at INDEX from --list-gpus (Helio follows it)\n",
-            "  --stats              print the frame rate and the copy timings once a second\n",
-            "  --probe              print the copied image's centre pixel and mean once\n",
+            "  --stats              print the frame-rate and timing breakdown once a second\n",
+            "  --probe              read the exported image back once and print its centre pixel\n",
+            "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear\n",
+            "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
             "  -h, --help           show this help\n",
             "\n",
-            "The first scaffold copies Helio's wgpu 30 frame to GPUI's wgpu 29 texture on the CPU;\n",
-            "the dma-buf export is the next step.",
+            "Helio's wgpu 30 frame leaves as a dma-buf and GPUI imports it on its own wgpu 29\n",
+            "device; no pixels cross the CPU. Run with --release for meaningful timings.",
         ));
     }
 
@@ -284,6 +338,19 @@ mod demo {
         }
     }
 
+    /// What moves each frame, per scene.
+    enum Animation {
+        Full {
+            spinner: ObjectId,
+            lights: [LightId; 4],
+            shadow_index: u32,
+        },
+        Field {
+            cubes: Vec<ObjectId>,
+        },
+        Clear,
+    }
+
     /// The Helio producer and its ring of exportable images.
     ///
     /// Declaration order is load-bearing: the slots own the raw images and their drop callbacks, so
@@ -297,8 +364,9 @@ mod demo {
         presented: Option<DmaBufHandle>,
         width: u32,
         height: u32,
-        spinner: ObjectId,
-        lights: [LightId; 4],
+        animation: Animation,
+        /// What the orbit camera looks at; the field looks at the origin.
+        target: Vec3,
         started: Instant,
         adapter: String,
         frames: u64,
@@ -332,6 +400,8 @@ mod demo {
             width: u32,
             height: u32,
             probe: bool,
+            scene: SceneKind,
+            shadows: Option<bool>,
         ) -> anyhow::Result<Self> {
             let interop = attach(gpu.try_device::<WgpuRenderer>())
                 .map_err(|unavailable| anyhow::anyhow!("{unavailable:?}"))?;
@@ -380,7 +450,17 @@ mod demo {
                 .with_external_device()
                 .build(device.clone(), queue.clone(), width, height, FORMAT);
 
-            let (spinner, lights) = populate(&mut renderer);
+            let (animation, target) = match scene {
+                SceneKind::Full => (
+                    populate_full(&mut renderer, shadows.unwrap_or(true)),
+                    TARGET,
+                ),
+                SceneKind::Field => (
+                    populate_field(&mut renderer, shadows.unwrap_or(false)),
+                    Vec3::ZERO,
+                ),
+                SceneKind::Clear => (Animation::Clear, Vec3::ZERO),
+            };
             let slots = slots(&device, width, height)?;
 
             Ok(Self {
@@ -391,8 +471,8 @@ mod demo {
                 presented: None,
                 width,
                 height,
-                spinner,
-                lights,
+                animation,
+                target,
                 started: Instant::now(),
                 adapter: info.name,
                 frames: 0,
@@ -417,7 +497,7 @@ mod demo {
         }
 
         fn camera(&self, yaw: f32, pitch: f32, distance: f32) -> Camera {
-            let eye = TARGET
+            let eye = self.target
                 + Vec3::new(
                     distance * pitch.cos() * yaw.sin(),
                     distance * pitch.sin(),
@@ -425,7 +505,7 @@ mod demo {
                 );
             Camera::perspective_look_at(
                 eye,
-                TARGET,
+                self.target,
                 Vec3::Y,
                 std::f32::consts::FRAC_PI_4,
                 self.width as f32 / self.height as f32,
@@ -435,31 +515,58 @@ mod demo {
         }
 
         fn animate(&mut self, elapsed: f32) {
-            let rot = Quat::from_rotation_y(elapsed * 0.8)
-                * Quat::from_rotation_x((elapsed * 0.5).sin() * 0.3);
-            let _ = self.renderer.scene_mut().update_object_transform(
-                self.spinner,
-                Mat4::from_rotation_translation(rot, Vec3::new(0.0, 2.5, 0.0)),
-            );
+            match &self.animation {
+                Animation::Full {
+                    spinner,
+                    lights,
+                    shadow_index,
+                } => {
+                    let rot = Quat::from_rotation_y(elapsed * 0.8)
+                        * Quat::from_rotation_x((elapsed * 0.5).sin() * 0.3);
+                    let _ = self.renderer.scene_mut().update_object_transform(
+                        *spinner,
+                        Mat4::from_rotation_translation(rot, Vec3::new(0.0, 2.5, 0.0)),
+                    );
 
-            let colors = [
-                [1.0, 0.3, 0.3],
-                [0.3, 1.0, 0.3],
-                [0.3, 0.5, 1.0],
-                [1.0, 0.8, 0.2],
-            ];
-            for (i, &light) in self.lights.iter().enumerate() {
-                let angle = elapsed * 0.6 + i as f32 * std::f32::consts::FRAC_PI_2;
-                let (x, z) = (angle.cos() * 4.0, angle.sin() * 4.0);
-                let _ = self.renderer.scene_mut().update_light(
-                    light,
-                    pt_light(
-                        [x, 5.0 + (elapsed * 1.2 + i as f32).sin() * 0.5, z],
-                        colors[i],
-                        10.0,
-                        10.0,
-                    ),
-                );
+                    let colors = [
+                        [1.0, 0.3, 0.3],
+                        [0.3, 1.0, 0.3],
+                        [0.3, 0.5, 1.0],
+                        [1.0, 0.8, 0.2],
+                    ];
+                    for (i, &light) in lights.iter().enumerate() {
+                        let angle = elapsed * 0.6 + i as f32 * std::f32::consts::FRAC_PI_2;
+                        let (x, z) = (angle.cos() * 4.0, angle.sin() * 4.0);
+                        let _ = self.renderer.scene_mut().update_light(
+                            light,
+                            pt_light(
+                                [x, 5.0 + (elapsed * 1.2 + i as f32).sin() * 0.5, z],
+                                colors[i],
+                                10.0,
+                                10.0,
+                                *shadow_index,
+                            ),
+                        );
+                    }
+                }
+                Animation::Field { cubes } => {
+                    let half = (GRID - 1) as f32 / 2.0;
+                    for (index, &cube) in cubes.iter().enumerate() {
+                        let (x, y) = (index % GRID, index / GRID);
+                        let (fx, fy) = (x as f32 - half, y as f32 - half);
+                        let phase = elapsed * 1.25 + fx * 0.42 + fy * 0.31;
+                        let transform = Mat4::from_scale_rotation_translation(
+                            Vec3::splat(0.40 + 0.05 * (phase * 0.9).sin()),
+                            Quat::from_euler(EulerRot::YXZ, phase * 0.62, phase * 0.44, 0.0),
+                            Vec3::new(fx * SPACING, fy * SPACING, phase.sin() * 0.42),
+                        );
+                        let _ = self
+                            .renderer
+                            .scene_mut()
+                            .update_object_transform(cube, transform);
+                    }
+                }
+                Animation::Clear => {}
             }
         }
 
@@ -728,6 +835,27 @@ mod demo {
                 Tiling::Tiled,
                 true,
             )?;
+            // Which modifier the driver gave the export target. A linear modifier is legal on some
+            // drivers but a notoriously slow render target; a non-preferred tiled one can be slow
+            // too. The graph's GPU tail is the fence wait, so this is the first thing to check when
+            // the tail is much larger than the same scene on a wgpu-allocated texture.
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                let linear = handle.modifier == DmaBufHandle::LINEAR;
+                eprintln!(
+                    "interop_helio: export target {}x{}: modifier {:#018x}{}, stride {}{}",
+                    width,
+                    height,
+                    handle.modifier,
+                    if linear { " (LINEAR)" } else { "" },
+                    handle.planes[0].stride,
+                    if linear {
+                        " — rendering to a linear image is slow"
+                    } else {
+                        ""
+                    },
+                );
+            });
 
             // The acquire fence. A `SYNC_FD` export moves the signal into a `sync_file`, which is
             // exactly what `DmaBufHandle::acquire_fence` takes; the same semaphore is reused once
@@ -979,7 +1107,8 @@ mod demo {
 
     /// The standalone demo's scene, unchanged in spirit: sky, floor, columns, spheres, four
     /// moving point lights, and a metallic crystal spinner.
-    fn populate(renderer: &mut Renderer) -> (ObjectId, [LightId; 4]) {
+    fn populate_full(renderer: &mut Renderer, shadows: bool) -> Animation {
+        let shadow_index = if shadows { 0 } else { u32::MAX };
         let gold = renderer.scene_mut().insert_material(make_mat(
             [0.95, 0.75, 0.25, 1.0],
             0.25,
@@ -1077,6 +1206,7 @@ mod demo {
                         colors[i],
                         8.0,
                         8.0,
+                        shadow_index,
                     )))
                     .as_light()
                     .unwrap(),
@@ -1097,7 +1227,58 @@ mod demo {
             Some(Movability::Movable),
         );
 
-        (spinner, lights.try_into().unwrap())
+        Animation::Full {
+            spinner,
+            lights: lights.try_into().unwrap(),
+            shadow_index,
+        }
+    }
+
+    /// `interop_bevy`'s scene: 7 × 7 cubes of 1.0 at 1.75 spacing, one directional light, no floor
+    /// and no sky. This is the content match, so a timing difference is the producer, not the scene.
+    fn populate_field(renderer: &mut Renderer, shadows: bool) -> Animation {
+        let shadow_index = if shadows { 0 } else { u32::MAX };
+        renderer
+            .scene_mut()
+            .insert_actor(SceneActor::light(directional_light(
+                Vec3::new(0.38, 0.82, 0.44).normalize().to_array(),
+                [1.0, 1.0, 1.0],
+                3000.0,
+                shadow_index,
+            )));
+
+        let cube = renderer
+            .scene_mut()
+            .insert_actor(SceneActor::mesh(cube_mesh(CUBE * 0.5)))
+            .as_mesh()
+            .unwrap();
+        let half = (GRID - 1) as f32 / 2.0;
+        let (_, from, to) = interop_demo::PALETTES[0];
+        let mut cubes = Vec::with_capacity(GRID * GRID);
+        for y in 0..GRID {
+            for x in 0..GRID {
+                let (fx, fy) = (x as f32 - half, y as f32 - half);
+                let t = ((fx + fy + GRID as f32) / (2.0 * GRID as f32)).clamp(0.0, 1.0);
+                let color = [
+                    from[0] + (to[0] - from[0]) * t,
+                    from[1] + (to[1] - from[1]) * t,
+                    from[2] + (to[2] - from[2]) * t,
+                    1.0,
+                ];
+                let material = renderer
+                    .scene_mut()
+                    .insert_material(make_mat(color, 1.0, 0.0, [0.0; 3], 0.0));
+                cubes.push(add_obj(
+                    renderer,
+                    cube,
+                    material,
+                    Mat4::from_translation(Vec3::new(fx * SPACING, fy * SPACING, 0.0)),
+                    CUBE * 0.5,
+                    Some(Movability::Movable),
+                ));
+            }
+        }
+        Animation::Field { cubes }
     }
 
     fn make_mat(
@@ -1123,12 +1304,33 @@ mod demo {
         }
     }
 
-    fn pt_light(pos: [f32; 3], color: [f32; 3], intensity: f32, range: f32) -> GpuLight {
+    fn directional_light(
+        direction: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        shadow_index: u32,
+    ) -> GpuLight {
+        GpuLight {
+            direction_outer: [direction[0], direction[1], direction[2], -1.0],
+            color_intensity: [color[0], color[1], color[2], intensity],
+            shadow_index,
+            light_type: LightType::Directional as u32,
+            ..Default::default()
+        }
+    }
+
+    fn pt_light(
+        pos: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        shadow_index: u32,
+    ) -> GpuLight {
         GpuLight {
             position_range: [pos[0], pos[1], pos[2], range],
             direction_outer: [0.0, 0.0, -1.0, 0.0],
             color_intensity: [color[0], color[1], color[2], intensity],
-            shadow_index: 0,
+            shadow_index,
             light_type: LightType::Point as u32,
             inner_angle: 0.0,
             _pad: 0,
@@ -1322,11 +1524,19 @@ mod demo {
         displayed_at: Option<Instant>,
         probe: bool,
         stats: bool,
+        scene_kind: SceneKind,
+        shadows: Option<bool>,
         logged: Rc<RefCell<Instant>>,
     }
 
     impl Demo {
-        fn new(cx: &mut Context<Self>, probe: bool, stats: bool) -> Self {
+        fn new(
+            cx: &mut Context<Self>,
+            probe: bool,
+            stats: bool,
+            scene: SceneKind,
+            shadows: Option<bool>,
+        ) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
             let metrics_panel = cx.new(|_| MetricsPanel {
                 metrics: panel_metrics.clone(),
@@ -1350,6 +1560,8 @@ mod demo {
                 displayed_at: None,
                 probe,
                 stats,
+                scene_kind: scene,
+                shadows,
                 logged: Rc::new(RefCell::new(Instant::now())),
             }
         }
@@ -1395,6 +1607,8 @@ mod demo {
                     self.yaw.clone(),
                     self.pitch.clone(),
                     self.distance.clone(),
+                    self.scene_kind,
+                    self.shadows,
                     self.probe,
                     self.stats,
                     self.logged.clone(),
@@ -1517,6 +1731,8 @@ mod demo {
         yaw: Rc<Cell<f32>>,
         pitch: Rc<Cell<f32>>,
         distance: Rc<Cell<f32>>,
+        scene_kind: SceneKind,
+        shadows: Option<bool>,
         probe: bool,
         stats: bool,
         logged: Rc<RefCell<Instant>>,
@@ -1535,7 +1751,7 @@ mod demo {
 
             let mut slot = scene.borrow_mut();
             if slot.is_none() && drawing_error.borrow().is_none() {
-                match HelioScene::build(gpu, width, height, probe) {
+                match HelioScene::build(gpu, width, height, probe, scene_kind, shadows) {
                     Ok(built) => *slot = Some(built),
                     Err(build) => {
                         let message = format!("{build:#}");
@@ -1677,7 +1893,9 @@ mod demo {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|cx| Demo::new(cx, cli.probe, cli.stats)),
+                move |_, cx| {
+                    cx.new(|cx| Demo::new(cx, cli.probe, cli.stats, cli.scene, cli.shadows))
+                },
             )
             .expect("a window to composite into");
             cx.activate(true);
