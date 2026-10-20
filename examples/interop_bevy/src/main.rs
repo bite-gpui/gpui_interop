@@ -144,6 +144,7 @@ mod demo {
     use bevy::ecs::change_detection::DetectChanges;
     use bevy::ecs::component::Component;
     use bevy::ecs::message::MessageWriter;
+    use bevy::ecs::query::With;
     use bevy::ecs::resource::Resource;
     use bevy::ecs::schedule::IntoScheduleConfigs;
     use bevy::ecs::system::{Commands, Query, Res, ResMut};
@@ -1127,7 +1128,10 @@ mod demo {
     }
 
     /// Turn the rig's yaw/pitch/distance into the camera's transform.
-    fn drive_camera(mut rig: ResMut<CameraRig>, mut cameras: Query<&mut Transform>) {
+    fn drive_camera(
+        mut rig: ResMut<CameraRig>,
+        mut cameras: Query<&mut Transform, With<Camera3d>>,
+    ) {
         if !rig.dirty {
             return;
         }
