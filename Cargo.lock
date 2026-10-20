@@ -4914,11 +4914,13 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "ash",
+ "bytemuck",
  "glam 0.33.12",
  "gpui",
  "gpui_interop",
  "gpui_wgpu",
  "helio",
+ "helio-core",
  "helio-default-graphs",
  "helio-pass-forward-lit",
  "helio-pass-gbuffer",

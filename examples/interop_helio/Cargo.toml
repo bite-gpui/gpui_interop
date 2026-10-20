@@ -36,6 +36,10 @@ wgpu30 = { package = "wgpu", version = "30.0.0", features = [
     "wgsl",
 ] }
 helio = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+# The custom CAD passes implement `helio::RenderPass` directly, whose trait methods name the
+# core's `PassContext`/`PrepareContext` (the facade does not re-export them).
+helio-core = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+bytemuck = { version = "1", features = ["derive"] }
 helio-default-graphs = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
 # SceneDB is the sole scene authority at this revision; the components are pass-owned.
 pulsar_scenedb = { git = "https://github.com/Far-Beyond-Pulsar/SceneDB", rev = "8b5b1144c4ef80411592985fcd9767134ee03941", features = ["gpu"] }

@@ -83,6 +83,15 @@
 //! export timings; `--profile` prints Helio's per-pass CPU/GPU timings once a
 //! second; `--probe` reads the exported image back once.
 //!
+//! # The CAD scene
+//!
+//! `--scene cad` (or `--graph cad`) swaps in a graph of two custom passes from
+//! `cad.rs`: a full-screen grid backdrop and one rounded, gold, metallic cube
+//! lit by a single Cook-Torrance fragment shader. It uses no SceneDB rows and
+//! none of the engine's shadow, GI, SSR, atmosphere or post-process passes, and
+//! every buffer it draws from is fixed at construction — so a frame adds two
+//! draws to the camera update Helio already makes.
+//!
 //! # Build profile
 //!
 //! Run it with `--release`. Helio's 39-pass graph and shader compilation are
@@ -101,6 +110,11 @@ fn main() {
          from are Vulkan-shaped. Run it on Linux."
     );
 }
+
+/// The custom-pass CAD scene. It builds its own graph, so it is independent of the engine's
+/// default graphs.
+#[cfg(target_os = "linux")]
+mod cad;
 
 #[cfg(target_os = "linux")]
 mod demo {
@@ -144,6 +158,8 @@ mod demo {
     };
     use pulsar_scenedb::{Entity as SceneEntity, World};
 
+    use crate::cad::cad_graph;
+
     /// Helio's output format. GPUI imports the exported image as `rgba8`.
     const FORMAT: wgpu30::TextureFormat = wgpu30::TextureFormat::Rgba8UnormSrgb;
     /// The Vulkan form of `FORMAT`: `_SRGB`, the form a shader's linear output is stored in.
@@ -172,6 +188,19 @@ mod demo {
     const DEFAULT_PITCH: f32 = 0.32;
     const DEFAULT_DISTANCE: f32 = 11.5;
     const TARGET: Vec3 = Vec3::new(0.0, 2.0, 0.0);
+    /// The CAD scene's view: the cube is centred on the origin and the camera is close enough
+    /// that it fills the viewport, looking down at the top face.
+    const CAD_YAW: f32 = 0.62;
+    const CAD_PITCH: f32 = 0.50;
+    const CAD_DISTANCE: f32 = 5.3;
+
+    /// The orbit state a scene starts at, and what Reset view returns to.
+    fn default_view(scene: SceneKind) -> (f32, f32, f32) {
+        match scene {
+            SceneKind::Cad => (CAD_YAW, CAD_PITCH, CAD_DISTANCE),
+            _ => (DEFAULT_YAW, DEFAULT_PITCH, DEFAULT_DISTANCE),
+        }
+    }
     /// `interop_bevy`'s field: 7 × 7 cubes of 1.0 at 1.75 spacing.
     const GRID: usize = 7;
     const SPACING: f32 = 1.75;
@@ -211,6 +240,8 @@ mod demo {
         Default,
         Simple,
         Forward,
+        /// Two custom passes: a grid backdrop and one metallic rounded cube.
+        Cad,
     }
 
     fn parse_graph(value: &str) -> GraphKind {
@@ -218,8 +249,9 @@ mod demo {
             "default" | "full" => GraphKind::Default,
             "simple" | "cube" => GraphKind::Simple,
             "forward" => GraphKind::Forward,
+            "cad" => GraphKind::Cad,
             other => usage_error(&format!(
-                "--graph: {other:?} is not default, simple or forward"
+                "--graph: {other:?} is not default, simple, forward, or cad"
             )),
         }
     }
@@ -239,6 +271,10 @@ mod demo {
         Field,
         /// No actors: the graph's own per-frame cost.
         Clear,
+        /// The custom-pass CAD scene: one metallic rounded cube over a grid. It has no SceneDB
+        /// actors — the cube and the backdrop are the two custom passes' static buffers — so the
+        /// world stays empty and the graph is the scene.
+        Cad,
     }
 
     fn parse_scene(value: &str) -> SceneKind {
@@ -246,7 +282,10 @@ mod demo {
             "full" | "standalone" => SceneKind::Full,
             "field" | "bevy" | "ember" => SceneKind::Field,
             "clear" => SceneKind::Clear,
-            other => usage_error(&format!("--scene: {other:?} is not full, field, or clear")),
+            "cad" | "ferrocad" => SceneKind::Cad,
+            other => usage_error(&format!(
+                "--scene: {other:?} is not full, field, clear, or cad"
+            )),
         }
     }
 
@@ -271,7 +310,7 @@ mod demo {
                 "--scene" => {
                     let value = args
                         .next()
-                        .unwrap_or_else(|| usage_error("--scene needs full, field, or clear"));
+                        .unwrap_or_else(|| usage_error("--scene needs full, field, clear, or cad"));
                     cli.scene = parse_scene(&value);
                 }
                 "--shadows" => {
@@ -286,7 +325,7 @@ mod demo {
                 }
                 "--graph" => {
                     let value = args.next().unwrap_or_else(|| {
-                        usage_error("--graph needs default, forward, or simple")
+                        usage_error("--graph needs default, forward, simple, or cad")
                     });
                     cli.graph = parse_graph(&value);
                 }
@@ -328,9 +367,11 @@ mod demo {
             "  --stats              print the frame-rate and timing breakdown once a second\n",
             "  --profile            print Helio's per-pass CPU and GPU timings once a second\n",
             "  --probe              read the exported image back once and print its centre pixel\n",
-            "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear\n",
+            "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear,\n",
+            "                       or cad (one custom-pass metallic cube over a grid)\n",
             "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
-            "  --graph <KIND>       default (39 passes), forward (lit geometry) or simple (one cube)\n",
+            "  --graph <KIND>       default (39 passes), forward (lit geometry), simple (one cube),\n",
+            "                       or cad (the two-pass CAD scene)\n",
             "  -h, --help           show this help\n",
             "\n",
             "Helio's wgpu 30 frame leaves as a dma-buf and GPUI imports it on its own wgpu 29\n",
@@ -526,8 +567,7 @@ mod demo {
                 }
             }
             self.interval_ms = self.intervals.back().copied().unwrap_or(0.0);
-            self.gpui_ms =
-                (self.interval_ms - self.render_ms - self.export_ms - self.gpu_wait_ms).max(0.0);
+            self.gpui_ms = (self.interval_ms - self.render_ms - self.export_ms).max(0.0);
             self.fps = if self.intervals.is_empty() {
                 0.0
             } else {
@@ -698,10 +738,18 @@ mod demo {
             // and post-processing, so the alpha written here reaches the compositor.
             let config = RendererConfig::new(width, height, FORMAT).with_background_color([0.0; 4]);
             let builder = RendererBuilder::new(config, scene_db_handle(&scene_db));
+            // The CAD scene has no SceneDB actors: its content *is* the custom graph's static
+            // buffers, so the engine's default graph would draw nothing. It selects its own graph
+            // unless the caller named one explicitly.
+            let graph = match (scene, graph) {
+                (SceneKind::Cad, GraphKind::Default) => GraphKind::Cad,
+                _ => graph,
+            };
             let builder = builder.with_pass_build_context(match graph {
                 GraphKind::Default => Box::new(build_default_graph_external_with_context),
                 GraphKind::Simple => Box::new(simple_graph),
                 GraphKind::Forward => Box::new(build_forward_only_graph_with_context),
+                GraphKind::Cad => Box::new(cad_graph),
             });
             let renderer = builder
                 // Helio shares a device it did not create: no owned-device readbacks, no teardown.
@@ -718,6 +766,7 @@ mod demo {
                     Vec3::ZERO,
                 ),
                 SceneKind::Clear => (Animation::Clear, Vec3::ZERO),
+                SceneKind::Cad => (Animation::Clear, Vec3::ZERO),
             };
             let slots = slots(&device, width, height)?;
 
@@ -2032,6 +2081,7 @@ mod demo {
             phase_costs: Rc<RefCell<PhaseCosts>>,
         ) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
+            let (default_yaw, default_pitch, default_distance) = default_view(scene);
             let metrics_panel = cx.new(|_| MetricsPanel {
                 metrics: panel_metrics.clone(),
             });
@@ -2044,9 +2094,9 @@ mod demo {
                 last: Rc::new(Cell::new(None)),
                 grab: Rc::new(Cell::new(false)),
                 paused: Rc::new(Cell::new(false)),
-                yaw: Rc::new(Cell::new(DEFAULT_YAW)),
-                pitch: Rc::new(Cell::new(DEFAULT_PITCH)),
-                distance: Rc::new(Cell::new(DEFAULT_DISTANCE)),
+                yaw: Rc::new(Cell::new(default_yaw)),
+                pitch: Rc::new(Cell::new(default_pitch)),
+                distance: Rc::new(Cell::new(default_distance)),
                 palette: Rc::new(Cell::new(0)),
                 metrics: Rc::new(RefCell::new(Metrics::default())),
                 panel_metrics,
@@ -2103,13 +2153,13 @@ mod demo {
                     self.pitch.clone(),
                     self.distance.clone(),
                     self.palette.clone(),
+                    self.scene_kind,
                     self.histogram_panel.clone(),
                 ),
                 viewport(
                     self.scene.clone(),
                     self.error.clone(),
                     self.metrics.clone(),
-                    self.phase_costs.clone(),
                     self.last.clone(),
                     self.grab.clone(),
                     self.paused.clone(),
@@ -2130,6 +2180,7 @@ mod demo {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn controls_panel(
         cx: &mut Context<Demo>,
         paused: Rc<Cell<bool>>,
@@ -2137,6 +2188,7 @@ mod demo {
         pitch: Rc<Cell<f32>>,
         distance: Rc<Cell<f32>>,
         palette: Rc<Cell<u8>>,
+        scene_kind: SceneKind,
         histogram_panel: Entity<HistogramPanel>,
     ) -> AnyElement {
         let pause_label = if paused.get() { "Resume" } else { "Pause" };
@@ -2147,9 +2199,10 @@ mod demo {
             }));
 
         let reset = control("reset", "Reset view").on_click(cx.listener(move |_this, _, _, cx| {
-            yaw.set(DEFAULT_YAW);
-            pitch.set(DEFAULT_PITCH);
-            distance.set(DEFAULT_DISTANCE);
+            let (yaw_default, pitch_default, distance_default) = default_view(scene_kind);
+            yaw.set(yaw_default);
+            pitch.set(pitch_default);
+            distance.set(distance_default);
             cx.notify();
         }));
 
@@ -2178,7 +2231,6 @@ mod demo {
         scene: Rc<RefCell<Option<HelioScene>>>,
         error: Rc<RefCell<Option<String>>>,
         metrics: Rc<RefCell<Metrics>>,
-        phase_costs: Rc<RefCell<PhaseCosts>>,
         last: Rc<Cell<Option<SurfacePoint>>>,
         grab: Rc<Cell<bool>>,
         paused: Rc<Cell<bool>>,
@@ -2258,10 +2310,7 @@ mod demo {
                 scene.present_pending();
                 match scene.prepare(&camera) {
                     Ok(Some((render, export, gpu_wait))) => {
-                        let mut metrics = metrics.borrow_mut();
-                        // The previous GPUI frame's draw time, for the histogram's green foot.
-                        metrics.draw_ms = phase_costs.borrow().draw_ms;
-                        metrics.record(
+                        metrics.borrow_mut().record(
                             render,
                             export,
                             gpu_wait,
