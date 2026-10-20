@@ -86,6 +86,13 @@ name = "wgpu_surface"
 path = "tests/wgpu_surface.rs"
 required-features = ["wgpu-test"]
 
+# The Windows cross-device test imports the facade directly, so it needs the `gpui` feature;
+# without it Cargo would build the test with no `gpui` crate. The file itself is `#![cfg(windows)]`.
+[[test]]
+name = "cross_device_surface"
+path = "tests/cross_device_surface.rs"
+required-features = ["gpui"]
+
 [features]
 default = []
 # The cross-API bridge: the wgpu side of a producer's device, the surface it renders into, and the
