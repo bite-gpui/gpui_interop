@@ -1528,6 +1528,13 @@ mod demo {
         logged: Rc<RefCell<Instant>>,
         /// The window's controls. Paused, the canvas keeps presenting the last frame.
         controls: Controls,
+        /// The pointer's last surface-local position, so a move becomes the delta the camera
+        /// orbits by. Kept across frames: a fresh cell each render would forget a drag the moment
+        /// the view was rebuilt.
+        last: Rc<Cell<Option<SurfacePoint>>>,
+        /// Whether this viewport founded the gesture — a drag that merely passes over it does not
+        /// turn it.
+        grab: Rc<Cell<bool>>,
     }
 
     impl BevyDemo {
@@ -1558,6 +1565,8 @@ mod demo {
                 config,
                 logged: Rc::new(RefCell::new(Instant::now())),
                 controls: Controls::new(),
+                last: Rc::new(Cell::new(None)),
+                grab: Rc::new(Cell::new(false)),
             }
         }
     }
@@ -1621,6 +1630,8 @@ mod demo {
                     self.config,
                     self.logged.clone(),
                     self.controls.clone(),
+                    self.last.clone(),
+                    self.grab.clone(),
                 ),
                 self.metrics_panel.clone().cached(metrics_panel_style()),
             )
@@ -1810,6 +1821,8 @@ mod demo {
         config: ViewConfig,
         logged: Rc<RefCell<Instant>>,
         controls: Controls,
+        last: Rc<Cell<Option<SurfacePoint>>>,
+        grab: Rc<Cell<bool>>,
     ) -> AnyElement {
         let drawing_error = error.clone();
         let overlay_error = error;
@@ -1927,8 +1940,6 @@ mod demo {
         })
         .size_full();
 
-        let last = Rc::new(Cell::new(None::<SurfacePoint>));
-        let grab = Rc::new(Cell::new(false));
         let handler = move |input: SurfaceInput| {
             let mut slot = interactive.borrow_mut();
             let Some(scene) = slot.as_mut() else {
