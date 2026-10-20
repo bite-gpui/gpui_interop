@@ -106,7 +106,7 @@ mod demo {
         MeshId, MeshUpload, Movability, ObjectDescriptor, ObjectId, PackedVertex, RenderGraph,
         Renderer, RendererBuilder, RendererConfig, SceneActor, SkyActor,
     };
-    use helio_default_graphs::{build_default_graph_external, build_forward_only_graph_external};
+    use helio_default_graphs::build_default_graph_external;
     use helio_pass_simple_cube::SimpleCubePass;
     use interop_demo::{
         ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
@@ -161,25 +161,27 @@ mod demo {
 
     /// Which render graph Helio runs.
     ///
-    /// The default graph is the 39-pass standalone one. `Forward` is Helio's forward-mode graph:
-    /// fewer passes, but still its shadows, GI and fog. `Simple` is a single pass drawing one
+    /// The default graph is the 39-pass standalone one. `Simple` is a single pass drawing one
     /// debug cube — the micro baseline, comparable to `interop_wgpu`'s hand-written scene.
+    ///
+    /// Helio's forward graph is deliberately not exposed: at this pin `ForwardLitPass` loads
+    /// `pre_aa` and no pass in that graph clears it, so old frames accumulate.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     enum GraphKind {
         #[default]
         Default,
-        Forward,
         Simple,
     }
 
     fn parse_graph(value: &str) -> GraphKind {
         match value {
             "default" | "full" => GraphKind::Default,
-            "forward" => GraphKind::Forward,
             "simple" | "cube" => GraphKind::Simple,
-            other => usage_error(&format!(
-                "--graph: {other:?} is not default, forward, or simple"
-            )),
+            "forward" => usage_error(
+                "--graph forward is disabled: Helio's forward graph does not clear pre_aa at this \
+                 pin, so frames accumulate. Use default or simple.",
+            ),
+            other => usage_error(&format!("--graph: {other:?} is not default or simple")),
         }
     }
 
@@ -286,7 +288,7 @@ mod demo {
             "  --probe              read the exported image back once and print its centre pixel\n",
             "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear\n",
             "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
-            "  --graph <KIND>       default (39 passes), forward (fewer), simple (one cube)\n",
+            "  --graph <KIND>       default (39 passes) or simple (one cube)\n",
             "  -h, --help           show this help\n",
             "\n",
             "Helio's wgpu 30 frame leaves as a dma-buf and GPUI imports it on its own wgpu 29\n",
@@ -490,9 +492,6 @@ mod demo {
             let builder = match graph {
                 GraphKind::Default => builder.with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
                     build_default_graph_external(d, q, s, c, ds, cb, csb, None)
-                })),
-                GraphKind::Forward => builder.with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
-                    build_forward_only_graph_external(d, q, s, c, ds, cb, csb, None)
                 })),
                 GraphKind::Simple => builder.with_graph(Box::new(|d, q, _s, c, _ds, _cb, _csb| {
                     simple_graph(d, q, c)
