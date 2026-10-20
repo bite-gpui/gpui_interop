@@ -612,31 +612,21 @@ During development this workspace takes the core from the sibling checkout — `
 `gpui_wgpu` and `gpui_windows` are path dependencies on `../bite-gpui/crates/…` — so a fix in the
 renderer reaches this stack without a release. On release each path becomes the published package.
 
-The last published release is `1.23.302`. A consumer aliases the published packages back to their
+The last published release is `1.23.305`. A consumer aliases the published packages back to their
 standard crate names so imports like `use gpui::...` compile unchanged:
 
 ```toml
 [workspace.dependencies]
-gpui         = { package = "bite-gpui",       version = "1.23.302", default-features = false }
-gpui_engine  = { package = "bite-gp-engine",  version = "1.23.302" }
-gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.23.302" }
-gpui_windows = { package = "bite-gp-windows", version = "1.23.302" }
+gpui         = { package = "bite-gpui",       version = "1.23.305", default-features = false }
+gpui_engine  = { package = "bite-gp-engine",  version = "1.23.305" }
+gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.23.305" }
+gpui_windows = { package = "bite-gp-windows", version = "1.23.305" }
 ```
 
-The crate's current line needs core additions that are on `bite_v1.23.x` **after** that tag: the
-guest seams (a public `Window::present`, the headless renderer factory, the offscreen surface
-handle), the dma-buf explicit-layout guard, and the transfer function. Until the next amendment to
-the `1.23` line is published, point at the branch or a checkout instead:
-
-```toml
-[workspace.dependencies]
-gpui         = { path = "../bite-gpui/crates/gpui", default-features = false }
-gpui_engine  = { path = "../bite-gpui/crates/gpui_engine" }
-gpui_wgpu    = { path = "../bite-gpui/crates/gpui_wgpu" }
-gpui_windows = { path = "../bite-gpui/crates/gpui_windows" }
-```
-
-To test against a custom GPUI branch, replace those paths with `git`/`branch` sources.
+The guest and same-device wgpu paths need the seams published in `1.23.305`: a public
+`Window::present`, the headless renderer factory, the offscreen surface handle, the dma-buf
+explicit-layout guard, and the transfer function. To test against a GPUI checkout or a custom
+branch, replace the versions above with `path` or `git`/`branch` sources.
 
 ## Running the tests
 
@@ -675,9 +665,36 @@ crates/gpui_interop/
   src/macos.rs                    macOS IOSurface stub (not yet implemented)
   src/guest.rs                    Guest: headless GPUI on a worker thread, handing frames to a host loop
   src/input.rs                    Input routing for interactive viewports and surfaces
-  tests/                          Opt-in integration suites: guest_runner, linux_dmabuf_readback, surface_input, wgpu_surface
-  examples/                       Linux demos: interop_linux, interop_cube, interop_cube_drag, interop_wgpu, interop_bevy
+  tests/                          Opt-in integration suites: cross_device_surface, guest_runner,
+                                  linux_dmabuf_readback, surface_input, wgpu_surface
+  examples/                       Library examples: interop_linux, interop_cube, interop_cube_drag
+examples/interop_wgpu/            The wgpu producer demo (its own crate)
+examples/interop_bevy/            The Bevy producer demo (its own crate)
+crates/interop_demo/              Chrome shared by the two producer demos
+scripts/prepare-publish.py        Stages a publishable copy with the core dependencies rewritten
+LICENSE-APACHE                    Apache-2.0 licence text
+rust-toolchain.toml               The pinned compiler
 ```
+
+## Releasing
+
+`cargo publish` needs the core dependencies under their registry names. The local
+crates are path dependencies named `gpui`, `gpui_engine`, `gpui_wgpu` and
+`gpui_windows`; their published packages are `bite-gpui`, `bite-gp-engine`,
+`bite-gp-wgpu` and `bite-gp-windows`. Cargo cannot rename a path package, so the
+staging script copies the workspace, rewrites those four lines, and drops the
+development-only `[patch.crates-io]` table:
+
+```sh
+python3 scripts/prepare-publish.py /tmp/gpui-interop-publish
+(cd /tmp/gpui-interop-publish && cargo publish --dry-run -p gpui_interop)
+```
+
+A release is a `vX.Y.Z` tag that matches `crates/gpui_interop/Cargo.toml`; the
+`Release` workflow runs the tests, the same staging and dry run, then publishes
+behind the `crates-io` environment. Configure that environment with
+`CARGO_REGISTRY_TOKEN` (scoped to the crate) and required reviewers before pushing
+the first tag.
 
 ## Status
 
@@ -686,4 +703,4 @@ platform backends (such as macOS `IOSurface`) are implemented.
 
 ## License
 
-Licensed under the Apache-2.0 License. See `Cargo.toml` for details.
+Licensed under the Apache-2.0 License. See [LICENSE-APACHE](LICENSE-APACHE).

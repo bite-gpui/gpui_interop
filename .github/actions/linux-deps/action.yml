@@ -1,0 +1,33 @@
+# The system packages this repository needs before anything links.
+#
+# The list is `bite-gpui/distribution`'s `linux-deps` verbatim — its union of what
+# ce's publish job installs and what zed's `script/linux` installs for
+# Debian/Ubuntu — because that list is a *proven* superset: it links the whole
+# layer stack.
+#
+# The package dry run builds `gpui_interop` with `--features gpui,wgpu,guest`,
+# which compiles the facade's platform bundle: X11, Wayland, xkbcommon, fontconfig
+# and wgpu. The release's `cargo test` links the same stack. A short list dies at
+# the linker (`unable to find library -lX11-xcb`) or, worse, inside
+# `yeslogic-fontconfig-sys`'s build script during `cargo publish` verification.
+#
+# `mesa-vulkan-drivers` is here for the tests rather than the build: it provides
+# lavapipe, so the dma-buf suites run instead of skipping on a runner with no GPU.
+name: Install Linux build dependencies
+description: Install the system packages this repository needs to build and link on Debian/Ubuntu
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libasound2-dev libegl1-mesa-dev libfontconfig-dev libgit2-dev \
+          libglib2.0-dev libgles2-mesa-dev libssl-dev libsqlite3-dev \
+          libva-dev libvulkan1 libvulkan-dev libwayland-dev \
+          libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+          libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+          libxcb-xinput-dev libzstd-dev mesa-vulkan-drivers

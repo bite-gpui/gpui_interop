@@ -4,13 +4,26 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "Apache-2.0"
+description = "Zero-copy external GPU surfaces for GPUI windows"
+repository.workspace = true
+homepage = "https://bite-gpui.github.io/"
+documentation = "https://docs.rs/gpui_interop"
+readme = "README.md"
+keywords = ["gpui", "gpu", "dma-buf", "wgpu", "zero-copy"]
+categories = ["gui", "rendering"]
 
 [lints]
 workspace = true
 
 [lib]
+name = "gpui_interop"
 path = "src/gpui_interop.rs"
 doctest = false
+
+[package.metadata.docs.rs]
+all-features = false
+features = ["gpui", "wgpu", "guest"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 # The Linux example: the hatch's `SharedBuffer` -- a shareable Vulkan image -- exported as a dma-buf
 # and composited by a GPUI window, with no CPU copy. Built only with the `example` feature, which

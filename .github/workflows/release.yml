@@ -1,0 +1,185 @@
+# Publish `gpui_interop` to crates.io.
+#
+# A release is a tag: `v0.1.0` releases the manifest's `0.1.0` and refuses to
+# release anything else. A dispatch defaults to a dry run; a real publish repeats
+# the tag and waits on the `crates-io` environment, where `CARGO_REGISTRY_TOKEN`
+# lives and where required reviewers belong.
+#
+# This crate is a workspace member, so the version is read from
+# `crates/gpui_interop/Cargo.toml`, and `cargo publish -p gpui_interop` packages
+# only that crate. The workspace's core dependencies are path dependencies during
+# development; `scripts/prepare-publish.py` stages a copy that rewrites them to
+# the published `bite-gpui`, `bite-gp-engine`, `bite-gp-wgpu` and `bite-gp-windows`
+# packages and drops the development-only `[patch.crates-io]` table. Both the
+# package check and the upload run in that staged tree, so the artifact that is
+# verified is the artifact that is uploaded.
+name: Release
+
+run-name: ${{ github.event_name == 'push' && format('Release {0}', github.ref_name) || format('{0} {1}', github.event.inputs.dry_run == 'false' && 'Release' || 'Dry run', github.event.inputs.tag) }}
+
+on:
+  # The tag is the release. Pushing one starts this workflow, and the upload still
+  # waits for the environment's approval.
+  push:
+    tags: ['v*']
+
+  # For re-running a tag, and for looking at the packaging without going near the
+  # registry. `tag` names an existing tag, so a dispatch can never release a
+  # commit that is not tagged.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'the vX.Y.Z tag to act on (it must already exist)'
+        required: true
+      dry_run:
+        description: 'package and verify without uploading'
+        type: boolean
+        required: false
+        default: true
+      confirm:
+        description: 'repeat the tag to confirm a real publish'
+        required: false
+        default: ''
+
+# One upload at a time in this repository.
+concurrency:
+  group: registry-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # No debug information, so the compile and the verification build fit on a runner.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      dry_run: ${{ steps.mode.outputs.dry_run }}
+    env:
+      # On a tag push the tag is the intent and there is nothing to type; on a
+      # dispatch there is, and a real publish has to repeat it.
+      TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+      CONFIRM: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.confirm }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+
+      - uses: ./.github/actions/linux-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: The tag must name the manifest's version
+        id: resolve
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/gpui_interop/Cargo.toml", "rb"))["package"]["version"])')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error title=tag mismatch::$TAG does not name this manifest's version ($version)." \
+                 "A release tag is v<version>: tag v$version, or set the manifest to ${TAG#v}."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the mode
+        id: mode
+        env:
+          DRY_RUN: ${{ github.event_name == 'push' && 'false' || github.event.inputs.dry_run }}
+        run: echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an unconfirmed publish
+        env:
+          DRY_RUN: ${{ github.event_name == 'push' && 'false' || github.event.inputs.dry_run }}
+        run: |
+          # The dispatch input may arrive as the string "true" or a boolean.
+          if [ "$DRY_RUN" = "true" ]; then
+            exit 0
+          fi
+          if [ "$CONFIRM" != "$TAG" ]; then
+            echo "::error title=unconfirmed::confirm ($CONFIRM) does not name the tag ($TAG)." \
+                 "Repeat the tag to publish it, or leave dry_run checked."
+            exit 1
+          fi
+
+      # The source tree's tests use the sibling checkout through the path
+      # dependencies; the staged tree below then proves the published packages
+      # build the same crate.
+      - name: Test
+        run: cargo test --locked -p gpui_interop
+
+      - name: Stage the publishable tree
+        run: python3 scripts/prepare-publish.py "$RUNNER_TEMP/gpui-interop-publish"
+
+      # `cargo publish --dry-run`'s own packaging and verification: the tarball,
+      # its manifest, and the crate built as the root of its own build against
+      # crates.io. The second run covers the feature surface docs.rs builds.
+      - name: Package
+        working-directory: ${{ runner.temp }}/gpui-interop-publish
+        run: |
+          cargo publish --dry-run -p gpui_interop
+          cargo publish --dry-run -p gpui_interop --features gpui,wgpu,guest
+
+      - name: Summarise
+        env:
+          MODE: ${{ steps.mode.outputs.dry_run }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          if [ "$MODE" = "false" ]; then
+            echo "::notice title=release::gpui_interop $VERSION will be published to crates.io"
+          else
+            echo "::notice title=dry run::gpui_interop $VERSION was packaged and verified, not uploaded"
+          fi
+
+  publish:
+    needs: package
+    if: ${{ needs.package.result == 'success' && needs.package.outputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    # The approval gate, and where CARGO_REGISTRY_TOKEN lives. Configure the
+    # environment with required reviewers: it is the last thing between a tag and
+    # an irreversible upload, and the only place the token is reachable from.
+    environment: crates-io
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+
+      - uses: ./.github/actions/linux-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # Only a job that names the environment can see the token. The scope is a
+      # crates.io name-prefix glob; this package is `gpui_interop`, so a `gpui_*`
+      # token matches it, while a `gpui-*` token does not.
+      - name: Require the registry token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error title=missing secret::CARGO_REGISTRY_TOKEN is empty. Store a crates.io token scoped to gpui_* in the crates-io environment."
+            exit 1
+          fi
+
+      - name: Stage the publishable tree
+        run: python3 scripts/prepare-publish.py "$RUNNER_TEMP/gpui-interop-publish"
+
+      - name: Publish
+        working-directory: ${{ runner.temp }}/gpui-interop-publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p gpui_interop
+
+      - name: Summarise
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: echo "::notice title=published::gpui_interop $VERSION is on crates.io"

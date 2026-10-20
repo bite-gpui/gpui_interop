@@ -85,8 +85,14 @@ interop_demo = { path = "crates/interop_demo" }
 
 # The core, from the working tree next door — `bite-gpui`'s own checkout, so a fix in `gpui_wgpu`
 # (the dma-buf importer) reaches this stack without a release. Each key keeps its source name, so
-# every `use gpui::…` in the crate and its examples keeps compiling unchanged. On release each path
-# is replaced by the core's published package, which is what a published crate has to depend on.
+# every `use gpui::…` in the crate and its examples keeps compiling unchanged.
+#
+# These are path-only on purpose. The registry knows the same crates under the distribution's names
+# (`bite-gpui`, `bite-gp-engine`, `bite-gp-wgpu`, `bite-gp-windows`), but Cargo cannot rename a
+# *path* dependency: the package at the path is named `gpui`, so `package = "bite-gpui"` would look
+# for a package that is not there. Publishing therefore stages a copy of this workspace with the
+# four lines rewritten to their published packages — `scripts/prepare-publish.py` — which is the
+# same path the out-of-tree crates take on release.
 gpui = { path = "../bite-gpui/crates/gpui", default-features = false }
 gpui_engine = { path = "../bite-gpui/crates/gpui_engine" }
 gpui_wgpu = { path = "../bite-gpui/crates/gpui_wgpu" }

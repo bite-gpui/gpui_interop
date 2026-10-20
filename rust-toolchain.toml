@@ -1,0 +1,9 @@
+# The compiler this repository's builds and releases use.
+#
+# A consumer is not affected: Cargo ignores a dependency's toolchain file. The
+# pin keeps the crate's own tests, the publish dry run and a tag build on the
+# same compiler the sibling `gpui_parley` and the `bite-gpui` core use.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
