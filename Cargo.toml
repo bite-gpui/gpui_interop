@@ -161,6 +161,18 @@ windows = { version = "0.62", features = [
 # The core is developed against a few forked crates, and patches only apply from the root workspace,
 # so whichever repo builds it has to carry them.
 [patch.crates-io]
+# Helio's main branch pins wgpu 30.0.1 to the Pulsar fork (reusable command buffers). A patch in a
+# dependency's workspace does not apply here, so the workspace root repeats it. wgpu 29 (the core's
+# own) is a different major and keeps resolving to crates.io.
+naga = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-core = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-core-deps-apple = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-core-deps-emscripten = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-hal = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-naga-bridge = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
+wgpu-types = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "1bac7e303fb4fe6a2532a98ba0526c35ce193d2f" }
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }

@@ -27,16 +27,22 @@ interop_demo.workspace = true
 # The release descriptor is an `eventfd` the renderer writes to once it has sampled a frame.
 libc = "0.2"
 
-# Helio's own renderer. The revision is the one the `Helio_Standalone_Demo` pins.
+# Helio's own renderer, upstream `main`. It authors scenes through SceneDB and builds against
+# wgpu 30.0.1 from Far-Beyond-Pulsar's fork, which the workspace root patches in.
 wgpu30 = { package = "wgpu", version = "30.0.0", features = [
     "vulkan",
     "vulkan-portability",
     "gles",
     "wgsl",
 ] }
-helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "4356a855e33b691aac10621e712bd973d8c4b68b" }
-helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "4356a855e33b691aac10621e712bd973d8c4b68b" }
-# The one-pass micro graph: Helio's `SimpleCubePass`, used for the `--graph simple` baseline.
-helio-pass-simple-cube = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "4356a855e33b691aac10621e712bd973d8c4b68b" }
+helio = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+helio-default-graphs = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+# SceneDB is the sole scene authority at this revision; the components are pass-owned.
+pulsar_scenedb = { git = "https://github.com/Far-Beyond-Pulsar/SceneDB", rev = "8b5b1144c4ef80411592985fcd9767134ee03941", features = ["gpu"] }
+helio-pass-gbuffer = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+helio-pass-forward-lit = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+helio-pass-sky = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
+# The one-pass micro graph; its upstream builder does not lock the graph.
+helio-pass-simple-cube = { git = "https://github.com/Vanuan/Helio", rev = "daf54b414d3830853043c40ad8ea101808bf01be" }
 glam = { version = "0.33", features = ["bytemuck"] }
 pollster = "0.4"

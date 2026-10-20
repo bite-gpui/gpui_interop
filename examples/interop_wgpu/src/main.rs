@@ -83,7 +83,7 @@ mod demo {
         AnyElement, App, Bounds, Context, Corners, Entity, FocusId, FramePipeline,
         FramePipelineExt, IntoElement, PhaseMetrics, PreparedRoots, Render, ScrollDelta,
         StandardImmediatePipeline, Window, WindowBounds, WindowMetrics, WindowOptions, div,
-        gpu_canvas, prelude::*, px, rgb, size,
+        gpu_canvas, prelude::*, px, size,
     };
     use gpui_interop::vulkan_export::DmaBufHandle;
     use gpui_interop::{
@@ -92,9 +92,9 @@ mod demo {
     };
     use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
     use interop_demo::{
-        ACCENT, LEFT_WIDTH, MUTED, PALETTES, control, error_panel, histogram, histogram_caption,
-        histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
-        page, panel, section_label, title, viewport_frame,
+        LEFT_WIDTH, MetricsSnapshot, PALETTES, control, error_panel, histogram_style,
+        metrics_histogram, metrics_panel, metrics_panel_style, overlay_badge, overlay_hint, page,
+        panel, section_label, viewport_frame,
     };
     use wgpu::util::DeviceExt as _;
 
@@ -397,11 +397,6 @@ mod demo {
             self.intervals_ms.back().copied().unwrap_or(0.0)
         }
 
-        /// The root passes of the most recent frame, in milliseconds.
-        fn latest_passes_ms(&self) -> f32 {
-            self.evaluate_ms + self.layout_ms + self.paint_ms
-        }
-
         /// The part of the interval the pipeline did not spend driving the frame: presentation,
         /// vsync, and the frame source's pacing.
         fn latest_wait_ms(&self) -> f32 {
@@ -423,49 +418,33 @@ mod demo {
         }
     }
 
-    /// The numbers the view renders, copied out of the pipeline's cells once per frame.
-    #[derive(Clone)]
-    struct Metrics {
-        fps: f32,
-        frame_ms: f32,
-        draw_ms: f32,
-        wait_ms: f32,
-        passes_ms: f32,
-        gpui_frames: u64,
-        asked: u64,
-        produced: u64,
-        evaluate_ms: f32,
-        layout_ms: f32,
-        paint_ms: f32,
-        active: bool,
-        intervals: Vec<f32>,
-        work: Vec<f32>,
-        /// The adapter the window's renderer chose.
-        gpu: String,
-        /// How the frames reach GPUI: `dma-buf + sync_file` or `same-device view`.
-        path: &'static str,
-    }
-
-    impl Metrics {
-        fn new(stats: &FrameStats, produced: u64) -> Self {
-            Self {
-                fps: stats.fps(),
-                frame_ms: stats.latest_ms(),
-                draw_ms: stats.draw_ms,
-                wait_ms: stats.latest_wait_ms(),
-                passes_ms: stats.latest_passes_ms(),
-                gpui_frames: stats.frames,
-                asked: stats.asked,
-                produced,
-                evaluate_ms: stats.evaluate_ms,
-                layout_ms: stats.layout_ms,
-                paint_ms: stats.paint_ms,
-                active: stats.active,
-                intervals: stats.intervals_ms.iter().copied().collect(),
-                work: stats.work_ms.iter().copied().collect(),
-                gpu: String::new(),
-                path: "",
-            }
+    /// The shared snapshot, copied out of the pipeline's cells once per refresh.
+    fn snapshot(stats: &FrameStats, scene: &Scene) -> MetricsSnapshot {
+        MetricsSnapshot {
+            heading: "wgpu, inside GPUI",
+            subtitle: "An instanced wgpu scene handed to the window renderer with no CPU copy.",
+            fps: stats.fps(),
+            interval_ms: stats.latest_ms(),
+            producer_ms: scene.render_ms,
+            handoff_ms: scene.submit_ms,
+            // The producer never waits: the exported surface carries its fence to GPUI.
+            gpu_wait_ms: 0.0,
+            gpui_ms: stats.draw_ms,
+            present_wait_ms: stats.latest_wait_ms(),
+            evaluate_ms: stats.evaluate_ms,
+            layout_ms: stats.layout_ms,
+            paint_ms: stats.paint_ms,
+            produced: scene.frames,
+            gpui_frames: stats.frames,
+            asked: stats.asked,
+            dropped: 0,
+            width: scene.width,
+            height: scene.height,
+            adapter: scene.gpu.clone(),
+            path: scene.path.to_owned(),
+            active: stats.active,
+            intervals: stats.intervals_ms.iter().copied().collect(),
+            work: stats.work_ms.iter().copied().collect(),
         }
     }
 
@@ -602,13 +581,13 @@ mod demo {
     /// does not re-lay-out its bars. Embedded with `.cached()`, it is a single definite-size
     /// layout node until the root notifies it (5×/s, when the snapshot is refreshed).
     struct HistogramPanel {
-        metrics: Rc<RefCell<Option<Metrics>>>,
+        metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
     }
 
     impl Render for HistogramPanel {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             match self.metrics.borrow().as_ref() {
-                Some(metrics) => histogram_section(metrics),
+                Some(metrics) => metrics_histogram(metrics),
                 None => div().into_any_element(),
             }
         }
@@ -617,13 +596,13 @@ mod demo {
     /// The right column: the demo's title, the live metrics and the producer's path. Cached for the
     /// same reason as the histogram.
     struct MetricsPanel {
-        metrics: Rc<RefCell<Option<Metrics>>>,
+        metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
     }
 
     impl Render for MetricsPanel {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             match self.metrics.borrow().as_ref() {
-                Some(metrics) => metrics_section(metrics),
+                Some(metrics) => metrics_panel(metrics),
                 None => div().into_any_element(),
             }
         }
@@ -654,10 +633,10 @@ mod demo {
         /// The right column's metrics, cached as a child view.
         metrics_panel: Entity<MetricsPanel>,
         /// The snapshot the cached panels render.
-        panel_metrics: Rc<RefCell<Option<Metrics>>>,
+        panel_metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
         /// The metrics as last displayed in the right panel. Refreshed a few times a second rather than
         /// every frame: each changed string is a text-layout cache miss.
-        display: Option<Metrics>,
+        display: Option<MetricsSnapshot>,
         displayed_at: Instant,
         /// Raw producer bench: render into the output, wait for the GPU, and report throughput
         /// without presenting anything. A fixed limit rather than a flag so the scene build can
@@ -712,18 +691,20 @@ mod demo {
                 window.request_animation_frame();
             }
 
-            let (produced, gpu, path) = {
-                let scene = self.scene.borrow();
-                match scene.as_ref() {
-                    Some(scene) => (scene.frames, scene.gpu.clone(), scene.path),
-                    None => (0, "—".to_owned(), "—"),
-                }
-            };
             let refresh = self.display.is_none() || self.displayed_at.elapsed().as_millis() >= 500;
             if refresh {
-                let mut metrics = Metrics::new(&self.stats.borrow(), produced);
-                metrics.gpu = gpu;
-                metrics.path = path;
+                let metrics = {
+                    let scene = self.scene.borrow();
+                    match scene.as_ref() {
+                        Some(scene) => snapshot(&self.stats.borrow(), scene),
+                        None => MetricsSnapshot {
+                            heading: "wgpu, inside GPUI",
+                            subtitle: "An instanced wgpu scene handed to the window renderer with \
+                                       no CPU copy.",
+                            ..MetricsSnapshot::default()
+                        },
+                    }
+                };
                 *self.panel_metrics.borrow_mut() = Some(metrics.clone());
                 self.display = Some(metrics);
                 self.displayed_at = Instant::now();
@@ -811,80 +792,6 @@ mod demo {
             .child(reset)
             .child(div().h(px(8.)).flex_none())
             .child(histogram_panel.cached(histogram_style()))
-            .into_any_element()
-    }
-
-    /// The left column's histogram block: the interval bars, what they mean, and where the most
-    /// recent interval went.
-    fn histogram_section(metrics: &Metrics) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(section_label("Frame interval"))
-            .child(histogram(&metrics.intervals, Some(&metrics.work)))
-            .child(histogram_caption(true))
-            .child(pacing_note(
-                metrics.frame_ms,
-                metrics.draw_ms,
-                metrics.wait_ms,
-                metrics.active,
-            ))
-            .into_any_element()
-    }
-
-    /// The right column: the title, the frame rate, the pipeline's own breakdown, and the producer.
-    fn metrics_section(metrics: &Metrics) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(title(
-                "wgpu, inside GPUI",
-                "An instanced wgpu scene handed to the window renderer with no CPU copy.",
-            ))
-            .child(div().h(px(2.)).flex_none())
-            .child(
-                div()
-                    .text_2xl()
-                    .text_color(rgb(ACCENT))
-                    .child(format!("{:.1} FPS", metrics.fps)),
-            )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                "{:.2} ms · draw {:.2} ms · wait {:.2} ms",
-                metrics.frame_ms, metrics.draw_ms, metrics.wait_ms
-            )))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Frame pipeline · per frame"))
-            .child(metric_row(
-                "frame interval",
-                format!("{:.2} ms", metrics.frame_ms),
-            ))
-            .child(metric_row(
-                "root passes",
-                format!("{:.3} ms", metrics.passes_ms),
-            ))
-            .child(metric_row(
-                "evaluate",
-                format!("{:.3} ms", metrics.evaluate_ms),
-            ))
-            .child(metric_row("layout", format!("{:.3} ms", metrics.layout_ms)))
-            .child(metric_row("paint", format!("{:.3} ms", metrics.paint_ms)))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Counters"))
-            .child(metric_row("GPUI frames", metrics.gpui_frames.to_string()))
-            .child(metric_row("asked", metrics.asked.to_string()))
-            .child(metric_row("produced", metrics.produced.to_string()))
-            .child(metric_row(
-                "window",
-                if metrics.active { "active" } else { "inactive" }.to_owned(),
-            ))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Producer"))
-            .child(metric_row("adapter", metrics.gpu.clone()))
-            .child(metric_row("hand-off", metrics.path.to_owned()))
             .into_any_element()
     }
 
@@ -1097,6 +1004,10 @@ mod demo {
         pitch: f32,
         distance: f32,
         frames: u64,
+        /// CPU spent building this frame's instances and recording its pass.
+        render_ms: f32,
+        /// CPU spent submitting and presenting it.
+        submit_ms: f32,
         gpu: String,
         /// A raw bench duration, taken by the first paint that reaches the canvas.
         bench: Option<Duration>,
@@ -1301,6 +1212,8 @@ mod demo {
                 pitch: 0.42,
                 distance: 11.0,
                 frames: 0,
+                render_ms: 0.0,
+                submit_ms: 0.0,
                 gpu: gpu_name,
                 output,
                 path,
@@ -1416,6 +1329,7 @@ mod demo {
                 self.time += 0.016 * speed;
             }
 
+            let producer_start = Instant::now();
             let eye = [
                 self.distance * self.pitch.cos() * self.yaw.sin(),
                 self.distance * self.pitch.sin(),
@@ -1497,6 +1411,9 @@ mod demo {
                 pass.draw_indexed(0..36, 0, 0..INSTANCES);
             }
 
+            self.render_ms = producer_start.elapsed().as_secs_f32() * 1000.0;
+
+            let handoff_start = Instant::now();
             let queue = Arc::clone(&self.queue);
             let handle = match &mut self.output {
                 Output::Exported(buffer) => {
@@ -1519,6 +1436,7 @@ mod demo {
                     None
                 }
             };
+            self.submit_ms = handoff_start.elapsed().as_secs_f32() * 1000.0;
             self.frames += 1;
             Ok(handle)
         }

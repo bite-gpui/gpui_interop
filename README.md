@@ -191,7 +191,7 @@ library features.
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
 | `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting, polling the exported `sync_file` on the dma-buf path and printing the submit and fence portions separately. |
 | `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause, Speed, Palette, Reset view and Probe, and the viewport orbits/zooms. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
-| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, exported as a dma-buf and imported by GPUI's wgpu 29 renderer with `paint_surface` — no CPU copy. Three exportable images cycle — the one GPUI is presenting is never recycled — and a slot is reused only after GPUI signals the `eventfd` release it was handed, so drawing frame N+1 never races frame N. The field scene takes the same Pause, Palette and Reset view controls as the other two demos. Helio is pinned to a git revision, not crates.io. `--scene full\|field\|clear` switches between the standalone scene, `interop_bevy`'s 49-cube field and an empty graph; `--shadows on\|off` overrides the scene's shadow maps; `--graph default\|simple` picks the 39-pass graph or a one-pass micro graph. Run it with `--release`: a debug build measures Helio's unoptimised graph and shaders. `--stats` prints the frame-rate and timing breakdown; `--probe` reads the exported image back once. |
+| `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene authored through SceneDB on its own wgpu 30 device (a fork of upstream `main` at `3398609b`, [`Vanuan/Helio`](https://github.com/Vanuan/Helio) at `daf54b4`, which adds a configurable scene background and builds against Far-Beyond-Pulsar's wgpu fork), exported as a dma-buf and imported by GPUI's wgpu 29 renderer with `paint_surface` — no CPU copy. Three exportable images cycle — the one GPUI is presenting is never recycled — and a slot is reused only after GPUI signals the `eventfd` release it was handed, so drawing frame N+1 never races frame N. The producer keeps one frame of lead time and hands the acquire fence over live for the field, which holds 60 fps at 677 × 686; the full scene exceeds GPUI's 16 ms acquire timeout, so it completes the fence producer-side instead of dropping surfaces. The scene clear is transparent, so the field's empty pixels composite over GPUI's window background rather than a black target. The field scene takes the same Pause, Palette and Reset view controls as the other two demos. `--scene full\|field\|clear` switches between the standalone scene, `interop_bevy`'s 49-cube field and an empty graph; `--shadows on\|off` overrides the scene's shadow maps; `--graph default\|forward\|simple` picks the deferred graph, the forward-lit graph — whose `BackgroundPass` clears `pre_aa`, so frames no longer accumulate — or a one-pass micro graph. Run it with `--release`: a debug build measures Helio's unoptimised graph and shaders. `--stats` prints the frame-rate and timing breakdown; `--probe` reads the exported image back once. |
 
 ```sh
 cargo run -p gpui_interop --example interop_linux     --features example
@@ -226,17 +226,25 @@ package's features across an invocation, so running one demo with its own featur
 rebuild the library and every GPUI crate, and switching back rebuilt them again. With one crate per
 producer and the same `gpui_interop/example` feature in both, the library artifacts are shared and
 Bevy is only in `interop_bevy`'s graph. The chrome itself lives in `crates/interop_demo`: the
-palette, the three-column layout, the controls, the histogram and the error panel are shared, so the
-demos cannot drift while the producers stay independent.
+palette, the three-column layout, the controls, the histogram, the right-hand metrics schema and
+the error panel are shared, so the demos cannot drift while the producers stay independent. Each
+producer fills one `MetricsSnapshot`; `interop_demo` renders the same Frame / Producer / Counters
+rows in all three demos.
 
-`interop_helio` is experimental and lives on the `helio-interop` branch. Helio and its default
-graphs are pinned to the git revision of `Helio_Standalone_Demo` because they are not on crates.io,
-and Helio's renderer is wgpu 30 while this workspace is wgpu 29. Cargo keeps both majors in one
-graph; no wgpu type crosses between them. Helio creates its own Vulkan device on the **same physical
-GPU as the window**, matched through `Adapter::gpu_id`, and its frame leaves as a dma-buf: the image
-is allocated by `gpui_interop`'s Vulkan exporter, wrapped into wgpu 30 with `texture_from_raw`, and
+`interop_helio` is experimental and lives on the `helio-interop` branch. Helio is pinned to
+a fork of upstream `main` (`3398609b`) because it is not on crates.io. The fork adds
+`RendererConfig::background_color` and carries its alpha through FXAA, the fog composite and
+post-processing, so the field can clear to transparent and let GPUI's own background show
+through the dma-buf. Upstream `main` also authors scenes through SceneDB: the example's meshes,
+materials, objects and lights are rows flushed to the renderer's GPU mirror at each frame
+boundary. Helio's renderer is wgpu 30.0.1 from
+Far-Beyond-Pulsar's fork (reusable command buffers), patched in at the workspace root alongside
+`naga`; this workspace's own renderer is wgpu 29. Cargo keeps both majors in one graph; no wgpu type
+crosses between them. Helio creates its own Vulkan device on the **same physical GPU as the
+window**, matched through `Adapter::gpu_id`, and its frame leaves as a dma-buf: the image is
+allocated by `gpui_interop`'s Vulkan exporter, wrapped into wgpu 30 with `texture_from_raw`, and
 imported by GPUI's wgpu 29 device. Only raw Vulkan handles and file descriptors cross the version
-boundary.
+boundary. The first build downloads both `Helio` and the wgpu fork from GitHub.
 
 Two details make that work without touching `gpui_wgpu`. The device is created through wgpu 30's
 HAL rather than `request_device`, so `VK_KHR_external_semaphore_fd` is added before

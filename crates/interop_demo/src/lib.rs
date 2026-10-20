@@ -1,13 +1,13 @@
-//! The GPUI chrome shared by the `interop_wgpu` and `interop_bevy` demos.
+//! The GPUI chrome shared by the `interop_wgpu`, `interop_bevy` and `interop_helio` demos.
 //!
-//! Both demos put the same shell around different producers: a left column of real GPUI controls
-//! with a frame-interval histogram beneath them, the producer's canvas in the centre, and a right
-//! column of live metrics. The producer-specific code still owns its own metrics snapshot and its
-//! cached panel entity; this crate only supplies the styling and the layout, so the two examples
-//! cannot drift apart visually or in what they measure.
+//! Every demo puts the same shell around a different producer: a left column of real GPUI
+//! controls with a frame-interval histogram beneath them, the producer's canvas in the centre, and
+//! a right column of live metrics. The producer fills one [`MetricsSnapshot`]; this crate renders
+//! it with [`metrics_panel`] and [`metrics_histogram`], so the three demos cannot drift apart
+//! visually or in what they measure: the same sections, the same rows, the same order.
 //!
 //! The palette and the sizes are here rather than in each example for the same reason: a reader
-//! comparing the two demos should be comparing the engines, not two hand-tuned copies of the same
+//! comparing the demos should be comparing the engines, not three hand-tuned copies of the same
 //! chrome.
 
 use gpui::{
@@ -315,5 +315,132 @@ pub fn error_panel(heading: &'static str, message: String, hint: &'static str) -
                 .child(div().text_xs().text_color(rgb(0xc9ced8)).child(message))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(hint)),
         )
+        .into_any_element()
+}
+
+/// Everything the right column shows, in one schema shared by every demo.
+///
+/// The producers measure different things internally, but they all map onto the same rows: the
+/// engine's own CPU step, the hand-off into GPUI, the producer's GPU wait, GPUI's frame, the
+/// producer's output, and the counters. Keeping the schema here is what makes the panels
+/// comparable across `interop_wgpu`, `interop_bevy` and `interop_helio`.
+#[derive(Clone, Default)]
+pub struct MetricsSnapshot {
+    pub heading: &'static str,
+    pub subtitle: &'static str,
+    pub fps: f32,
+    /// Wall-clock interval between the producer's frames.
+    pub interval_ms: f32,
+    /// The engine's own CPU work for the frame (Bevy update, Helio render, wgpu scene build).
+    pub producer_ms: f32,
+    /// Handing the frame to GPUI (submit, export or transport).
+    pub handoff_ms: f32,
+    /// Time the producer spent waiting for its own GPU work before the hand-off; zero when the
+    /// fence is handed over live.
+    pub gpu_wait_ms: f32,
+    /// GPUI's whole frame: evaluate, layout, paint and draw.
+    pub gpui_ms: f32,
+    /// The part of the interval outside GPUI's frame: presentation, vsync and pacing.
+    pub present_wait_ms: f32,
+    pub evaluate_ms: f32,
+    pub layout_ms: f32,
+    /// GPUI's pipeline paint (the root passes' paint).
+    pub paint_ms: f32,
+    /// Frames the producer produced.
+    pub produced: u64,
+    pub gpui_frames: u64,
+    /// Frames the frame source asked GPUI to render.
+    pub asked: u64,
+    /// Frames the producer dropped because every export slot was in flight.
+    pub dropped: u64,
+    pub width: u32,
+    pub height: u32,
+    pub adapter: String,
+    /// How frames reach GPUI: `dma-buf + sync_file`, `same-device view`, ...
+    pub path: String,
+    pub active: bool,
+    pub intervals: Vec<f32>,
+    /// Per-interval GPUI draw time; drawn as the histogram's green foot.
+    pub work: Vec<f32>,
+}
+
+/// One label/value row, monospaced enough to line up across the three panels.
+fn row(label: &'static str, value: String) -> AnyElement {
+    metric_row(label, value)
+}
+
+/// The right column, identical in every demo except the title, subtitle and values.
+pub fn metrics_panel(metrics: &MetricsSnapshot) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(title(metrics.heading, metrics.subtitle))
+        .child(div().h(px(2.)).flex_none())
+        .child(
+            div()
+                .text_2xl()
+                .text_color(rgb(ACCENT))
+                .child(format!("{:.1} FPS", metrics.fps)),
+        )
+        .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+            "{:.2} ms · producer {:.2} · hand-off {:.2} · GPUI {:.2}",
+            metrics.interval_ms, metrics.producer_ms, metrics.handoff_ms, metrics.gpui_ms
+        )))
+        .child(div().h(px(4.)).flex_none())
+        .child(section_label("Frame"))
+        .child(row(
+            "frame interval",
+            format!("{:.2} ms", metrics.interval_ms),
+        ))
+        .child(row("producer", format!("{:.2} ms", metrics.producer_ms)))
+        .child(row("hand-off", format!("{:.2} ms", metrics.handoff_ms)))
+        .child(row("GPU wait", format!("{:.2} ms", metrics.gpu_wait_ms)))
+        .child(row("GPUI draw", format!("{:.2} ms", metrics.gpui_ms)))
+        .child(row(
+            "present wait",
+            format!("{:.2} ms", metrics.present_wait_ms),
+        ))
+        .child(row("evaluate", format!("{:.2} ms", metrics.evaluate_ms)))
+        .child(row("layout", format!("{:.2} ms", metrics.layout_ms)))
+        .child(row("pipeline paint", format!("{:.2} ms", metrics.paint_ms)))
+        .child(div().h(px(4.)).flex_none())
+        .child(section_label("Producer"))
+        .child(row("adapter", metrics.adapter.clone()))
+        .child(row("path", metrics.path.clone()))
+        .child(row(
+            "size",
+            format!("{} × {}", metrics.width, metrics.height),
+        ))
+        .child(row("produced", metrics.produced.to_string()))
+        .child(row("dropped", metrics.dropped.to_string()))
+        .child(div().h(px(4.)).flex_none())
+        .child(section_label("Counters"))
+        .child(row("GPUI frames", metrics.gpui_frames.to_string()))
+        .child(row("asked", metrics.asked.to_string()))
+        .child(row(
+            "window",
+            if metrics.active { "active" } else { "inactive" }.to_owned(),
+        ))
+        .into_any_element()
+}
+
+/// The left column's histogram block, built from the same snapshot as the right panel.
+pub fn metrics_histogram(metrics: &MetricsSnapshot) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(section_label("Frame interval"))
+        .child(histogram(&metrics.intervals, Some(&metrics.work)))
+        .child(histogram_caption(true))
+        .child(pacing_note(
+            metrics.interval_ms,
+            metrics.gpui_ms,
+            metrics.present_wait_ms,
+            metrics.active,
+        ))
         .into_any_element()
 }

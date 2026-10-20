@@ -167,7 +167,7 @@ mod demo {
         AnyElement, App, Bounds, Context, Corners, Entity, FocusId, FramePipeline,
         FramePipelineExt, IntoElement, PhaseMetrics, PreparedRoots, Render, ScrollDelta,
         StandardImmediatePipeline, Window as GpuiWindow, WindowBounds, WindowMetrics,
-        WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
+        WindowOptions, div, gpu_canvas, prelude::*, px, size,
     };
     use gpui_engine::DmaBufHandle;
     use gpui_interop::{
@@ -175,9 +175,9 @@ mod demo {
     };
     use gpui_wgpu::{ImportedTextureExt as _, WgpuRenderer};
     use interop_demo::{
-        ACCENT, LEFT_WIDTH, MUTED, PALETTES, control, error_panel, histogram, histogram_caption,
-        histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
-        page, panel, section_label, title, viewport_frame,
+        LEFT_WIDTH, MetricsSnapshot, PALETTES, control, error_panel, histogram_style,
+        metrics_histogram, metrics_panel, metrics_panel_style, overlay_badge, overlay_hint, page,
+        panel, section_label, viewport_frame,
     };
 
     /// The headless bench's fixed size. The windowed viewport follows its canvas bounds instead,
@@ -1323,8 +1323,13 @@ mod demo {
         active: bool,
         fps: f32,
         intervals: VecDeque<f32>,
+        /// The GPUI draw time of each interval, for the histogram's green foot.
+        work: VecDeque<f32>,
         last: Option<Instant>,
         gpui_frames: u64,
+        asked: u64,
+        width: u32,
+        height: u32,
     }
 
     impl Metrics {
@@ -1345,8 +1350,12 @@ mod demo {
             if let Some(last) = self.last.replace(now) {
                 self.intervals
                     .push_back((now - last).as_secs_f32() * 1000.0);
+                // `draw_ms` is the previous displayed frame's GPUI cost; one frame behind is
+                // invisible in a 60-bar histogram and avoids waiting for `end_frame`.
+                self.work.push_back(self.draw_ms);
                 while self.intervals.len() > 120 {
                     self.intervals.pop_front();
+                    self.work.pop_front();
                 }
             }
             self.interval_ms = self.intervals.back().copied().unwrap_or(0.0);
@@ -1359,6 +1368,37 @@ mod demo {
         }
     }
 
+    impl Metrics {
+        fn snapshot(&self, info: &HeaderInfo) -> MetricsSnapshot {
+            MetricsSnapshot {
+                heading: "Bevy, inside GPUI",
+                subtitle: "A headless Bevy app renders into a texture on the window renderer's \
+                           own device.",
+                fps: self.fps,
+                interval_ms: self.interval_ms,
+                producer_ms: self.update_ms + self.paint_ms,
+                handoff_ms: self.transport_ms,
+                gpu_wait_ms: self.wait_ms,
+                gpui_ms: self.draw_ms,
+                present_wait_ms: self.present_wait_ms,
+                evaluate_ms: self.evaluate_ms,
+                layout_ms: self.layout_ms,
+                paint_ms: self.pipeline_paint_ms,
+                produced: self.frames,
+                gpui_frames: self.gpui_frames,
+                asked: self.asked,
+                dropped: 0,
+                width: self.width,
+                height: self.height,
+                adapter: format!("{} · {}", info.gpu, info.backend),
+                path: info.hand_off.clone(),
+                active: self.active,
+                intervals: self.intervals.iter().copied().collect(),
+                work: self.work.iter().copied().collect(),
+            }
+        }
+    }
+
     /// Root-pass durations, copied out of `PhaseMetrics` once a frame.
     #[derive(Clone, Copy, Default)]
     struct PhaseCosts {
@@ -1368,6 +1408,7 @@ mod demo {
         draw_ms: f32,
         active: bool,
         frames: u64,
+        asked: u64,
     }
 
     /// Records the root passes and forwards every one to `inner`. The same decorator
@@ -1404,6 +1445,7 @@ mod demo {
     impl<P: FramePipeline> FramePipeline for MetricsPipeline<P> {
         fn should_render(&mut self, is_dirty: bool, metrics: &WindowMetrics) -> bool {
             self.active = metrics.is_active;
+            self.costs.borrow_mut().asked += 1;
             self.inner.should_render(is_dirty, metrics)
         }
 
@@ -1474,8 +1516,7 @@ mod demo {
     /// The right column: the title, the live metrics and the producer's path. Its text is cached,
     /// so the shapes are rebuilt only when the snapshot is refreshed (5×/s).
     struct MetricsPanel {
-        info: Rc<RefCell<HeaderInfo>>,
-        metrics: Rc<RefCell<Option<Metrics>>>,
+        metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
     }
 
     impl Render for MetricsPanel {
@@ -1484,15 +1525,16 @@ mod demo {
             _window: &mut GpuiWindow,
             _cx: &mut Context<Self>,
         ) -> impl IntoElement {
-            let info = self.info.borrow().clone();
-            let metrics = self.metrics.borrow().clone().unwrap_or_default();
-            metrics_section(&info, &metrics)
+            match self.metrics.borrow().as_ref() {
+                Some(metrics) => metrics_panel(metrics),
+                None => div().into_any_element(),
+            }
         }
     }
 
     /// The left column's cached interval histogram.
     struct HistogramPanel {
-        metrics: Rc<RefCell<Option<Metrics>>>,
+        metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
     }
 
     impl Render for HistogramPanel {
@@ -1501,8 +1543,10 @@ mod demo {
             _window: &mut GpuiWindow,
             _cx: &mut Context<Self>,
         ) -> impl IntoElement {
-            let metrics = self.metrics.borrow().clone().unwrap_or_default();
-            histogram_section(&metrics)
+            match self.metrics.borrow().as_ref() {
+                Some(metrics) => metrics_histogram(metrics),
+                None => div().into_any_element(),
+            }
         }
     }
 
@@ -1518,7 +1562,7 @@ mod demo {
         scene: Rc<RefCell<Option<BevyScene>>>,
         error: Rc<RefCell<Option<String>>>,
         metrics: Rc<RefCell<Metrics>>,
-        panel_metrics: Rc<RefCell<Option<Metrics>>>,
+        panel_metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
         header_info: Rc<RefCell<HeaderInfo>>,
         metrics_panel: Entity<MetricsPanel>,
         histogram_panel: Entity<HistogramPanel>,
@@ -1546,7 +1590,6 @@ mod demo {
             let panel_metrics = Rc::new(RefCell::new(None));
             let header_info = Rc::new(RefCell::new(HeaderInfo::default()));
             let metrics_panel = cx.new(|_| MetricsPanel {
-                info: header_info.clone(),
                 metrics: panel_metrics.clone(),
             });
             let histogram_panel = cx.new(|_| HistogramPanel {
@@ -1584,7 +1627,7 @@ mod demo {
                 .displayed_at
                 .is_none_or(|at| at.elapsed() >= Duration::from_millis(500))
             {
-                let (gpu, backend, hand_off) = {
+                let (gpu, backend, hand_off, width, height) = {
                     let scene = self.scene.borrow();
                     match scene.as_ref() {
                         Some(scene) => (
@@ -1595,15 +1638,18 @@ mod demo {
                             } else {
                                 "same-device texture".to_owned()
                             },
+                            scene.width,
+                            scene.height,
                         ),
-                        None => ("—".to_owned(), "—".to_owned(), "—".to_owned()),
+                        None => ("—".to_owned(), "—".to_owned(), "—".to_owned(), 0, 0),
                     }
                 };
-                *self.header_info.borrow_mut() = HeaderInfo {
+                let info = HeaderInfo {
                     gpu,
                     backend,
                     hand_off,
                 };
+                *self.header_info.borrow_mut() = info.clone();
 
                 let mut metrics = self.metrics.borrow().clone();
                 let costs = *self.phase_costs.borrow();
@@ -1614,7 +1660,10 @@ mod demo {
                 metrics.present_wait_ms = (metrics.interval_ms - costs.draw_ms).max(0.0);
                 metrics.active = costs.active;
                 metrics.gpui_frames = costs.frames;
-                *self.panel_metrics.borrow_mut() = Some(metrics);
+                metrics.asked = costs.asked;
+                metrics.width = width;
+                metrics.height = height;
+                *self.panel_metrics.borrow_mut() = Some(metrics.snapshot(&info));
                 self.displayed_at = Some(Instant::now());
                 self.metrics_panel.update(cx, |_, cx| cx.notify());
                 self.histogram_panel.update(cx, |_, cx| cx.notify());
@@ -1712,106 +1761,6 @@ mod demo {
             .into_any_element()
     }
 
-    /// The left column's histogram block: the interval bars and where the interval went.
-    fn histogram_section(metrics: &Metrics) -> AnyElement {
-        let intervals: Vec<f32> = metrics.intervals.iter().copied().collect();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(section_label("Frame interval"))
-            .child(histogram(&intervals, None))
-            .child(histogram_caption(false))
-            .child(pacing_note(
-                metrics.interval_ms,
-                metrics.draw_ms,
-                metrics.present_wait_ms,
-                metrics.active,
-            ))
-            .into_any_element()
-    }
-
-    /// The right column: title, frame rate, the pipeline's breakdown and the engine's own timings.
-    fn metrics_section(info: &HeaderInfo, metrics: &Metrics) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(title(
-                "Bevy, inside GPUI",
-                "A headless Bevy app renders into a texture on the window renderer's own device.",
-            ))
-            .child(div().h(px(2.)).flex_none())
-            .child(
-                div()
-                    .text_2xl()
-                    .text_color(rgb(ACCENT))
-                    .child(format!("{:.1} FPS", metrics.fps)),
-            )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                "{:.2} ms · bevy {:.2} · gpu {:.2} · layout {:.2}",
-                metrics.interval_ms, metrics.update_ms, metrics.wait_ms, metrics.layout_ms
-            )))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Frame"))
-            .child(metric_row(
-                "frame interval",
-                format!("{:.2} ms", metrics.interval_ms),
-            ))
-            .child(metric_row("draw", format!("{:.2} ms", metrics.draw_ms)))
-            .child(metric_row(
-                "present wait",
-                format!("{:.2} ms", metrics.present_wait_ms),
-            ))
-            .child(metric_row(
-                "evaluate",
-                format!("{:.2} ms", metrics.evaluate_ms),
-            ))
-            .child(metric_row("layout", format!("{:.2} ms", metrics.layout_ms)))
-            .child(metric_row(
-                "pipeline paint",
-                format!("{:.2} ms", metrics.pipeline_paint_ms),
-            ))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Engine"))
-            .child(metric_row(
-                "gpui frames",
-                format!("{}", metrics.gpui_frames),
-            ))
-            .child(metric_row("bevy frames", format!("{}", metrics.frames)))
-            .child(metric_row(
-                "engine step",
-                format!("{:.2} ms", metrics.update_ms),
-            ))
-            .child(metric_row("gpu wait", format!("{:.2} ms", metrics.wait_ms)))
-            .child(metric_row(
-                "transport",
-                format!("{:.2} ms", metrics.transport_ms),
-            ))
-            .child(metric_row(
-                "texture paint",
-                format!("{:.2} ms", metrics.paint_ms),
-            ))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Adapter"))
-            .child(metric_row(
-                "gpu",
-                format!("{} · {}", info.gpu, info.backend),
-            ))
-            .child(metric_row("hand-off", info.hand_off.clone()))
-            .child(metric_row(
-                "present rate",
-                format!("{:.1} fps", metrics.fps),
-            ))
-            .child(metric_row(
-                "window",
-                if metrics.active { "active" } else { "inactive" }.to_owned(),
-            ))
-            .into_any_element()
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn viewport(
         scene: Rc<RefCell<Option<BevyScene>>>,
@@ -1891,9 +1840,11 @@ mod demo {
                 return;
             }
             if stepped {
-                metrics
-                    .borrow_mut()
-                    .record(update, wait, transport, paint.elapsed());
+                let mut metrics = metrics.borrow_mut();
+                // The previous GPUI frame's draw time, so the histogram's green foot is
+                // per-interval rather than whatever the last 500 ms refresh sampled.
+                metrics.draw_ms = phase_costs.borrow().draw_ms;
+                metrics.record(update, wait, transport, paint.elapsed());
             }
 
             if config.log_stats {

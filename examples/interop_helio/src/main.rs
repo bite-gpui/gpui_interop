@@ -4,11 +4,13 @@
 //! cargo run -p interop_helio
 //! ```
 //!
-//! Helio is not on crates.io yet, so this pins the revision
-//! `4356a855e33b691aac10621e712bd973d8c4b68b` — the one the upstream
-//! `Helio_Standalone_Demo` uses. Its renderer is built against **wgpu 30**;
-//! GPUI's renderer is still **wgpu 29**. Cargo keeps both majors in one graph
-//! because nothing in either renderer's type system crosses the boundary.
+//! Helio is not on crates.io yet, so this pins upstream `main` at
+//! `3398609bb5f2ef57d9bba663a17a86af57de6aaa`. That revision authors its scene
+//! through SceneDB (Helio 3.0) and builds against **wgpu 30.0.1 from
+//! Far-Beyond-Pulsar's fork**; the workspace root patches the whole wgpu 30
+//! stack to it. GPUI's renderer is still **wgpu 29**, and Cargo keeps both
+//! majors in one graph because nothing in either renderer's type system
+//! crosses the boundary.
 //!
 //! # Windowing
 //!
@@ -42,20 +44,39 @@
 //!
 //! The frame is ordered by a `sync_file` exported from a binary semaphore that
 //! an empty submission on Helio's queue signals after the graph has run. A ring
-//! of two images recycles a slot only after the renderer signals the `eventfd`
+//! of three images recycles a slot only after the renderer signals the `eventfd`
 //! it was handed, so drawing frame N+1 never races GPUI sampling frame N.
 //!
-//! The renderer polls that fence for only 16 ms and drops the surface if it has
-//! not signalled, so the producer waits for it here before the hand-off — the
-//! CPU read-back's wait without the copy. A Helio frame slower than 16 ms then
-//! presents as a frame, not as black.
+//! The fence is handed over live: GPUI polls it for at most 16 ms and drops the
+//! surface if it has not signalled, but the producer does not wait here. It also
+//! keeps one frame of lead time — each paint shows the frame the previous paint
+//! prepared, then prepares the next — so the GPU has a whole interval to signal
+//! instead of whatever is left after the paint starts. The field holds 60 fps at
+//! 677 × 686 on the NVIDIA 930M with this pipelining; without it, the ~4.5 ms
+//! fence landed just inside the vsync deadline and every other frame missed.
 //!
 //! # Scene
 //!
-//! The scene is the standalone demo's: a sky, a reflective floor, four
+//! The scene is built as SceneDB rows: mesh, material, object and light
+//! components, flushed to the renderer's GPU mirror at each frame boundary.
+//! The default scene is the standalone demo's — a sky, a reflective floor, four
 //! columns with spheres, four orbiting point lights, and a metallic crystal
-//! spinner. It exercises Helio's default graph — GI, shadows, reflections,
-//! post-processing — rather than a single forward pass.
+//! spinner — and exercises Helio's default graph: GI, shadows, reflections and
+//! post-processing. `--graph forward` runs the forward-lit graph instead, whose
+//! `BackgroundPass` clears `pre_aa` before drawing, so frames no longer
+//! accumulate; `--graph simple` is the one-pass micro baseline.
+//!
+//! That `BackgroundPass` used to hard-code black, so a field with no sky was
+//! pitch black. This example pins a fork (`Vanuan/Helio`) whose
+//! `RendererConfig::background_color` the pass honours, with alpha carried
+//! through FXAA, the fog composite and post-processing. The clear is fully
+//! transparent, so the dma-buf's empty pixels show GPUI's own background —
+//! `paint_surface` blends with alpha — and the clear costs nothing per pixel.
+//!
+//! The field hands its acquire fence over live. The full scene's frame is
+//! slower than GPUI's 16 ms timeout, so it completes the fence producer-side
+//! instead; handing that one over live gets every other surface dropped, which
+//! reads as a black viewport with frames flashing through.
 //!
 //! Drag to orbit the camera, scroll to zoom. Pause stops the clock but keeps
 //! the last frame on screen. `--stats` prints the frame rate and the render and
@@ -93,8 +114,10 @@ mod demo {
     use ash::vk;
     use glam::{EulerRot, Mat4, Quat, Vec3};
     use gpui::{
-        AnyElement, App, Bounds, Context, Entity, IntoElement, Render, ScrollDelta, Window,
-        WindowBounds, WindowOptions, div, gpu_canvas, prelude::*, px, rgb, size,
+        AnyElement, App, Bounds, Context, Entity, FocusId, FramePipeline, FramePipelineExt,
+        IntoElement, PhaseMetrics, PreparedRoots, Render, ScrollDelta, StandardImmediatePipeline,
+        Window, Window as GpuiWindow, WindowBounds, WindowMetrics, WindowOptions, div, gpu_canvas,
+        prelude::*, px, size,
     };
     use gpui_interop::vulkan_export::{
         DmaBufHandle, ExportDevice, SurfaceFormatKind, Tiling, allocate_export_image,
@@ -102,17 +125,23 @@ mod demo {
     use gpui_interop::{SurfaceEvent, SurfaceInput, SurfacePoint, attach, surface_input};
     use gpui_wgpu::WgpuRenderer;
     use helio::{
-        Camera, GpuLight, GpuMaterial, GraphRebuilder, GroupMask, LightId, LightType, MaterialId,
-        MeshId, MeshUpload, Movability, ObjectDescriptor, ObjectId, PackedVertex, RenderGraph,
-        Renderer, RendererBuilder, RendererConfig, SceneActor, SkyActor,
+        Camera, GpuLight, GpuMaterial, GraphRebuilder, LightType, MeshUpload, Movability,
+        PackedVertex, PassBuildContext, RenderGraph, Renderer, RendererBuilder, RendererConfig,
     };
-    use helio_default_graphs::build_default_graph_external;
+    use helio_default_graphs::{
+        build_default_graph_external_with_context, build_forward_only_graph_with_context,
+    };
+    use helio_pass_forward_lit::LightComponent;
+    use helio_pass_gbuffer::{MaterialComponent, MeshComponent, StaticObjectComponent};
     use helio_pass_simple_cube::SimpleCubePass;
+    use pulsar_scenedb::gpu::GpuMirrorHandle;
+    // SceneDB has its own `Entity`; `gpui::Entity` is already in scope below.
     use interop_demo::{
-        ACCENT, LEFT_WIDTH, MUTED, control, error_panel, histogram, histogram_caption,
-        histogram_style, metric_row, metrics_panel_style, overlay_badge, overlay_hint, pacing_note,
-        page, panel, section_label, title, viewport_frame,
+        LEFT_WIDTH, MetricsSnapshot, control, error_panel, histogram_style, metrics_histogram,
+        metrics_panel, metrics_panel_style, overlay_badge, overlay_hint, page, panel,
+        section_label, viewport_frame,
     };
+    use pulsar_scenedb::{Entity as SceneEntity, World};
 
     /// Helio's output format. GPUI imports the exported image as `rgba8`.
     const FORMAT: wgpu30::TextureFormat = wgpu30::TextureFormat::Rgba8UnormSrgb;
@@ -122,15 +151,15 @@ mod demo {
     /// sampling, and one free to render into. A release that never comes costs a timeout, not the
     /// frame loop.
     const SLOTS: usize = 3;
+    /// How long a slow scene waits for its own acquire fence before the hand-off.
+    ///
+    /// GPUI polls the fence for only 16 ms. The field's frame is ~4.5 ms, so it is handed over
+    /// live and the consumer never waits; the full scene's frame is ~40 ms on the 930M, and a live
+    /// hand-off there is dropped, which presents as a black viewport with frames flashing through.
+    /// Waiting here is the read-back's wait without the copy.
+    const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
     /// How long a handed-out slot waits for the renderer's release before it is reclaimed.
     const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
-    /// How long the producer waits for its own acquire fence before handing a frame over.
-    ///
-    /// The renderer polls the fence for only 16 ms (`ACQUIRE_FENCE_TIMEOUT` in `gpui_wgpu`) and
-    /// drops the surface for that frame otherwise. A Helio frame is regularly slower than that, so
-    /// the hand-off would lose almost every frame; waiting here — the CPU read-back's wait without
-    /// the copy — is what keeps the viewport stable.
-    const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Orbit/zoom, the same feel as the other two demos.
     const SENSITIVITY: f32 = 0.007;
@@ -170,25 +199,25 @@ mod demo {
     ///
     /// The default graph is the 39-pass standalone one. `Simple` is a single pass drawing one
     /// debug cube — the micro baseline, comparable to `interop_wgpu`'s hand-written scene.
-    ///
-    /// Helio's forward graph is deliberately not exposed: at this pin `ForwardLitPass` loads
-    /// `pre_aa` and no pass in that graph clears it, so old frames accumulate.
+    /// `Forward` is the forward-lighting graph: G-buffer, decals, deferred lighting and SSR are
+    /// replaced by one lit-geometry pass. Its `BackgroundPass` clears `pre_aa` first, so frames do
+    /// not accumulate (Helio's own graph only grew that clear in the revision this example pins).
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     enum GraphKind {
         #[default]
         Default,
         Simple,
+        Forward,
     }
 
     fn parse_graph(value: &str) -> GraphKind {
         match value {
             "default" | "full" => GraphKind::Default,
             "simple" | "cube" => GraphKind::Simple,
-            "forward" => usage_error(
-                "--graph forward is disabled: Helio's forward graph does not clear pre_aa at this \
-                 pin, so frames accumulate. Use default or simple.",
-            ),
-            other => usage_error(&format!("--graph: {other:?} is not default or simple")),
+            "forward" => GraphKind::Forward,
+            other => usage_error(&format!(
+                "--graph: {other:?} is not default, simple or forward"
+            )),
         }
     }
 
@@ -295,7 +324,7 @@ mod demo {
             "  --probe              read the exported image back once and print its centre pixel\n",
             "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear\n",
             "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
-            "  --graph <KIND>       default (39 passes) or simple (one cube)\n",
+            "  --graph <KIND>       default (39 passes), forward (lit geometry) or simple (one cube)\n",
             "  -h, --help           show this help\n",
             "\n",
             "Helio's wgpu 30 frame leaves as a dma-buf and GPUI imports it on its own wgpu 29\n",
@@ -328,6 +357,108 @@ mod demo {
         );
     }
 
+    /// Root-pass durations, copied out of `PhaseMetrics` once a frame.
+    #[derive(Clone, Copy, Default)]
+    struct PhaseCosts {
+        evaluate_ms: f32,
+        layout_ms: f32,
+        paint_ms: f32,
+        draw_ms: f32,
+        active: bool,
+        frames: u64,
+        asked: u64,
+    }
+
+    /// Records the root passes and forwards every one to `inner`, the same decorator
+    /// `interop_wgpu` and `interop_bevy` use.
+    struct MetricsPipeline<P> {
+        inner: P,
+        phases: Rc<RefCell<PhaseMetrics>>,
+        costs: Rc<RefCell<PhaseCosts>>,
+        last: PhaseMetrics,
+        started: Option<Instant>,
+        active: bool,
+        frames: u64,
+    }
+
+    impl<P> MetricsPipeline<P> {
+        fn new(
+            inner: P,
+            phases: Rc<RefCell<PhaseMetrics>>,
+            costs: Rc<RefCell<PhaseCosts>>,
+        ) -> Self {
+            Self {
+                inner,
+                phases,
+                costs,
+                last: PhaseMetrics::default(),
+                started: None,
+                active: false,
+                frames: 0,
+            }
+        }
+    }
+
+    impl<P: FramePipeline> FramePipeline for MetricsPipeline<P> {
+        fn should_render(&mut self, is_dirty: bool, metrics: &WindowMetrics) -> bool {
+            self.active = metrics.is_active;
+            self.costs.borrow_mut().asked += 1;
+            self.inner.should_render(is_dirty, metrics)
+        }
+
+        fn begin_frame(&mut self, window: &mut GpuiWindow, cx: &mut App) {
+            self.last = *self.phases.borrow();
+            self.started = Some(Instant::now());
+            self.frames += 1;
+            self.costs.borrow_mut().frames = self.frames;
+            self.inner.begin_frame(window, cx);
+        }
+
+        fn evaluate_roots(&mut self, window: &mut GpuiWindow, cx: &mut App) -> PreparedRoots {
+            self.inner.evaluate_roots(window, cx)
+        }
+
+        fn layout_roots(
+            &mut self,
+            window: &mut GpuiWindow,
+            roots: &mut PreparedRoots,
+            cx: &mut App,
+        ) {
+            self.inner.layout_roots(window, roots, cx);
+        }
+
+        fn paint_roots(&mut self, window: &mut GpuiWindow, roots: PreparedRoots, cx: &mut App) {
+            self.inner.paint_roots(window, roots, cx);
+        }
+
+        fn finish_frame(&mut self, window: &mut GpuiWindow, cx: &mut App) {
+            self.inner.finish_frame(window, cx);
+        }
+
+        fn complete_frame(&mut self, window: &mut GpuiWindow, cx: &mut App) -> Option<FocusId> {
+            self.inner.complete_frame(window, cx)
+        }
+
+        fn end_frame(&mut self, window: &mut GpuiWindow, cx: &mut App, focus: Option<FocusId>) {
+            self.inner.end_frame(window, cx, focus);
+
+            let phases = *self.phases.borrow();
+            let since = |now: Duration, then: Duration| now.saturating_sub(then);
+            let mut costs = self.costs.borrow_mut();
+            costs.evaluate_ms = since(phases.evaluate, self.last.evaluate).as_secs_f32() * 1000.0;
+            costs.layout_ms = since(phases.layout, self.last.layout).as_secs_f32() * 1000.0;
+            costs.paint_ms = since(phases.paint, self.last.paint).as_secs_f32() * 1000.0;
+            costs.draw_ms = self
+                .started
+                .take()
+                .map(|started| started.elapsed().as_secs_f32() * 1000.0)
+                .unwrap_or(0.0);
+            costs.active = self.active;
+            drop(costs);
+            self.last = phases;
+        }
+    }
+
     /// One snapshot of the numbers the right panel shows.
     #[derive(Clone, Default)]
     struct Metrics {
@@ -336,14 +467,26 @@ mod demo {
         fps: f32,
         render_ms: f32,
         export_ms: f32,
-        fence_ms: f32,
-        /// The part of the interval outside the producer: GPUI's own layout, text, compositing and
-        /// the wait for the next animation frame.
+        /// Time the producer spent completing the acquire fence before the hand-off; zero when it
+        /// handed the fence over live.
+        gpu_wait_ms: f32,
+        /// The part of the interval outside the producer. Kept for `--stats`.
         gpui_ms: f32,
+        evaluate_ms: f32,
+        layout_ms: f32,
+        paint_ms: f32,
+        draw_ms: f32,
+        present_wait_ms: f32,
+        gpui_frames: u64,
+        asked: u64,
+        dropped: u64,
+        active: bool,
         width: u32,
         height: u32,
         adapter: String,
         intervals: VecDeque<f32>,
+        /// GPUI draw time of each interval, for the histogram's green foot.
+        work: VecDeque<f32>,
         last: Option<Instant>,
     }
 
@@ -352,28 +495,33 @@ mod demo {
             &mut self,
             render: Duration,
             export: Duration,
-            fence: Duration,
+            gpu_wait: Duration,
             width: u32,
             height: u32,
+            dropped: u64,
         ) {
             self.frames += 1;
             self.render_ms = render.as_secs_f32() * 1000.0;
             self.export_ms = export.as_secs_f32() * 1000.0;
-            self.fence_ms = fence.as_secs_f32() * 1000.0;
+            self.gpu_wait_ms = gpu_wait.as_secs_f32() * 1000.0;
             self.width = width;
             self.height = height;
+            self.dropped = dropped;
 
             let now = Instant::now();
             if let Some(last) = self.last.replace(now) {
                 self.intervals
                     .push_back((now - last).as_secs_f32() * 1000.0);
+                // One displayed frame behind, like the other two demos.
+                self.work.push_back(self.draw_ms);
                 while self.intervals.len() > 120 {
                     self.intervals.pop_front();
+                    self.work.pop_front();
                 }
             }
             self.interval_ms = self.intervals.back().copied().unwrap_or(0.0);
             self.gpui_ms =
-                (self.interval_ms - self.render_ms - self.export_ms - self.fence_ms).max(0.0);
+                (self.interval_ms - self.render_ms - self.export_ms - self.gpu_wait_ms).max(0.0);
             self.fps = if self.intervals.is_empty() {
                 0.0
             } else {
@@ -381,19 +529,48 @@ mod demo {
                 1000.0 / average
             };
         }
+
+        fn snapshot(&self) -> MetricsSnapshot {
+            MetricsSnapshot {
+                heading: "Helio, inside GPUI",
+                subtitle: "Helio's wgpu 30 renderer, exported as a dma-buf to GPUI's wgpu 29 \
+                           device.",
+                fps: self.fps,
+                interval_ms: self.interval_ms,
+                producer_ms: self.render_ms,
+                handoff_ms: self.export_ms,
+                gpu_wait_ms: self.gpu_wait_ms,
+                gpui_ms: self.draw_ms,
+                present_wait_ms: self.present_wait_ms,
+                evaluate_ms: self.evaluate_ms,
+                layout_ms: self.layout_ms,
+                paint_ms: self.paint_ms,
+                produced: self.frames,
+                gpui_frames: self.gpui_frames,
+                asked: self.asked,
+                dropped: self.dropped,
+                width: self.width,
+                height: self.height,
+                adapter: self.adapter.clone(),
+                path: "dma-buf · zero copy".to_owned(),
+                active: self.active,
+                intervals: self.intervals.iter().copied().collect(),
+                work: self.work.iter().copied().collect(),
+            }
+        }
     }
 
     /// What moves each frame, per scene.
     enum Animation {
         Full {
-            spinner: ObjectId,
-            lights: [LightId; 4],
+            spinner: SceneEntity,
+            lights: [SceneEntity; 4],
             shadow_index: u32,
         },
         Field {
-            cubes: Vec<ObjectId>,
+            cubes: Vec<SceneEntity>,
             /// One material per cube, so the palette button can recolour the field once per click.
-            materials: Vec<MaterialId>,
+            materials: Vec<SceneEntity>,
         },
         Clear,
     }
@@ -405,10 +582,19 @@ mod demo {
     struct HelioScene {
         slots: Vec<Slot>,
         renderer: Renderer,
+        /// The authoritative scene. The renderer only holds its GPU projection, so every CPU-side
+        /// change has to be flushed to the mirror before a frame is drawn.
+        scene_db: pulsar_scenedb::SceneDb,
         queue: Arc<wgpu30::Queue>,
         device: Arc<wgpu30::Device>,
         /// The handle last handed to GPUI; re-presented while paused.
         presented: Option<DmaBufHandle>,
+        /// A rendered frame waiting for the next paint. One frame of lead time gives the GPU a
+        /// whole interval to signal its fence instead of whatever is left after the paint starts.
+        pending: Option<(usize, DmaBufHandle)>,
+        /// Whether this scene's frame exceeds GPUI's 16 ms acquire-fence timeout. The field is
+        /// under it, so the fence is handed over live; the full scene is not.
+        wait_for_gpu: bool,
         /// The slot `presented` belongs to. It is never chosen for rendering while it is the
         /// presented image: GPUI may still be sampling a re-presentation even after the release
         /// from the previous one has arrived.
@@ -499,27 +685,30 @@ mod demo {
             let (device, queue) = helio_device(adapter)?;
             let (device, queue) = (Arc::new(device), Arc::new(queue));
 
-            let builder = RendererBuilder::new(RendererConfig::new(width, height, FORMAT));
-            let builder = match graph {
-                GraphKind::Default => builder.with_graph(Box::new(|d, q, s, c, ds, cb, csb| {
-                    build_default_graph_external(d, q, s, c, ds, cb, csb, None)
-                })),
-                GraphKind::Simple => builder.with_graph(Box::new(|d, q, _s, c, _ds, _cb, _csb| {
-                    simple_graph(d, q, c)
-                })),
-            };
-            let mut renderer = builder
+            let mut scene_db = new_scene_db(&device, &queue);
+            // A transparent scene background: the field has no sky or floor, so the clear is all
+            // that fills the viewport, and GPUI's `paint_surface` blends the dma-buf over the
+            // window's own background. The fork preserves alpha through FXAA, the fog composite
+            // and post-processing, so the alpha written here reaches the compositor.
+            let config = RendererConfig::new(width, height, FORMAT).with_background_color([0.0; 4]);
+            let builder = RendererBuilder::new(config, scene_db_handle(&scene_db));
+            let builder = builder.with_pass_build_context(match graph {
+                GraphKind::Default => Box::new(build_default_graph_external_with_context),
+                GraphKind::Simple => Box::new(simple_graph),
+                GraphKind::Forward => Box::new(build_forward_only_graph_with_context),
+            });
+            let renderer = builder
                 // Helio shares a device it did not create: no owned-device readbacks, no teardown.
                 .with_external_device()
                 .build(device.clone(), queue.clone(), width, height, FORMAT);
 
             let (animation, target) = match scene {
                 SceneKind::Full => (
-                    populate_full(&mut renderer, shadows.unwrap_or(true)),
+                    populate_full(&mut scene_db.world, shadows.unwrap_or(true)),
                     TARGET,
                 ),
                 SceneKind::Field => (
-                    populate_field(&mut renderer, shadows.unwrap_or(false)),
+                    populate_field(&mut scene_db.world, shadows.unwrap_or(false)),
                     Vec3::ZERO,
                 ),
                 SceneKind::Clear => (Animation::Clear, Vec3::ZERO),
@@ -529,9 +718,12 @@ mod demo {
             Ok(Self {
                 slots,
                 renderer,
+                scene_db,
                 queue,
                 device,
                 presented: None,
+                pending: None,
+                wait_for_gpu: matches!(scene, SceneKind::Full),
                 presented_slot: None,
                 width,
                 height,
@@ -557,6 +749,7 @@ mod demo {
             self.renderer.set_render_size(width, height);
             self.slots = slots(&self.device, width, height)?;
             self.presented = None;
+            self.pending = None;
             self.presented_slot = None;
             self.width = width;
             self.height = height;
@@ -590,7 +783,8 @@ mod demo {
                 } => {
                     let rot = Quat::from_rotation_y(elapsed * 0.8)
                         * Quat::from_rotation_x((elapsed * 0.5).sin() * 0.3);
-                    let _ = self.renderer.scene_mut().update_object_transform(
+                    update_object_transform(
+                        &mut self.scene_db.world,
                         *spinner,
                         Mat4::from_rotation_translation(rot, Vec3::new(0.0, 2.5, 0.0)),
                     );
@@ -604,7 +798,8 @@ mod demo {
                     for (i, &light) in lights.iter().enumerate() {
                         let angle = elapsed * 0.6 + i as f32 * std::f32::consts::FRAC_PI_2;
                         let (x, z) = (angle.cos() * 4.0, angle.sin() * 4.0);
-                        let _ = self.renderer.scene_mut().update_light(
+                        update_light(
+                            &mut self.scene_db.world,
                             light,
                             pt_light(
                                 [x, 5.0 + (elapsed * 1.2 + i as f32).sin() * 0.5, z],
@@ -627,10 +822,7 @@ mod demo {
                             Quat::from_euler(EulerRot::YXZ, phase * 0.62, phase * 0.44, 0.0),
                             Vec3::new(fx * SPACING, fy * SPACING, phase.sin() * 0.42),
                         );
-                        let _ = self
-                            .renderer
-                            .scene_mut()
-                            .update_object_transform(cube, transform);
+                        update_object_transform(&mut self.scene_db.world, cube, transform);
                     }
                 }
                 Animation::Clear => {}
@@ -661,25 +853,32 @@ mod demo {
                     from[2] + (to[2] - from[2]) * t,
                     1.0,
                 ];
-                let _ = self
-                    .renderer
-                    .scene_mut()
-                    .update_material(material, make_mat(color, 1.0, 0.0, [0.0; 3], 0.0));
+                if let Some(mut row) = self.scene_db.world.get_mut::<MaterialComponent>(material) {
+                    *row = make_mat(color, 1.0, 0.0, [0.0; 3], 0.0).into();
+                }
             }
         }
 
-        /// Render one frame into a free slot and export it, or `None` when every slot is still in
-        /// flight — a dropped frame rather than a write into a buffer the compositor is sampling.
-        fn render(
+        /// Render one frame into a free slot and export it, ready for `present_pending` on the
+        /// next paint, or `None` when every slot is still in flight — a dropped frame rather than
+        /// a write into a buffer the compositor is sampling.
+        fn prepare(
             &mut self,
             camera: &Camera,
         ) -> anyhow::Result<Option<(Duration, Duration, Duration)>> {
-            let Some(index) = (0..self.slots.len())
-                .find(|&index| Some(index) != self.presented_slot && self.slots[index].released())
-            else {
+            let pending_slot = self.pending.as_ref().map(|(slot, _)| *slot);
+            let Some(index) = (0..self.slots.len()).find(|&index| {
+                Some(index) != self.presented_slot
+                    && Some(index) != pending_slot
+                    && self.slots[index].released()
+            }) else {
                 self.dropped += 1;
                 return Ok(None);
             };
+
+            // CPU-side rows are authoritative but invisible to the GPU until the mirror uploads
+            // them; this is the frame boundary the upstream demos share.
+            self.scene_db.world.flush_gpu_mirror(&self.queue);
 
             let render_start = Instant::now();
             self.renderer
@@ -700,33 +899,42 @@ mod demo {
             let mut handle = self.slots[index].target.submit(&self.queue)?;
             let export = export_start.elapsed();
 
-            // The renderer polls this fence for at most 16 ms and drops the surface if it has not
-            // signalled. Helio's graph is slower than that, so complete the frame here before the
-            // hand-off: the read-back path's wait, without the copy.
-            let fence_start = Instant::now();
-            let ready = handle
-                .acquire_fence
-                .as_ref()
-                .is_none_or(|fence| wait_for_fence(fence, HANDOFF_TIMEOUT));
-            let fence = fence_start.elapsed();
-            if !ready {
-                anyhow::bail!(
-                    "the frame's acquire fence did not signal within {HANDOFF_TIMEOUT:?}"
-                );
+            // Hand the acquire fence over live when the scene fits GPUI's 16 ms timeout; a frame
+            // that does not fit is completed here instead, or the consumer drops it and the
+            // viewport flashes.
+            let gpu_wait_start = Instant::now();
+            if self.wait_for_gpu {
+                let ready = handle
+                    .acquire_fence
+                    .as_ref()
+                    .is_none_or(|fence| wait_for_fence(fence, HANDOFF_TIMEOUT));
+                if !ready {
+                    anyhow::bail!(
+                        "the frame's acquire fence did not signal within {HANDOFF_TIMEOUT:?}"
+                    );
+                }
+                handle.acquire_fence = None;
             }
-            // The GPU has finished; the renderer need not wait on the fence again.
-            handle.acquire_fence = None;
+            let gpu_wait = gpu_wait_start.elapsed();
 
             let release = release_descriptor()?;
             handle.release = Some(Arc::clone(&release));
             let slot = &mut self.slots[index];
             slot.release = Some(release);
             slot.handed_at = Some(Instant::now());
-            self.presented = Some(handle);
-            self.presented_slot = Some(index);
+            self.pending = Some((index, handle));
             self.frames += 1;
 
-            Ok(Some((render, export, fence)))
+            Ok(Some((render, export, gpu_wait)))
+        }
+
+        /// Show the frame prepared on the previous paint. Called even when paused: the painter
+        /// re-presents the same handle, which carries no new fence work.
+        fn present_pending(&mut self) {
+            if let Some((slot, handle)) = self.pending.take() {
+                self.presented = Some(handle);
+                self.presented_slot = Some(slot);
+            }
         }
 
         /// Composite the last exported frame into the canvas. Cheap: GPUI imports the dma-buf on
@@ -831,6 +1039,9 @@ mod demo {
 
         fn dump_slot(&self, index: usize, path: &Path) -> anyhow::Result<()> {
             let pixels = self.read_slot(index)?;
+            // The top-left texel is outside the field: its alpha says whether the transparent
+            // background survived the graph's AA and post-processing.
+            eprintln!("interop_helio: corner rgba {:?}", &pixels[..4]);
             write_bmp(path, self.width, self.height, &pixels)?;
             eprintln!(
                 "interop_helio: wrote {}x{} to {}",
@@ -844,26 +1055,24 @@ mod demo {
 
     /// The micro graph: one pass drawing `SimpleCubePass`'s debug cube.
     ///
-    /// Helio's `build_simple_graph` creates the same pass but its rebuilder returns an unlocked
-    /// graph, so a resize (or the renderer's first rebuild) panics in `execute`. This version locks
-    /// the initial graph and every rebuild.
-    fn simple_graph(
-        device: &Arc<wgpu30::Device>,
-        queue: &Arc<wgpu30::Queue>,
-        config: RendererConfig,
-    ) -> RenderGraph {
-        let mut graph = RenderGraph::new_with_external_device(device, queue);
-        graph.add_pass(Box::new(SimpleCubePass::new(device, FORMAT)));
+    /// Upstream's `build_simple_graph_with_context` returns an unlocked graph, and the renderer
+    /// requires a lock before `execute`; this version locks the graph and every rebuild.
+    fn simple_graph(ctx: PassBuildContext<'_>) -> RenderGraph {
+        let mut graph = RenderGraph::new_with_external_device(ctx.device, ctx.queue);
+        graph.add_pass(Box::new(SimpleCubePass::new(
+            ctx.device,
+            ctx.config.surface_format,
+        )));
         let rebuilder: GraphRebuilder = Arc::new(
-            move |device, queue, _scene, config, _debug_state, _camera, _cull| {
+            |device, queue, config, _debug_state, _camera, _debug_camera, _cull| {
                 let mut graph = RenderGraph::new_with_external_device(device, queue);
-                graph.add_pass(Box::new(SimpleCubePass::new(device, FORMAT)));
+                graph.add_pass(Box::new(SimpleCubePass::new(device, config.surface_format)));
                 graph.lock(config.internal_width(), config.internal_height());
                 graph
             },
         );
         graph.set_graph_data(rebuilder);
-        graph.lock(config.internal_width(), config.internal_height());
+        graph.lock(ctx.config.internal_width(), ctx.config.internal_height());
         graph
     }
 
@@ -1282,63 +1491,49 @@ mod demo {
 
     /// The standalone demo's scene, unchanged in spirit: sky, floor, columns, spheres, four
     /// moving point lights, and a metallic crystal spinner.
-    fn populate_full(renderer: &mut Renderer, shadows: bool) -> Animation {
+    fn populate_full(world: &mut World, shadows: bool) -> Animation {
         let shadow_index = if shadows { 0 } else { u32::MAX };
-        let gold = renderer.scene_mut().insert_material(make_mat(
-            [0.95, 0.75, 0.25, 1.0],
-            0.25,
-            0.85,
-            [0.0; 3],
-            0.0,
-        ));
-        let marble = renderer.scene_mut().insert_material(make_mat(
-            [0.85, 0.83, 0.80, 1.0],
-            0.55,
-            0.0,
-            [0.0; 3],
-            0.0,
-        ));
-        let crystal = renderer.scene_mut().insert_material(make_mat(
-            [0.3, 0.6, 1.0, 1.0],
-            0.05,
-            0.1,
-            [0.2, 0.4, 1.0],
-            2.0,
-        ));
-        let floor = renderer.scene_mut().insert_material(make_mat(
-            [0.22, 0.22, 0.25, 1.0],
-            0.7,
-            0.05,
-            [0.0; 3],
-            0.0,
-        ));
-        renderer.scene_mut().insert_actor(SceneActor::sky(
-            SkyActor::new().with_sky_color([0.15, 0.25, 0.45]),
-        ));
+        let gold = spawn_material(
+            world,
+            make_mat([0.95, 0.75, 0.25, 1.0], 0.25, 0.85, [0.0; 3], 0.0),
+        );
+        let marble = spawn_material(
+            world,
+            make_mat([0.85, 0.83, 0.80, 1.0], 0.55, 0.0, [0.0; 3], 0.0),
+        );
+        let crystal = spawn_material(
+            world,
+            make_mat([0.3, 0.6, 1.0, 1.0], 0.05, 0.1, [0.2, 0.4, 1.0], 2.0),
+        );
+        let floor = spawn_material(
+            world,
+            make_mat([0.22, 0.22, 0.25, 1.0], 0.7, 0.05, [0.0; 3], 0.0),
+        );
+        spawn_sky(world, [0.15, 0.25, 0.45]);
+        // The atmosphere's sky is lit by the scene's first directional light; without one it stays
+        // black. A dim sun restores the sky the old procedural `SkyActor` drew, without competing
+        // with the four point lights that light the floor.
+        spawn_light(
+            world,
+            directional_light(
+                Vec3::new(-0.38, -0.82, -0.44).normalize().to_array(),
+                [1.0, 1.0, 1.0],
+                1.0,
+                u32::MAX,
+            ),
+        );
 
-        let ground = renderer
-            .scene_mut()
-            .insert_actor(SceneActor::mesh(plane_mesh(12.0)))
-            .as_mesh()
-            .unwrap();
-        let _ = add_obj(renderer, ground, floor, Mat4::IDENTITY, 12.0, None);
+        let ground = spawn_mesh(world, plane_mesh(12.0));
+        spawn_object(world, ground, floor, Mat4::IDENTITY, 12.0, None);
 
-        let pillar = renderer
-            .scene_mut()
-            .insert_actor(SceneActor::mesh({
-                let mut mesh = cube_mesh(0.15);
-                for vertex in &mut mesh.vertices {
-                    vertex.position[1] *= 13.33;
-                }
-                mesh
-            }))
-            .as_mesh()
-            .unwrap();
-        let sphere = renderer
-            .scene_mut()
-            .insert_actor(SceneActor::mesh(sphere_mesh(0.4)))
-            .as_mesh()
-            .unwrap();
+        let pillar = spawn_mesh(world, {
+            let mut mesh = cube_mesh(0.15);
+            for vertex in &mut mesh.vertices {
+                vertex.position[1] *= 13.33;
+            }
+            mesh
+        });
+        let sphere = spawn_mesh(world, sphere_mesh(0.4));
 
         let colors = [
             [1.0, 0.3, 0.3],
@@ -1357,44 +1552,31 @@ mod demo {
         .enumerate()
         {
             let (x, z) = (angle.cos() * 4.0, angle.sin() * 4.0);
-            let _ = add_obj(
-                renderer,
+            spawn_object(
+                world,
                 pillar,
                 marble,
                 Mat4::from_translation(Vec3::new(x, 2.0, z)),
                 0.15,
                 None,
             );
-            let _ = add_obj(
-                renderer,
+            spawn_object(
+                world,
                 sphere,
                 gold,
                 Mat4::from_translation(Vec3::new(x, 4.3, z)),
                 0.4,
                 None,
             );
-            lights.push(
-                renderer
-                    .scene_mut()
-                    .insert_actor(SceneActor::light(pt_light(
-                        [x, 5.0, z],
-                        colors[i],
-                        8.0,
-                        8.0,
-                        shadow_index,
-                    )))
-                    .as_light()
-                    .unwrap(),
-            );
+            lights.push(spawn_light(
+                world,
+                pt_light([x, 5.0, z], colors[i], 8.0, 8.0, shadow_index),
+            ));
         }
 
-        let cube = renderer
-            .scene_mut()
-            .insert_actor(SceneActor::mesh(cube_mesh(0.6)))
-            .as_mesh()
-            .unwrap();
-        let spinner = add_obj(
-            renderer,
+        let cube = spawn_mesh(world, cube_mesh(0.6));
+        let spinner = spawn_object(
+            world,
             cube,
             crystal,
             Mat4::from_translation(Vec3::new(0.0, 2.5, 0.0)),
@@ -1411,24 +1593,21 @@ mod demo {
 
     /// `interop_bevy`'s scene: 7 × 7 cubes of 1.0 at 1.75 spacing, one directional light, no floor
     /// and no sky. This is the content match, so a timing difference is the producer, not the scene.
-    fn populate_field(renderer: &mut Renderer, shadows: bool) -> Animation {
+    fn populate_field(world: &mut World, shadows: bool) -> Animation {
         let shadow_index = if shadows { 0 } else { u32::MAX };
-        renderer
-            .scene_mut()
-            .insert_actor(SceneActor::light(directional_light(
+        spawn_light(
+            world,
+            directional_light(
                 // `direction_outer` is the direction the light travels; Bevy's light sits at
                 // (0.38, 0.82, 0.44) and looks at the origin, so it travels towards -d.
                 Vec3::new(-0.38, -0.82, -0.44).normalize().to_array(),
                 [1.0, 1.0, 1.0],
                 FIELD_LIGHT,
                 shadow_index,
-            )));
+            ),
+        );
 
-        let cube = renderer
-            .scene_mut()
-            .insert_actor(SceneActor::mesh(cube_mesh(CUBE * 0.5)))
-            .as_mesh()
-            .unwrap();
+        let cube = spawn_mesh(world, cube_mesh(CUBE * 0.5));
         let half = (GRID - 1) as f32 / 2.0;
         let (_, from, to) = interop_demo::PALETTES[0];
         let mut cubes = Vec::with_capacity(GRID * GRID);
@@ -1443,12 +1622,10 @@ mod demo {
                     from[2] + (to[2] - from[2]) * t,
                     1.0,
                 ];
-                let material = renderer
-                    .scene_mut()
-                    .insert_material(make_mat(color, 1.0, 0.0, [0.0; 3], 0.0));
+                let material = spawn_material(world, make_mat(color, 1.0, 0.0, [0.0; 3], 0.0));
                 materials.push(material);
-                cubes.push(add_obj(
-                    renderer,
+                cubes.push(spawn_object(
+                    world,
                     cube,
                     material,
                     Mat4::from_translation(Vec3::new(fx * SPACING, fy * SPACING, 0.0)),
@@ -1458,6 +1635,154 @@ mod demo {
             }
         }
         Animation::Field { cubes, materials }
+    }
+
+    /// The SceneDB and the GPU projection the renderer reads. Every column the example writes is
+    /// registered up front: the lazy auto-registration path can drop the first write (see
+    /// upstream's `v3_demo_common`).
+    fn new_scene_db(
+        device: &Arc<wgpu30::Device>,
+        queue: &Arc<wgpu30::Queue>,
+    ) -> pulsar_scenedb::SceneDb {
+        let mut scene_db = pulsar_scenedb::SceneDb::new();
+        let context = pulsar_scenedb::gpu::EngineGpuContext::new(device.clone(), queue.clone());
+        let config = pulsar_scenedb::gpu::SceneGpuConfig {
+            classes: Vec::new(),
+            tombstone_headroom: 0,
+            max_cells_metadata: 0,
+        };
+        let store = pulsar_scenedb::gpu::SceneGpuStore::new(&context, config);
+        MeshComponent::register_gpu_columns_growable(&store, 4096, device);
+        MaterialComponent::register_gpu_columns_growable(&store, 4096, device);
+        StaticObjectComponent::register_gpu_columns_growable(&store, 4096, device);
+        LightComponent::register_gpu_columns_growable(
+            &store,
+            helio_pass_forward_lit::MAX_LIGHTS,
+            device,
+        );
+        helio_pass_sky::AtmosphereComponent::register_gpu_columns_growable(&store, 4, device);
+        let store = Arc::new(store);
+        let mirror = GpuMirrorHandle::new(store, queue.clone());
+        scene_db.world.attach_gpu_mirror(mirror);
+        scene_db
+    }
+
+    fn scene_db_handle(scene_db: &pulsar_scenedb::SceneDb) -> helio::SceneDbHandle {
+        scene_db
+            .world
+            .gpu_mirror()
+            .cloned()
+            .expect("new_scene_db always attaches a mirror")
+    }
+
+    fn spawn_mesh(world: &mut World, upload: MeshUpload) -> SceneEntity {
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            MeshComponent {
+                vertices: upload.vertices,
+                indices: upload.indices,
+            },
+        );
+        entity
+    }
+
+    fn spawn_material(world: &mut World, material: GpuMaterial) -> SceneEntity {
+        let entity = world.spawn();
+        world.insert(entity, MaterialComponent::from(material));
+        entity
+    }
+
+    fn spawn_light(world: &mut World, light: GpuLight) -> SceneEntity {
+        let entity = world.spawn();
+        world.insert(entity, LightComponent::from(light));
+        entity
+    }
+
+    fn update_light(world: &mut World, entity: SceneEntity, light: GpuLight) {
+        if let Some(mut existing) = world.get_mut::<LightComponent>(entity) {
+            *existing = LightComponent::from(light);
+        }
+    }
+
+    fn spawn_sky(world: &mut World, tint: [f32; 3]) -> SceneEntity {
+        let mut sky = helio_pass_sky::AtmosphereComponent::earth();
+        let peak = tint[0].max(tint[1]).max(tint[2]).max(f32::EPSILON);
+        for (scattering, channel) in sky.rayleigh_scattering.iter_mut().zip(tint) {
+            *scattering *= channel / peak;
+        }
+        let entity = world.spawn();
+        world.insert(entity, sky);
+        entity
+    }
+
+    /// Object rows resolve the mesh's GPU ranges and the material's class once, at spawn time.
+    fn spawn_object(
+        world: &mut World,
+        mesh: SceneEntity,
+        material: SceneEntity,
+        transform: Mat4,
+        radius: f32,
+        movability: Option<Movability>,
+    ) -> SceneEntity {
+        let mirror = world
+            .gpu_mirror()
+            .cloned()
+            .expect("the scene needs its GPU mirror");
+        let vertices = MeshComponent::vertices_gpu_handle(mirror.store(), mesh.index())
+            .filter(|handle| handle.count != 0)
+            .expect("mesh has no GPU vertex range");
+        let indices = MeshComponent::indices_gpu_handle(mirror.store(), mesh.index())
+            .filter(|handle| handle.count != 0)
+            .expect("mesh has no GPU index range");
+        let material_component = world
+            .get::<MaterialComponent>(material)
+            .expect("material entity has no MaterialComponent");
+        let bounds = [
+            transform.w_axis.x,
+            transform.w_axis.y,
+            transform.w_axis.z,
+            radius,
+        ];
+        // `+ 1` keeps zero as SceneDB's "never written" sentinel; see upstream's `spawn_object`.
+        let mut component = StaticObjectComponent::new(
+            mesh.index(),
+            mesh.generation().wrapping_add(1),
+            material.index(),
+            material.generation().wrapping_add(1),
+            transform,
+            bounds,
+            indices.count,
+            indices.offset,
+            vertices.offset as i32,
+            material_component.material_class,
+            0,
+            0,
+        );
+        if movability.is_some_and(Movability::can_move) {
+            component.flags |= helio::INSTANCE_FLAG_MOVABLE;
+        }
+        let entity = world.spawn();
+        world.insert(entity, component);
+        if let Some(movability) = movability {
+            world.insert(entity, movability);
+        }
+        entity
+    }
+
+    /// Move a row through the authoritative world; `with_transform` also carries the previous
+    /// transform for motion vectors.
+    fn update_object_transform(world: &mut World, entity: SceneEntity, transform: Mat4) {
+        let Some(mut object) = world.get_mut::<StaticObjectComponent>(entity) else {
+            return;
+        };
+        let bounds = [
+            transform.w_axis.x,
+            transform.w_axis.y,
+            transform.w_axis.z,
+            object.bounds[3],
+        ];
+        *object = object.with_transform(transform, bounds);
     }
 
     fn make_mat(
@@ -1515,34 +1840,6 @@ mod demo {
             _pad: 0,
             ..Default::default()
         }
-    }
-
-    fn add_obj(
-        renderer: &mut Renderer,
-        mesh: MeshId,
-        material: MaterialId,
-        transform: Mat4,
-        radius: f32,
-        movability: Option<Movability>,
-    ) -> ObjectId {
-        let id = renderer
-            .scene_mut()
-            .insert_actor(SceneActor::object(ObjectDescriptor {
-                mesh,
-                material,
-                transform,
-                bounds: [
-                    transform.w_axis.x,
-                    transform.w_axis.y,
-                    transform.w_axis.z,
-                    radius,
-                ],
-                flags: 3,
-                groups: GroupMask::NONE,
-                movability,
-                user_tag: 0,
-            }));
-        id.as_object().unwrap()
     }
 
     type FaceQuads = (Vec<[usize; 4]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[f32; 3]>);
@@ -1665,25 +1962,29 @@ mod demo {
 
     /// The right column: title, rate and the two copies.
     struct MetricsPanel {
-        metrics: Rc<RefCell<Option<Metrics>>>,
+        metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
     }
 
     impl Render for MetricsPanel {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let metrics = self.metrics.borrow().clone().unwrap_or_default();
-            metrics_section(&metrics)
+            match self.metrics.borrow().as_ref() {
+                Some(metrics) => metrics_panel(metrics),
+                None => div().into_any_element(),
+            }
         }
     }
 
     /// The left column's cached interval histogram.
     struct HistogramPanel {
-        metrics: Rc<RefCell<Option<Metrics>>>,
+        metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
     }
 
     impl Render for HistogramPanel {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let metrics = self.metrics.borrow().clone().unwrap_or_default();
-            histogram_section(&metrics)
+            match self.metrics.borrow().as_ref() {
+                Some(metrics) => metrics_histogram(metrics),
+                None => div().into_any_element(),
+            }
         }
     }
 
@@ -1698,7 +1999,8 @@ mod demo {
         distance: Rc<Cell<f32>>,
         palette: Rc<Cell<u8>>,
         metrics: Rc<RefCell<Metrics>>,
-        panel_metrics: Rc<RefCell<Option<Metrics>>>,
+        panel_metrics: Rc<RefCell<Option<MetricsSnapshot>>>,
+        phase_costs: Rc<RefCell<PhaseCosts>>,
         metrics_panel: Entity<MetricsPanel>,
         histogram_panel: Entity<HistogramPanel>,
         displayed_at: Option<Instant>,
@@ -1718,6 +2020,7 @@ mod demo {
             scene: SceneKind,
             shadows: Option<bool>,
             graph: GraphKind,
+            phase_costs: Rc<RefCell<PhaseCosts>>,
         ) -> Self {
             let panel_metrics = Rc::new(RefCell::new(None));
             let metrics_panel = cx.new(|_| MetricsPanel {
@@ -1738,6 +2041,7 @@ mod demo {
                 palette: Rc::new(Cell::new(0)),
                 metrics: Rc::new(RefCell::new(Metrics::default())),
                 panel_metrics,
+                phase_costs,
                 metrics_panel,
                 histogram_panel,
                 displayed_at: None,
@@ -1763,10 +2067,19 @@ mod demo {
                 .is_none_or(|at| at.elapsed() >= Duration::from_millis(500))
             {
                 let mut metrics = self.metrics.borrow().clone();
+                let costs = *self.phase_costs.borrow();
+                metrics.evaluate_ms = costs.evaluate_ms;
+                metrics.layout_ms = costs.layout_ms;
+                metrics.paint_ms = costs.paint_ms;
+                metrics.draw_ms = costs.draw_ms;
+                metrics.present_wait_ms = (metrics.interval_ms - costs.draw_ms).max(0.0);
+                metrics.active = costs.active;
+                metrics.gpui_frames = costs.frames;
+                metrics.asked = costs.asked;
                 if let Some(scene) = self.scene.borrow().as_ref() {
                     metrics.adapter = scene.adapter.clone();
                 }
-                *self.panel_metrics.borrow_mut() = Some(metrics);
+                *self.panel_metrics.borrow_mut() = Some(metrics.snapshot());
                 self.displayed_at = Some(Instant::now());
                 self.metrics_panel.update(cx, |_, cx| cx.notify());
                 self.histogram_panel.update(cx, |_, cx| cx.notify());
@@ -1786,6 +2099,7 @@ mod demo {
                     self.scene.clone(),
                     self.error.clone(),
                     self.metrics.clone(),
+                    self.phase_costs.clone(),
                     self.last.clone(),
                     self.grab.clone(),
                     self.paused.clone(),
@@ -1848,82 +2162,12 @@ mod demo {
             .into_any_element()
     }
 
-    fn histogram_section(metrics: &Metrics) -> AnyElement {
-        let intervals: Vec<f32> = metrics.intervals.iter().copied().collect();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(section_label("Frame interval"))
-            .child(histogram(&intervals, None))
-            .child(histogram_caption(false))
-            .child(pacing_note(
-                metrics.interval_ms,
-                metrics.render_ms,
-                metrics.interval_ms - metrics.render_ms,
-                true,
-            ))
-            .into_any_element()
-    }
-
-    fn metrics_section(metrics: &Metrics) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(title(
-                "Helio, inside GPUI",
-                "Helio's wgpu 30 renderer, exported as a dma-buf to GPUI's wgpu 29 device.",
-            ))
-            .child(div().h(px(2.)).flex_none())
-            .child(
-                div()
-                    .text_2xl()
-                    .text_color(rgb(ACCENT))
-                    .child(format!("{:.1} FPS", metrics.fps)),
-            )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                "{:.2} ms · Helio {:.2} · fence {:.2}",
-                metrics.interval_ms, metrics.render_ms, metrics.fence_ms
-            )))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Frame"))
-            .child(metric_row(
-                "frame interval",
-                format!("{:.2} ms", metrics.interval_ms),
-            ))
-            .child(metric_row(
-                "Helio render",
-                format!("{:.2} ms", metrics.render_ms),
-            ))
-            .child(metric_row("export", format!("{:.2} ms", metrics.export_ms)))
-            .child(metric_row(
-                "fence wait",
-                format!("{:.2} ms", metrics.fence_ms),
-            ))
-            .child(metric_row(
-                "GPUI + pacing",
-                format!("{:.2} ms", metrics.gpui_ms),
-            ))
-            .child(div().h(px(4.)).flex_none())
-            .child(section_label("Producer"))
-            .child(metric_row(
-                "size",
-                format!("{} × {}", metrics.width, metrics.height),
-            ))
-            .child(metric_row("adapter", metrics.adapter.clone()))
-            .child(metric_row("hand-off", "dma-buf · zero copy".to_owned()))
-            .child(metric_row("frames", metrics.frames.to_string()))
-            .into_any_element()
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn viewport(
         scene: Rc<RefCell<Option<HelioScene>>>,
         error: Rc<RefCell<Option<String>>>,
         metrics: Rc<RefCell<Metrics>>,
+        phase_costs: Rc<RefCell<PhaseCosts>>,
         last: Rc<Cell<Option<SurfacePoint>>>,
         grab: Rc<Cell<bool>>,
         paused: Rc<Cell<bool>>,
@@ -1989,14 +2233,29 @@ mod demo {
                     pitch_for_canvas.get(),
                     distance_for_camera.get(),
                 );
-                match scene.render(&camera) {
-                    Ok(Some((render, export, fence))) => {
-                        metrics.borrow_mut().record(
+                // The first paint has nothing prepared; prime it, show it, then prepare the
+                // frame after it. From then on each paint shows the ready frame and draws ahead.
+                if scene.pending.is_none()
+                    && let Err(error) = scene.prepare(&camera)
+                {
+                    let message = format!("{error:#}");
+                    eprintln!("interop_helio: cannot render: {message}");
+                    *drawing_error.borrow_mut() = Some(message);
+                    return;
+                }
+                scene.present_pending();
+                match scene.prepare(&camera) {
+                    Ok(Some((render, export, gpu_wait))) => {
+                        let mut metrics = metrics.borrow_mut();
+                        // The previous GPUI frame's draw time, for the histogram's green foot.
+                        metrics.draw_ms = phase_costs.borrow().draw_ms;
+                        metrics.record(
                             render,
                             export,
-                            fence,
+                            gpu_wait,
                             scene.width,
                             scene.height,
+                            scene.dropped,
                         );
                     }
                     Ok(None) => {}
@@ -2017,15 +2276,13 @@ mod demo {
                     let metrics = metrics.borrow();
                     eprintln!(
                         "interop_helio: window {} frames ({} dropped) — {:.1} fps, {:.2} ms \
-                         interval, helio {:.2} ms, export {:.2} ms, fence {:.2} ms, gpui {:.2} \
-                         ms, {}x{}",
+                         interval, helio {:.2} ms, export {:.2} ms, gpui {:.2} ms, {}x{}",
                         metrics.frames,
                         scene.dropped,
                         metrics.fps,
                         metrics.interval_ms,
                         metrics.render_ms,
                         metrics.export_ms,
-                        metrics.fence_ms,
                         metrics.gpui_ms,
                         scene.width,
                         scene.height,
@@ -2086,7 +2343,18 @@ mod demo {
 
     pub fn run() {
         let cli = parse_args();
-        let app = gpui::application();
+        let phases = Rc::new(RefCell::new(PhaseMetrics::default()));
+        let costs = Rc::new(RefCell::new(PhaseCosts::default()));
+        let app = gpui::application().with_frame_pipeline({
+            let costs = costs.clone();
+            move |_window_id| {
+                Box::new(MetricsPipeline::new(
+                    StandardImmediatePipeline.instrumented(phases.clone()),
+                    phases.clone(),
+                    costs.clone(),
+                ))
+            }
+        });
         let app = match cli.preference {
             Some(preference) => app.with_gpu_preference(preference),
             None => app,
@@ -2103,8 +2371,17 @@ mod demo {
                     ..Default::default()
                 },
                 move |_, cx| {
-                    cx.new(|cx| {
-                        Demo::new(cx, cli.probe, cli.stats, cli.scene, cli.shadows, cli.graph)
+                    let costs = costs.clone();
+                    cx.new(move |cx| {
+                        Demo::new(
+                            cx,
+                            cli.probe,
+                            cli.stats,
+                            cli.scene,
+                            cli.shadows,
+                            cli.graph,
+                            costs,
+                        )
                     })
                 },
             )
