@@ -146,6 +146,13 @@ mod demo {
     const GRID: usize = 7;
     const SPACING: f32 = 1.75;
     const CUBE: f32 = 1.0;
+    /// The field's directional light, in Helio's radiance units.
+    ///
+    /// Bevy's `DirectionalLight` is 3000 lux, and its camera divides by `2^-EV100 / 1.2`
+    /// (EV100 = 9.7) while tonemapping. Helio has no exposure pass, so the light has to carry
+    /// that factor: `3000 * 2^-9.7 / 1.2 = 3.0057`. At the raw 3000 the camera-facing faces clip
+    /// to white and the palette disappears.
+    const FIELD_LIGHT: f32 = 3.005_723_7;
 
     struct Cli {
         list: bool,
@@ -385,6 +392,8 @@ mod demo {
         },
         Field {
             cubes: Vec<ObjectId>,
+            /// One material per cube, so the palette button can recolour the field once per click.
+            materials: Vec<MaterialId>,
         },
         Clear,
     }
@@ -409,6 +418,8 @@ mod demo {
         animation: Animation,
         /// What the orbit camera looks at; the field looks at the origin.
         target: Vec3,
+        /// The palette currently applied to the field (zero for the other scenes).
+        palette: usize,
         started: Instant,
         adapter: String,
         frames: u64,
@@ -526,6 +537,7 @@ mod demo {
                 height,
                 animation,
                 target,
+                palette: 0,
                 started: Instant::now(),
                 adapter: info.name,
                 frames: 0,
@@ -604,7 +616,7 @@ mod demo {
                         );
                     }
                 }
-                Animation::Field { cubes } => {
+                Animation::Field { cubes, .. } => {
                     let half = (GRID - 1) as f32 / 2.0;
                     for (index, &cube) in cubes.iter().enumerate() {
                         let (x, y) = (index % GRID, index / GRID);
@@ -622,6 +634,37 @@ mod demo {
                     }
                 }
                 Animation::Clear => {}
+            }
+        }
+
+        /// Apply `palette` to the field's materials. Called only when the button changes it, not
+        /// per frame: rewriting 49 materials every frame is the trap the Bevy demo documented.
+        fn recolour(&mut self, palette: usize) {
+            let palette = palette % interop_demo::PALETTES.len();
+            if self.palette == palette {
+                return;
+            }
+            self.palette = palette;
+            let Animation::Field { materials, .. } = &self.animation else {
+                return;
+            };
+            let materials = materials.clone();
+            let (_, from, to) = interop_demo::PALETTES[palette];
+            let half = (GRID - 1) as f32 / 2.0;
+            for (index, material) in materials.into_iter().enumerate() {
+                let (x, y) = (index % GRID, index / GRID);
+                let (fx, fy) = (x as f32 - half, y as f32 - half);
+                let t = ((fx + fy + GRID as f32) / (2.0 * GRID as f32)).clamp(0.0, 1.0);
+                let color = [
+                    from[0] + (to[0] - from[0]) * t,
+                    from[1] + (to[1] - from[1]) * t,
+                    from[2] + (to[2] - from[2]) * t,
+                    1.0,
+                ];
+                let _ = self
+                    .renderer
+                    .scene_mut()
+                    .update_material(material, make_mat(color, 1.0, 0.0, [0.0; 3], 0.0));
             }
         }
 
@@ -1373,9 +1416,11 @@ mod demo {
         renderer
             .scene_mut()
             .insert_actor(SceneActor::light(directional_light(
-                Vec3::new(0.38, 0.82, 0.44).normalize().to_array(),
+                // `direction_outer` is the direction the light travels; Bevy's light sits at
+                // (0.38, 0.82, 0.44) and looks at the origin, so it travels towards -d.
+                Vec3::new(-0.38, -0.82, -0.44).normalize().to_array(),
                 [1.0, 1.0, 1.0],
-                3000.0,
+                FIELD_LIGHT,
                 shadow_index,
             )));
 
@@ -1387,6 +1432,7 @@ mod demo {
         let half = (GRID - 1) as f32 / 2.0;
         let (_, from, to) = interop_demo::PALETTES[0];
         let mut cubes = Vec::with_capacity(GRID * GRID);
+        let mut materials = Vec::with_capacity(GRID * GRID);
         for y in 0..GRID {
             for x in 0..GRID {
                 let (fx, fy) = (x as f32 - half, y as f32 - half);
@@ -1400,6 +1446,7 @@ mod demo {
                 let material = renderer
                     .scene_mut()
                     .insert_material(make_mat(color, 1.0, 0.0, [0.0; 3], 0.0));
+                materials.push(material);
                 cubes.push(add_obj(
                     renderer,
                     cube,
@@ -1410,7 +1457,7 @@ mod demo {
                 ));
             }
         }
-        Animation::Field { cubes }
+        Animation::Field { cubes, materials }
     }
 
     fn make_mat(
@@ -1649,6 +1696,7 @@ mod demo {
         yaw: Rc<Cell<f32>>,
         pitch: Rc<Cell<f32>>,
         distance: Rc<Cell<f32>>,
+        palette: Rc<Cell<u8>>,
         metrics: Rc<RefCell<Metrics>>,
         panel_metrics: Rc<RefCell<Option<Metrics>>>,
         metrics_panel: Entity<MetricsPanel>,
@@ -1687,6 +1735,7 @@ mod demo {
                 yaw: Rc::new(Cell::new(DEFAULT_YAW)),
                 pitch: Rc::new(Cell::new(DEFAULT_PITCH)),
                 distance: Rc::new(Cell::new(DEFAULT_DISTANCE)),
+                palette: Rc::new(Cell::new(0)),
                 metrics: Rc::new(RefCell::new(Metrics::default())),
                 panel_metrics,
                 metrics_panel,
@@ -1730,6 +1779,7 @@ mod demo {
                     self.yaw.clone(),
                     self.pitch.clone(),
                     self.distance.clone(),
+                    self.palette.clone(),
                     self.histogram_panel.clone(),
                 ),
                 viewport(
@@ -1742,6 +1792,7 @@ mod demo {
                     self.yaw.clone(),
                     self.pitch.clone(),
                     self.distance.clone(),
+                    self.palette.clone(),
                     self.scene_kind,
                     self.shadows,
                     self.graph,
@@ -1760,6 +1811,7 @@ mod demo {
         yaw: Rc<Cell<f32>>,
         pitch: Rc<Cell<f32>>,
         distance: Rc<Cell<f32>>,
+        palette: Rc<Cell<u8>>,
         histogram_panel: Entity<HistogramPanel>,
     ) -> AnyElement {
         let pause_label = if paused.get() { "Resume" } else { "Pause" };
@@ -1776,9 +1828,20 @@ mod demo {
             cx.notify();
         }));
 
+        let palette_index = (palette.get() as usize) % interop_demo::PALETTES.len();
+        let palette_button = control(
+            "palette",
+            format!("Palette · {}", interop_demo::PALETTES[palette_index].0),
+        )
+        .on_click(cx.listener(move |_this, _, _, cx| {
+            palette.set((palette.get() + 1) % interop_demo::PALETTES.len() as u8);
+            cx.notify();
+        }));
+
         panel(LEFT_WIDTH)
             .child(section_label("Controls"))
             .child(pause)
+            .child(palette_button)
             .child(reset)
             .child(div().h(px(8.)).flex_none())
             .child(histogram_panel.cached(histogram_style()))
@@ -1867,6 +1930,7 @@ mod demo {
         yaw: Rc<Cell<f32>>,
         pitch: Rc<Cell<f32>>,
         distance: Rc<Cell<f32>>,
+        palette: Rc<Cell<u8>>,
         scene_kind: SceneKind,
         shadows: Option<bool>,
         graph: GraphKind,
@@ -1909,9 +1973,17 @@ mod demo {
                 return;
             }
 
-            if !paused.get() {
+            let palette_index = (palette.get() as usize) % interop_demo::PALETTES.len();
+            let palette_changed = scene.palette != palette_index;
+            if palette_changed {
+                scene.recolour(palette_index);
+            }
+
+            if !paused.get() || palette_changed {
                 let elapsed = scene.started.elapsed().as_secs_f32();
-                scene.animate(elapsed);
+                if !paused.get() {
+                    scene.animate(elapsed);
+                }
                 let camera = scene.camera(
                     yaw_for_canvas.get(),
                     pitch_for_canvas.get(),
