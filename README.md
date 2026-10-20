@@ -189,7 +189,7 @@ library features.
 | `interop_linux` | Minimal setup: clears two `SharedBuffer` textures on a separate GPU device (one linear, one driver-tiled), exports them as `dma-buf` handles, and draws them as tiles in a GPUI window. |
 | `interop_cube` | Embedded 3D engine: an independent Vulkan pipeline renders a spinning cube into a `SharedBuffer` and composites it into GPUI with zero CPU copies. |
 | `interop_cube_drag` | Interactive 3D viewport: lets you rotate the spinning cube by clicking and dragging via `surface_input`. Mouse drags continue tracking even if the cursor leaves the viewport, while GPUI buttons overlaid on top still receive normal clicks. |
-| `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting. |
+| `interop_wgpu` | An embedded wgpu scene: a depth-tested, lit field of instanced cubes with orbit/zoom input, exported as a dma-buf and wrapped in the shared GPUI panel (controls and an interval histogram on the left, live metrics on the right). `--list-gpus` enumerates adapters; `--gpu <index>` selects one; `--bench <secs>` measures the producer flat out without presenting, polling the exported `sync_file` on the dma-buf path and printing the submit and fence portions separately. |
 | `interop_bevy` | An embedded Bevy 0.19 scene: a headless PBR app (no `winit`) renders the same 7 × 7 Ember field as `interop_wgpu` into an offscreen image on the window renderer's own device, and GPUI samples the image's texture view with `paint_texture` — no export and no copy. The same shared panel adds Pause, Speed, Palette, Reset view and Probe, and the viewport orbits/zooms. `--transfer` renders into a `WgpuSharedBuffer` and imports its dma-buf with `paint_surface` instead. `--bench <secs>` runs Bevy alone through `ScheduleRunnerPlugin`; `--scene clear` isolates the engine's own cost; `--probe` reads the rendered image back once. |
 | `interop_helio` | **Experimental, branch `helio-interop`.** A Helio 0.19 scene on its own wgpu 30 device, exported as a dma-buf and imported by GPUI's wgpu 29 renderer with `paint_surface` — no CPU copy. Two exportable images cycle, and a slot is reused only after GPUI signals the `eventfd` release it was handed, so drawing frame N+1 never races frame N. Helio is pinned to a git revision, not crates.io. `--scene full\|field\|clear` switches between the standalone scene, `interop_bevy`'s 49-cube field and an empty graph; `--shadows on\|off` overrides the scene's shadow maps. Run it with `--release`: a debug build measures Helio's unoptimised graph and shaders. `--stats` prints the frame-rate and timing breakdown; `--probe` reads the exported image back once. |
 
@@ -267,9 +267,10 @@ same breakdown as `Helio`, `export`, `fence wait` and `GPUI + pacing`. The windo
 GPUI window — Wayland in a Wayland session, X11 in an X11 one; Helio is offscreen and ignores the
 session type.
 
-`--bench` measures the producer: the wgpu render plus, on the dma-buf path, the export and fence,
-with the GPU waited on each frame. It does not present, so it is independent of vsync and the
-window loop. The consumer's half is a normal run's `paint` (import/composite) and `wait`
+`--bench` measures the producer: the wgpu render plus, on the dma-buf path, the export and fence.
+It waits on the exported `sync_file` each frame (the same fence the consumer polls) and prints the
+submit and fence portions separately; the same-device path has no fence, so it waits on the device.
+It does not present, so it is independent of vsync and the window loop. The consumer's half is a normal run's `paint` (import/composite) and `wait`
 (presentation; on an Optimus laptop the PRIME transfer to the display). Compare both ways to tell
 an adapter's render ceiling from its display path.
 
@@ -292,12 +293,19 @@ sequentially rather than concurrently:
 
 | Path | Intel HD 520 | NVIDIA 930M |
 | --- | --- | --- |
-| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 798.6 fps · 1.25 ms/frame | 2209.0 fps · 0.45 ms/frame |
+| `interop_wgpu --bench 5` (same field, hand-written wgpu pipeline, dma-buf) | 806.4 fps · 1.24 ms/frame | 2442.7 fps · 0.41 ms/frame |
 | `interop_bevy --bench 10` (Bevy only, GPU waited) | 196.4 fps · 5.09 ms/frame | 250.1 fps · 4.00 ms/frame |
 | `interop_bevy --scene one --bench 10` | 157.2 fps · 6.36 ms/frame | 267.9 fps · 3.73 ms/frame |
 | `interop_bevy --scene clear --bench 10` (engine only) | 169.1 fps · 5.91 ms/frame | 239.9 fps · 4.17 ms/frame |
 | Windowed `--stats` (image, presented) | ~58–59 fps | ~60 fps |
 | Windowed `--transfer --stats` (dma-buf, presented) | ~56–58 fps | ~60 fps |
+
+The `interop_wgpu` bench now polls the exported `sync_file`, not a device-wide wait, so its two
+halves are visible: Intel 0.35 ms submit + 0.89 ms fence, NVIDIA 0.21 ms submit + 0.20 ms fence.
+The rate is essentially unchanged from the old `device.poll(Wait)` run (within variance): the
+fence and the device wait complete on the same GPU work. The difference is that the bench now
+measures the exact signal the consumer uses, and can separate a producer's CPU rate from its
+GPU completion rate.
 
 Release confirms the attribution: every Bevy scene — 49 cubes, one cube, or nothing — lands in
 the same ~4–6 ms/frame band, while the hand-written producer costs 1.25 ms and 0.45 ms. The

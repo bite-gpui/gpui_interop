@@ -29,10 +29,11 @@
 //!
 //! # Raw throughput
 //!
-//! `--bench <secs>` renders the scene into the chosen output, waits for the GPU each frame, prints
-//! the producer's rate and exits, without presenting a frame. On the dma-buf path that includes the
-//! export and fence; on the same-device path it is the wgpu render alone. It is the unbounded
-//! number, independent of vsync and the window loop.
+//! `--bench <secs>` renders the scene into the chosen output, waits for the frame's completion,
+//! prints the producer's rate and exits, without presenting a frame. On the dma-buf path it polls
+//! the exported `sync_file` — the same fence the consumer waits on — and prints the submit and
+//! fence portions separately; on the same-device path it waits on the device, since there is no
+//! export fence. It is the unbounded number, independent of vsync and the window loop.
 //!
 //! The consumer's half is a normal run's `paint` (the renderer importing/compositing the frame) and
 //! `wait` (presentation — on an Optimus laptop, the PRIME transfer to the display). Compare the
@@ -73,6 +74,7 @@ fn main() {
 mod demo {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -83,6 +85,7 @@ mod demo {
         StandardImmediatePipeline, Window, WindowBounds, WindowMetrics, WindowOptions, div,
         gpu_canvas, prelude::*, px, rgb, size,
     };
+    use gpui_interop::vulkan_export::DmaBufHandle;
     use gpui_interop::{
         SurfaceEvent, SurfaceInput, SurfacePoint, WgpuSharedBuffer, WgpuSurface, attach,
         surface_input,
@@ -94,6 +97,35 @@ mod demo {
         page, panel, section_label, title, viewport_frame,
     };
     use wgpu::util::DeviceExt as _;
+
+    /// A bench frame's timing: how long the completion wait took, and whether it was the exported
+    /// `sync_file` (`true`) or a same-device `poll(Wait)` (`false`).
+    struct BenchFrame {
+        wait: Duration,
+        fence: bool,
+    }
+
+    /// Wait, up to `timeout`, for a `sync_file` to become readable; `true` if it signalled in time.
+    fn wait_for_fence(fence: &OwnedFd, timeout: Duration) -> bool {
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd: fence.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            match unsafe { libc::poll(&mut descriptor, 1, timeout_ms) } {
+                ready if ready > 0 => return true,
+                0 => return false,
+                _ => {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
+    }
 
     /// The headless bench's fixed size, so producer runs are comparable between the two demos.
     /// The windowed viewport follows its canvas's physical size instead.
@@ -907,23 +939,50 @@ mod demo {
             if let Some(limit) = scene.bench.take() {
                 let started = Instant::now();
                 let mut frames = 0u64;
+                let mut waited = Duration::ZERO;
+                let mut fence_frames = 0u64;
                 while started.elapsed() < limit {
-                    if let Err(error) = scene.bench_frame(paused.get(), speed.get(), palette.get())
-                    {
-                        eprintln!("interop_wgpu: bench stopped: {error:#}");
-                        break;
+                    match scene.bench_frame(paused.get(), speed.get(), palette.get()) {
+                        Ok(frame) => {
+                            waited += frame.wait;
+                            if frame.fence {
+                                fence_frames += 1;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("interop_wgpu: bench stopped: {error:#}");
+                            break;
+                        }
                     }
                     frames += 1;
                 }
-                let elapsed = started.elapsed().as_secs_f64().max(1e-9);
-                eprintln!(
-                    "interop_wgpu: bench {frames} frames in {:.3}s — {:.1} fps, {:.3} ms/frame, \
-                     {} (producer only; no presentation)",
-                    elapsed,
-                    frames as f64 / elapsed,
-                    elapsed * 1000.0 / frames.max(1) as f64,
-                    scene.path,
-                );
+                let elapsed = started.elapsed();
+                let seconds = elapsed.as_secs_f64().max(1e-9);
+                let submit = elapsed.saturating_sub(waited).as_secs_f64() * 1000.0
+                    / frames.max(1) as f64;
+                let fence = waited.as_secs_f64() * 1000.0 / fence_frames.max(1) as f64;
+                if fence_frames > 0 {
+                    eprintln!(
+                        "interop_wgpu: bench {frames} frames in {:.3}s — {:.1} fps, {:.3} ms/frame, \
+                         {} (producer only; no presentation); submit {:.3} ms, fence {:.3} ms \
+                         over {fence_frames} frames",
+                        seconds,
+                        frames as f64 / seconds,
+                        elapsed.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+                        scene.path,
+                        submit,
+                        fence,
+                    );
+                } else {
+                    eprintln!(
+                        "interop_wgpu: bench {frames} frames in {:.3}s — {:.1} fps, {:.3} ms/frame, \
+                         {} (producer only; no presentation); same-device: no export fence",
+                        seconds,
+                        frames as f64 / seconds,
+                        elapsed.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+                        scene.path,
+                    );
+                }
                 unsafe { libc::_exit(0) }
             }
 
@@ -1304,21 +1363,46 @@ mod demo {
             speed: f32,
             palette: u8,
         ) -> anyhow::Result<()> {
-            self.draw(Some(gpu), paused, speed, palette)
+            self.draw(Some(gpu), paused, speed, palette)?;
+            Ok(())
         }
 
-        /// Render one frame without presenting it, and wait for the GPU to finish. This is the raw
-        /// bench's frame: it measures render plus export (on the dma-buf path), not the consumer's
-        /// import or the display's transfer.
-        fn bench_frame(&mut self, paused: bool, speed: f32, palette: u8) -> anyhow::Result<()> {
-            self.draw(None, paused, speed, palette)?;
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(Duration::from_secs(10)),
-                })
-                .map_err(|error| anyhow::anyhow!("waiting for a bench frame: {error}"))?;
-            Ok(())
+        /// Render one frame without presenting it, and wait for the producer's own completion
+        /// signal. On the dma-buf path that is the exported `sync_file` — the same fence the
+        /// consumer waits on, not a device-wide `poll(Wait)`. On the same-device path there is no
+        /// fence, so it falls back to the device wait.
+        fn bench_frame(
+            &mut self,
+            paused: bool,
+            speed: f32,
+            palette: u8,
+        ) -> anyhow::Result<BenchFrame> {
+            let handle = self.draw(None, paused, speed, palette)?;
+            let started = Instant::now();
+            let fence = match handle
+                .as_ref()
+                .and_then(|handle| handle.acquire_fence.as_deref())
+            {
+                Some(fence) => {
+                    if !wait_for_fence(fence, Duration::from_secs(10)) {
+                        anyhow::bail!("the exported frame's fence did not signal within 10s");
+                    }
+                    true
+                }
+                None => {
+                    self.device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: Some(Duration::from_secs(10)),
+                        })
+                        .map_err(|error| anyhow::anyhow!("waiting for a bench frame: {error}"))?;
+                    false
+                }
+            };
+            Ok(BenchFrame {
+                wait: started.elapsed(),
+                fence,
+            })
         }
 
         fn draw(
@@ -1327,7 +1411,7 @@ mod demo {
             paused: bool,
             speed: f32,
             palette: u8,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<Option<DmaBufHandle>> {
             if !paused {
                 self.time += 0.016 * speed;
             }
@@ -1414,12 +1498,13 @@ mod demo {
             }
 
             let queue = Arc::clone(&self.queue);
-            match &mut self.output {
+            let handle = match &mut self.output {
                 Output::Exported(buffer) => {
                     let handle = buffer.submit(&queue, Some(encoder.finish()))?;
                     if let Some(gpu) = gpu {
-                        gpu.paint_surface(handle);
+                        gpu.paint_surface(handle.clone());
                     }
+                    Some(handle)
                 }
                 Output::SameDevice(surface) => {
                     queue.submit(Some(encoder.finish()));
@@ -1431,10 +1516,11 @@ mod demo {
                             false,
                         );
                     }
+                    None
                 }
-            }
+            };
             self.frames += 1;
-            Ok(())
+            Ok(handle)
         }
 
         /// Move the camera by a drag delta, in physical pixels. Pitch is clamped short of the poles so
