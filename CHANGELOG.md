@@ -5,7 +5,9 @@ All notable changes to `gpui_interop` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 version may break the API; a patch does not.
 
-## [Unreleased]
+## [0.1.2] - 2026-10-22
+
+A producer-side ring that makes slow frames safe. No breaking API changes.
 
 ### Added
 
@@ -14,9 +16,18 @@ version may break the API; a patch does not.
   free slot; `present()` returns only a frame whose acquire fence has already
   signalled, or repeats the last good frame while a new one is in flight, so
   GPUI's 16 ms poll never drops a slow frame. Slots are recycled after the
-  consumer's release, with a timeout fallback.
+  consumer's release, with a timeout fallback. Frames overtaken by a newer one
+  are dropped, so presentation never jumps backwards.
 - `shared_buffer_ring` integration test: a deliberately long frame is never
   presented with a pending fence.
+
+### Fixed
+
+- The recommended dma-buf pattern no longer requires hand-rolling the ring,
+  release descriptors and fence bookkeeping. A slow frame is repeated instead of
+  being handed to GPUI with a pending fence, which is the cause of intermittent
+  black viewport frames. GPUI's acquire-fence wait is CPU-side and unchanged;
+  the producer now never makes it wait.
 
 ## [0.1.1] - 2026-10-21
 
@@ -67,5 +78,6 @@ First public release.
 - Examples: `interop_linux`, `interop_cube`, `interop_cube_drag`, plus the
   `interop_wgpu` and `interop_bevy` producer demos.
 
+[0.1.2]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/bite-gpui/gpui_interop/releases/tag/v0.1.0
