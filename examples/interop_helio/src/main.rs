@@ -86,12 +86,13 @@
 //! # The CAD scene
 //!
 //! `--scene cad` (or `--graph cad`) swaps in a graph of two custom passes from
-//! `cad.rs`: a full-screen grid backdrop and one chamfered, gold, metallic cube
-//! lit by a single Cook-Torrance fragment shader, with its feature edges drawn
-//! as screen-space quads so they stay visible (and pickable) at any zoom. It uses no SceneDB rows and
-//! none of the engine's shadow, GI, SSR, atmosphere or post-process passes, and
-//! every buffer it draws from is fixed at construction — so a frame adds two
-//! draws to the camera update Helio already makes.
+//! `cad.rs`: a full-screen grid backdrop and one chamfered steel cube, lit
+//! entirely by a soft ambient studio in a single Cook-Torrance fragment
+//! shader, with its feature edges drawn as screen-space quads so they stay
+//! visible (and pickable) at any zoom. It uses no SceneDB rows and none of
+//! the engine's shadow, GI, SSR, atmosphere or post-process passes, and
+//! every buffer it draws from is fixed at construction — so a frame adds three
+//! draws (grid, cube and edge overlay) to the camera update Helio already makes.
 //!
 //! # Build profile
 //!

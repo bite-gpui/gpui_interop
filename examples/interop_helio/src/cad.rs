@@ -6,7 +6,7 @@
 //!    grid floor. It is a full-screen triangle whose fragment shader rebuilds
 //!    the view ray from the camera uniform and intersects it with the floor
 //!    plane; there is no grid texture.
-//! 2. [`CadPass`] draws one chamfered, gold, metallic cube with Cook-Torrance
+//! 2. [`CadPass`] draws one chamfered white-metal (steel) cube with Cook-Torrance
 //!    direct lighting and a small analytic studio environment for reflections.
 //!    Its twelve edges are flat chamfers and its eight corners are smooth
 //!    multi-sided blends, with the curvature carried by a barycentric normal
@@ -60,7 +60,7 @@ struct EdgeVertex {
     side: f32,
 }
 
-/// The 128-byte material/light block, written once at construction.
+/// The 32-byte material block, written once at construction.
 ///
 /// `vec4` members only, so the WGSL struct matches without padding games.
 #[repr(C)]
@@ -70,28 +70,15 @@ struct CadParams {
     base_color: [f32; 4],
     /// `x`: roughness, `y`: metallic.
     roughness_metallic: [f32; 4],
-    /// `xyz`: direction towards the key light, `w`: intensity.
-    key: [f32; 4],
-    key_color: [f32; 4],
-    fill: [f32; 4],
-    fill_color: [f32; 4],
-    rim: [f32; 4],
-    rim_color: [f32; 4],
 }
 
 impl CadParams {
-    fn gold() -> Self {
+    fn steel() -> Self {
         Self {
-            // Linear gold: a warm yellow-orange in the sRGB target.
-            base_color: [1.00, 0.62, 0.025, 1.0],
-            roughness_metallic: [0.11, 1.0, 0.0, 0.0],
-            // Upper-front-left key, cool right fill, warm rim from behind.
-            key: [-0.30, 0.80, 0.55, 3.0],
-            key_color: [1.00, 0.94, 0.85, 1.0],
-            fill: [0.80, 0.15, 0.20, 1.2],
-            fill_color: [0.55, 0.68, 1.00, 1.0],
-            rim: [0.10, 0.30, -0.90, 1.5],
-            rim_color: [1.00, 0.75, 0.45, 1.0],
+            // Linear F0 of polished steel: neutral, a touch cool. In the sRGB
+            // target that is a bright white metal.
+            base_color: [0.72, 0.74, 0.77, 1.0],
+            roughness_metallic: [0.12, 1.0, 0.0, 0.0],
         }
     }
 }
@@ -809,7 +796,7 @@ impl CadPass {
         });
         let params = device.create_buffer_init(&wgpu30::util::BufferInitDescriptor {
             label: Some("CAD Cube Params"),
-            contents: bytemuck::bytes_of(&CadParams::gold()),
+            contents: bytemuck::bytes_of(&CadParams::steel()),
             usage: wgpu30::BufferUsages::UNIFORM,
         });
 

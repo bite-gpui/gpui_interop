@@ -1,15 +1,16 @@
-// The CAD cube: one pass, one draw, Cook-Torrance metal.
+// The CAD cube: one pass, one draw, a Cook-Torrance white metal.
 //
-// Everything the fragment shader needs is in two buffers that are written
-// before the first frame — the camera uniform Helio already uploads, and a
-// 128-byte parameter block (base colour, roughness/metallic, three fixed
-// lights). The draw itself is static geometry, so a frame costs the camera
-// write Helio makes anyway plus one `draw_indexed`.
+// Everything the fragment shader needs is in two buffers written before the
+// first frame — the camera uniform Helio already uploads, and a small
+// parameter block (base colour and roughness/metallic). The draw itself is
+// static geometry, so a frame costs the camera write Helio makes anyway plus
+// one `draw_indexed`.
 //
-// There is no shadow, GI, SSR or post-process pass in this graph. Reflections
-// come from `environment`, a small analytic studio (sky/ground gradient with
-// two soft panels) sampled along the reflected direction, and the highlight
-// comes from the same GGX lobe the three analytic lights use.
+// There is no shadow, GI, SSR or post-process pass, and no analytic light of
+// any kind: the image is entirely ambient. Reflections come from
+// `environment`, a soft studio sampled along the reflected direction. Its wide
+// panels are the only highlights, so they read as gentle sheen rather than
+// spot lights.
 
 struct Camera {
     view:          mat4x4<f32>,
@@ -25,12 +26,6 @@ struct Camera {
 struct Params {
     base_color:         vec4<f32>,
     roughness_metallic: vec4<f32>,
-    key:                vec4<f32>, // xyz: direction towards the light, w: intensity
-    key_color:          vec4<f32>,
-    fill:               vec4<f32>,
-    fill_color:         vec4<f32>,
-    rim:                vec4<f32>,
-    rim_color:          vec4<f32>,
 };
 
 @group(0) @binding(1) var<uniform> params: Params;
@@ -55,111 +50,57 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-const PI: f32 = 3.14159265359;
-
-fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
-    let a = roughness * roughness;
-    let a2 = a * a;
-    let denominator = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-    return a2 / max(PI * denominator * denominator, 1e-6);
-}
-
-fn geometry_schlick(n_dot_x: f32, roughness: f32) -> f32 {
-    let r = roughness + 1.0;
-    let k = r * r / 8.0;
-    return n_dot_x / max(n_dot_x * (1.0 - k) + k, 1e-6);
-}
-
-fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
-    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
-}
-
-fn direct_light(
-    n: vec3<f32>,
-    v: vec3<f32>,
-    light: vec4<f32>,
-    light_color: vec3<f32>,
-    albedo: vec3<f32>,
-    roughness: f32,
-    metallic: f32,
-    f0: vec3<f32>,
-) -> vec3<f32> {
-    let l = normalize(light.xyz);
-    let n_dot_l = dot(n, l);
-    if (n_dot_l <= 0.0) {
-        return vec3<f32>(0.0);
-    }
-    let h = normalize(v + l);
-    let n_dot_v = max(dot(n, v), 1e-4);
-    let n_dot_h = max(dot(n, h), 0.0);
-    let v_dot_h = max(dot(v, h), 0.0);
-
-    let d = distribution_ggx(n_dot_h, roughness);
-    let g = geometry_schlick(n_dot_v, roughness) * geometry_schlick(n_dot_l, roughness);
-    let f = fresnel_schlick(v_dot_h, f0);
-    let specular = d * g * f / (4.0 * n_dot_v * n_dot_l + 1e-4);
-    let diffuse = (vec3<f32>(1.0) - f) * (1.0 - metallic) * albedo / PI;
-    return (diffuse + specular) * light_color * light.w * n_dot_l;
-}
-
-/// A dim studio built around the reference render: a bright warm bounce where
-/// the left facet's mirror ray lands, a much darker cool one on the right, and
-/// narrow panels for the two top chamfers. The gaps between them are what give
-/// the chamfers their dark bands; a uniform environment washes them out and is
-/// what made the first version look soft.
+/// A soft, mostly ambient studio: a cool sky, a neutral floor bounce and four
+/// wide panels. There are no spot lights in the scene; the panels' reflections
+/// are the only highlights, so they are wide and gentle, and the ambient walls
+/// are bright enough to keep white metal white.
 fn environment(direction: vec3<f32>) -> vec3<f32> {
     let up = clamp(direction.y, -1.0, 1.0);
     let azimuth = normalize(direction.xz + vec2<f32>(1e-5));
 
-    // Dim studio walls.
-    var color = vec3<f32>(0.085, 0.088, 0.098);
+    // Bright, neutral ambient walls.
+    var color = vec3<f32>(0.16, 0.165, 0.175);
 
-    // Floor bounce: bright to the front-left, dim to the front-right, dark in
-    // the gap between them (where the front vertical chamfer looks).
+    // Floor bounce: slightly brighter to the front-left, softer to the right.
     let below = 1.0 - smoothstep(-0.15, 0.10, up);
-    let height = mix(0.55, 1.0, smoothstep(-0.9, 0.05, up));
+    let height = mix(0.60, 1.0, smoothstep(-0.9, 0.05, up));
     let warm = pow(max(dot(azimuth, vec2<f32>(-0.7, 0.7)), 0.0), 3.0);
-    let cool = pow(max(dot(azimuth, vec2<f32>(0.2, -0.98)), 0.0), 5.0);
+    let cool = pow(max(dot(azimuth, vec2<f32>(0.2, -0.98)), 0.0), 4.0);
     color += below
         * height
-        * (vec3<f32>(0.55, 0.45, 0.20) * warm + vec3<f32>(0.16, 0.17, 0.19) * cool);
+        * (vec3<f32>(0.55, 0.56, 0.58) * warm + vec3<f32>(0.24, 0.25, 0.26) * cool);
 
     // A cool sky above the horizon.
-    color = mix(color, vec3<f32>(0.26, 0.28, 0.31), smoothstep(0.0, 0.7, up));
+    color = mix(color, vec3<f32>(0.40, 0.42, 0.45), smoothstep(0.0, 0.7, up));
 
-    // The softboxes: front-left, right, behind, and one over each top chamfer.
-    let left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.57, -0.71, 0.39))), 0.0), 10.0);
-    color += vec3<f32>(0.45, 0.38, 0.22) * left_box;
-    let right_box = pow(max(dot(direction, normalize(vec3<f32>(0.40, -0.73, -0.59))), 0.0), 12.0);
-    color += vec3<f32>(0.30, 0.26, 0.14) * right_box;
-    let top_box = pow(max(dot(direction, normalize(vec3<f32>(-0.80, 0.30, -0.45))), 0.0), 8.0);
-    color += vec3<f32>(0.50, 0.44, 0.26) * top_box;
-    // Narrow, bright strip lights across each top chamfer. These are the edge
-    // highlights: the 45-degree facets mirror them along their whole length,
-    // while the flat faces mirror the much dimmer sky and floor.
-    // The mirror directions of the two top chamfers at this camera angle.
-    let top_left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.66, 0.46, 0.62))), 0.0), 16.0);
-    color += vec3<f32>(3.50, 3.05, 1.70) * top_left_box;
-    let top_right_box = pow(max(dot(direction, normalize(vec3<f32>(0.61, 0.46, -0.65))), 0.0), 16.0);
-    color += vec3<f32>(2.20, 1.95, 1.10) * top_right_box;
+    // Broad panels for the floor-facing and top-facing reflections.
+    let left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.57, -0.71, 0.39))), 0.0), 6.0);
+    color += vec3<f32>(0.45, 0.46, 0.47) * left_box;
+    let right_box = pow(max(dot(direction, normalize(vec3<f32>(0.40, -0.73, -0.59))), 0.0), 8.0);
+    color += vec3<f32>(0.30, 0.31, 0.32) * right_box;
+    let top_box = pow(max(dot(direction, normalize(vec3<f32>(-0.80, 0.30, -0.45))), 0.0), 6.0);
+    color += vec3<f32>(0.50, 0.51, 0.52) * top_box;
 
-    // The front vertical chamfer mirrors into the gap between the two floor
-    // pools. A little fill keeps it dark gold with a gradient instead of a
-    // flat black wedge.
+    // The two top chamfers' reflections. These are the edge highlights: broad
+    // and bright, so they read as ambient sheen rather than spot lights.
+    let top_left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.66, 0.46, 0.62))), 0.0), 8.0);
+    color += vec3<f32>(1.60, 1.62, 1.65) * top_left_box;
+    let top_right_box = pow(max(dot(direction, normalize(vec3<f32>(0.61, 0.46, -0.65))), 0.0), 8.0);
+    color += vec3<f32>(1.00, 1.01, 1.03) * top_right_box;
+
+    // The front vertical chamfer mirrors into the gap between the floor
+    // bounces; a little fill gives it depth rather than a flat dark wedge.
     let front_fill = pow(max(dot(direction, normalize(vec3<f32>(0.44, -0.77, 0.44))), 0.0), 6.0);
-    color += vec3<f32>(0.09, 0.07, 0.03) * front_fill;
+    color += vec3<f32>(0.07, 0.07, 0.075) * front_fill;
 
-    // A narrow strip reflected near the front edge of the right face,
-    // which is the bright vertical band in the reference.
+    // A narrow strip reflected near the front edge of the right face.
     let right_glint = pow(max(dot(azimuth, normalize(vec2<f32>(0.78, -0.63))), 0.0), 60.0)
         * (1.0 - smoothstep(-0.1, 0.15, up));
-    color += vec3<f32>(0.30, 0.24, 0.10) * right_glint;
+    color += vec3<f32>(0.28, 0.29, 0.30) * right_glint;
 
-    // A soft fill behind the camera. The vertex blend patches' middle normals
-    // point back at the viewer, and without this they mirror a dark wall and
-    // read as a notch between the bevels.
+    // A soft fill behind the camera for the corner blend patches.
     let corner_fill = pow(max(dot(direction, normalize(vec3<f32>(0.60, 0.55, 0.60))), 0.0), 2.0);
-    color += vec3<f32>(0.55, 0.46, 0.28) * corner_fill;
+    color += vec3<f32>(0.55, 0.56, 0.58) * corner_fill;
 
     return color;
 }
@@ -182,16 +123,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Conductors have no diffuse albedo; their base colour *is* F0.
     let f0 = mix(vec3<f32>(0.04), base, metallic);
-    let albedo = base * (1.0 - metallic);
 
+    // Everything is ambient now: mirror the view vector, sample the studio,
+    // and weight it by a roughness-aware Fresnel. The panels in the studio are
+    // what give the facets their distinct values and the bevels their sheen.
     var color = vec3<f32>(0.0);
-    color += direct_light(n, v, params.key, params.key_color.rgb, albedo, roughness, metallic, f0);
-    color += direct_light(n, v, params.fill, params.fill_color.rgb, albedo, roughness, metallic, f0);
-    color += direct_light(n, v, params.rim, params.rim_color.rgb, albedo, roughness, metallic, f0);
-
-    // Cheap image-based lighting: mirror the view vector, sample the studio,
-    // and weight it by a roughness-aware Fresnel. This is what gives the three
-    // visible facets their distinct values and the bevelled edges their glint.
     let reflected = reflect(-v, n);
     let n_dot_v = max(dot(n, v), 0.0);
     let fresnel = f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(1.0 - n_dot_v, 5.0);
@@ -205,10 +141,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // A thin grazing rim, so the silhouette reads as a rolled highlight
     // rather than a hard cut, without washing out the near-vertical sides.
-    color += vec3<f32>(0.90, 0.75, 0.45) * pow(1.0 - n_dot_v, 8.0) * 0.18;
-
-    // A little floor bounce, for dielectric parts only.
-    color += albedo * 0.04 * studio;
+    color += vec3<f32>(0.80, 0.82, 0.85) * pow(1.0 - n_dot_v, 8.0) * 0.18;
 
     return vec4<f32>(tonemap(color), 1.0);
 }
