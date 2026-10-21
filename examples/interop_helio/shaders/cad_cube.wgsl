@@ -1,4 +1,4 @@
-// The CAD cube: one pass, one draw, a Cook-Torrance white metal.
+// The CAD cube: one pass, one draw, a Cook-Torrance steel metal.
 //
 // Everything the fragment shader needs is in two buffers written before the
 // first frame — the camera uniform Helio already uploads, and a small
@@ -53,13 +53,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 /// A soft, mostly ambient studio: a cool sky, a neutral floor bounce and four
 /// wide panels. There are no spot lights in the scene; the panels' reflections
 /// are the only highlights, so they are wide and gentle, and the ambient walls
-/// are bright enough to keep white metal white.
+/// are bright enough to keep the steel's facets open and readable.
 fn environment(direction: vec3<f32>) -> vec3<f32> {
     let up = clamp(direction.y, -1.0, 1.0);
     let azimuth = normalize(direction.xz + vec2<f32>(1e-5));
 
-    // Bright, neutral ambient walls.
-    var color = vec3<f32>(0.16, 0.165, 0.175);
+    // Neutral, moderately bright ambient walls.
+    var color = vec3<f32>(0.085, 0.088, 0.095);
 
     // Floor bounce: slightly brighter to the front-left, softer to the right.
     let below = 1.0 - smoothstep(-0.15, 0.10, up);
@@ -68,39 +68,40 @@ fn environment(direction: vec3<f32>) -> vec3<f32> {
     let cool = pow(max(dot(azimuth, vec2<f32>(0.2, -0.98)), 0.0), 4.0);
     color += below
         * height
-        * (vec3<f32>(0.55, 0.56, 0.58) * warm + vec3<f32>(0.24, 0.25, 0.26) * cool);
+        * (vec3<f32>(0.36, 0.37, 0.39) * warm + vec3<f32>(0.16, 0.17, 0.19) * cool);
 
     // A cool sky above the horizon.
-    color = mix(color, vec3<f32>(0.40, 0.42, 0.45), smoothstep(0.0, 0.7, up));
+    color = mix(color, vec3<f32>(0.30, 0.315, 0.335), smoothstep(0.0, 0.7, up));
 
     // Broad panels for the floor-facing and top-facing reflections.
     let left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.57, -0.71, 0.39))), 0.0), 6.0);
-    color += vec3<f32>(0.45, 0.46, 0.47) * left_box;
+    color += vec3<f32>(0.38, 0.39, 0.41) * left_box;
     let right_box = pow(max(dot(direction, normalize(vec3<f32>(0.40, -0.73, -0.59))), 0.0), 8.0);
-    color += vec3<f32>(0.30, 0.31, 0.32) * right_box;
+    color += vec3<f32>(0.22, 0.23, 0.25) * right_box;
     let top_box = pow(max(dot(direction, normalize(vec3<f32>(-0.80, 0.30, -0.45))), 0.0), 6.0);
-    color += vec3<f32>(0.50, 0.51, 0.52) * top_box;
+    color += vec3<f32>(0.42, 0.43, 0.45) * top_box;
 
     // The two top chamfers' reflections. These are the edge highlights: broad
     // and bright, so they read as ambient sheen rather than spot lights.
     let top_left_box = pow(max(dot(direction, normalize(vec3<f32>(-0.66, 0.46, 0.62))), 0.0), 8.0);
-    color += vec3<f32>(1.60, 1.62, 1.65) * top_left_box;
+    color += vec3<f32>(1.25, 1.27, 1.30) * top_left_box;
     let top_right_box = pow(max(dot(direction, normalize(vec3<f32>(0.61, 0.46, -0.65))), 0.0), 8.0);
-    color += vec3<f32>(1.00, 1.01, 1.03) * top_right_box;
+    color += vec3<f32>(0.82, 0.83, 0.85) * top_right_box;
 
-    // The front vertical chamfer mirrors into the gap between the floor
-    // bounces; a little fill gives it depth rather than a flat dark wedge.
+    // The front vertical chamfer mirrors down into the floor between the two
+    // bounces. A broad floor fill keeps it reading as a lit metal strip rather
+    // than a black slot in the solid.
     let front_fill = pow(max(dot(direction, normalize(vec3<f32>(0.44, -0.77, 0.44))), 0.0), 6.0);
-    color += vec3<f32>(0.07, 0.07, 0.075) * front_fill;
+    color += vec3<f32>(0.34, 0.35, 0.37) * front_fill;
 
     // A narrow strip reflected near the front edge of the right face.
     let right_glint = pow(max(dot(azimuth, normalize(vec2<f32>(0.78, -0.63))), 0.0), 60.0)
         * (1.0 - smoothstep(-0.1, 0.15, up));
-    color += vec3<f32>(0.28, 0.29, 0.30) * right_glint;
+    color += vec3<f32>(0.24, 0.25, 0.27) * right_glint;
 
     // A soft fill behind the camera for the corner blend patches.
     let corner_fill = pow(max(dot(direction, normalize(vec3<f32>(0.60, 0.55, 0.60))), 0.0), 2.0);
-    color += vec3<f32>(0.55, 0.56, 0.58) * corner_fill;
+    color += vec3<f32>(0.44, 0.45, 0.47) * corner_fill;
 
     return color;
 }
@@ -141,7 +142,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // A thin grazing rim, so the silhouette reads as a rolled highlight
     // rather than a hard cut, without washing out the near-vertical sides.
-    color += vec3<f32>(0.80, 0.82, 0.85) * pow(1.0 - n_dot_v, 8.0) * 0.18;
+    color += vec3<f32>(0.78, 0.81, 0.85) * pow(1.0 - n_dot_v, 8.0) * 0.18;
 
     return vec4<f32>(tonemap(color), 1.0);
 }

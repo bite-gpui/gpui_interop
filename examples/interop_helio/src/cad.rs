@@ -6,8 +6,8 @@
 //!    grid floor. It is a full-screen triangle whose fragment shader rebuilds
 //!    the view ray from the camera uniform and intersects it with the floor
 //!    plane; there is no grid texture.
-//! 2. [`CadPass`] draws one chamfered white-metal (steel) cube with Cook-Torrance
-//!    direct lighting and a small analytic studio environment for reflections.
+//! 2. [`CadPass`] draws one chamfered steel cube with Cook-Torrance
+//!    ambient lighting and a small analytic studio environment for reflections.
 //!    Its twelve edges are flat chamfers and its eight corners are smooth
 //!    multi-sided blends, with the curvature carried by a barycentric normal
 //!    field rather than a bulge. It then overlays the cube's feature edges as
@@ -75,10 +75,10 @@ struct CadParams {
 impl CadParams {
     fn steel() -> Self {
         Self {
-            // Linear F0 of polished steel: neutral, a touch cool. In the sRGB
-            // target that is a bright white metal.
-            base_color: [0.72, 0.74, 0.77, 1.0],
-            roughness_metallic: [0.12, 1.0, 0.0, 0.0],
+            // Linear F0 of polished silver steel: darker than white and faintly
+            // cool, so the facets read as grey metal instead of a white shell.
+            base_color: [0.36, 0.375, 0.405, 1.0],
+            roughness_metallic: [0.16, 1.0, 0.0, 0.0],
         }
     }
 }

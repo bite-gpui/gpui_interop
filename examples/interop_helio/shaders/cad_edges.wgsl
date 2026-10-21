@@ -58,5 +58,5 @@ fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
     // Linear; the sRGB target encodes it into a pale neutral highlight.
-    return vec4<f32>(0.42, 0.44, 0.46, 1.0);
+    return vec4<f32>(0.44, 0.45, 0.46, 1.0);
 }
