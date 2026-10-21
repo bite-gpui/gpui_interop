@@ -61,10 +61,13 @@
 //! components, flushed to the renderer's GPU mirror at each frame boundary.
 //! The default scene is the standalone demo's — a sky, a reflective floor, four
 //! columns with spheres, four orbiting point lights, and a metallic crystal
-//! spinner — and exercises Helio's default graph: GI, shadows, reflections and
-//! post-processing. `--graph forward` runs the forward-lit graph instead, whose
-//! `BackgroundPass` clears `pre_aa` before drawing, so frames no longer
-//! accumulate; `--graph simple` is the one-pass micro baseline.
+//! spinner. The forward-lit graph is the default: one lit-geometry pass plus
+//! transparency, FXAA, lens and post-processing, whose `BackgroundPass` clears
+//! `pre_aa` before drawing, so frames do not accumulate. It renders at native
+//! resolution — Helio's default 0.75 internal scale would otherwise upsample
+//! the finished image and soften the AA with it. `--graph full` runs the 47-pass
+//! deferred graph (GI, shadows, reflections and post-processing), and
+//! `--graph simple` is the one-pass micro baseline.
 //!
 //! That `BackgroundPass` used to hard-code black, so a field with no sky was
 //! pitch black. This example pins a fork (`Vanuan/Helio`) whose
@@ -96,7 +99,7 @@
 //!
 //! # Build profile
 //!
-//! Run it with `--release`. Helio's 39-pass graph and shader compilation are
+//! Run it with `--release`. Helio's graphs and shader compilation are
 //! compiled at opt-level 0 in a debug build; the debug numbers measure the
 //! build, not the bridge.
 
@@ -231,29 +234,31 @@ mod demo {
 
     /// Which render graph Helio runs.
     ///
-    /// The default graph is the 39-pass standalone one. `Simple` is a single pass drawing one
-    /// debug cube — the micro baseline, comparable to `interop_wgpu`'s hand-written scene.
-    /// `Forward` is the forward-lighting graph: G-buffer, decals, deferred lighting and SSR are
-    /// replaced by one lit-geometry pass. Its `BackgroundPass` clears `pre_aa` first, so frames do
-    /// not accumulate (Helio's own graph only grew that clear in the revision this example pins).
+    /// `Forward` is the default: G-buffer, decals, deferred lighting and SSR are replaced by one
+    /// lit-geometry pass, which keeps the field interactive on integrated GPUs. It is also the
+    /// only graph rendered at native resolution, so its FXAA pass is not softened by an upscale.
+    /// `Full` is the 47-pass deferred graph. `Simple` is a single pass drawing one debug cube —
+    /// the micro baseline, comparable to `interop_wgpu`'s hand-written scene. `Cad` is the two
+    /// custom passes behind `--scene cad`.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     enum GraphKind {
+        /// The 47-pass deferred graph: GI, shadows, reflections and post-processing.
+        Full,
         #[default]
-        Default,
-        Simple,
         Forward,
+        Simple,
         /// Two custom passes: a grid backdrop and one metallic chamfered cube.
         Cad,
     }
 
     fn parse_graph(value: &str) -> GraphKind {
         match value {
-            "default" | "full" => GraphKind::Default,
-            "simple" | "cube" => GraphKind::Simple,
+            "full" => GraphKind::Full,
             "forward" => GraphKind::Forward,
+            "simple" | "cube" => GraphKind::Simple,
             "cad" => GraphKind::Cad,
             other => usage_error(&format!(
-                "--graph: {other:?} is not default, simple, forward, or cad"
+                "--graph: {other:?} is not full, forward, simple, or cad"
             )),
         }
     }
@@ -302,6 +307,7 @@ mod demo {
             shadows: None,
             graph: GraphKind::default(),
         };
+        let mut chosen_graph: Option<GraphKind> = None;
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -327,9 +333,9 @@ mod demo {
                 }
                 "--graph" => {
                     let value = args.next().unwrap_or_else(|| {
-                        usage_error("--graph needs default, forward, simple, or cad")
+                        usage_error("--graph needs full, forward, simple, or cad")
                     });
-                    cli.graph = parse_graph(&value);
+                    chosen_graph = Some(parse_graph(&value));
                 }
                 "--gpu" => {
                     let value = args
@@ -349,6 +355,12 @@ mod demo {
                 other => usage_error(&format!("unknown argument {other:?}")),
             }
         }
+        // An explicit `--graph` wins; otherwise the CAD scene uses its own graph
+        // and every other scene uses the forward graph.
+        cli.graph = chosen_graph.unwrap_or(match cli.scene {
+            SceneKind::Cad => GraphKind::Cad,
+            _ => GraphKind::default(),
+        });
         cli
     }
 
@@ -372,8 +384,8 @@ mod demo {
             "  --scene <KIND>       full (standalone demo), field (49 cubes, Bevy's scene), clear,\n",
             "                       or cad (one custom-pass metallic cube over a grid)\n",
             "  --shadows <ON|OFF>   override the scene's shadow maps (full: on, field: off)\n",
-            "  --graph <KIND>       default (39 passes), forward (lit geometry), simple (one cube),\n",
-            "                       or cad (the two-pass CAD scene)\n",
+            "  --graph <KIND>       forward (default, lit geometry and FXAA), full (the 47-pass\n",
+            "                       deferred graph), simple (one cube), or cad (the two-pass CAD scene)\n",
             "  -h, --help           show this help\n",
             "\n",
             "Helio's wgpu 30 frame leaves as a dma-buf and GPUI imports it on its own wgpu 29\n",
@@ -738,17 +750,20 @@ mod demo {
             // that fills the viewport, and GPUI's `paint_surface` blends the dma-buf over the
             // window's own background. The fork preserves alpha through FXAA, the fog composite
             // and post-processing, so the alpha written here reaches the compositor.
-            let config = RendererConfig::new(width, height, FORMAT).with_background_color([0.0; 4]);
+            let mut config = RendererConfig::new(width, height, FORMAT);
+            config = config.with_background_color([0.0; 4]);
+            // Helio's default scale is 0.75: the graph renders below the surface size and the
+            // final blit upsamples it. That softens the image and, with it, the FXAA pass's work.
+            // The forward graph is cheap enough to render at native resolution.
+            if graph == GraphKind::Forward {
+                config = config.with_render_scale(1.0);
+            }
             let builder = RendererBuilder::new(config, scene_db_handle(&scene_db));
-            // The CAD scene has no SceneDB actors: its content *is* the custom graph's static
-            // buffers, so the engine's default graph would draw nothing. It selects its own graph
-            // unless the caller named one explicitly.
-            let graph = match (scene, graph) {
-                (SceneKind::Cad, GraphKind::Default) => GraphKind::Cad,
-                _ => graph,
-            };
+            // The graph was resolved in `parse_args`: an explicit `--graph` wins, otherwise the
+            // CAD scene gets its own graph (it has no SceneDB actors, so the engine's graphs would
+            // draw nothing) and every other scene gets the forward graph.
             let builder = builder.with_pass_build_context(match graph {
-                GraphKind::Default => Box::new(build_default_graph_external_with_context),
+                GraphKind::Full => Box::new(build_default_graph_external_with_context),
                 GraphKind::Simple => Box::new(simple_graph),
                 GraphKind::Forward => Box::new(build_forward_only_graph_with_context),
                 GraphKind::Cad => Box::new(cad_graph),
