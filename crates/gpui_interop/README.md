@@ -62,6 +62,10 @@ A wgpu producer has two shapes, both starting from `Adapter::wgpu`:
   modifier and a `sync_file` — the cross-device shape another backend imports with `paint_surface`.
 - `WgpuSurface` is the same-device fast path, composited with `paint_texture`: no export and no
   fence.
+- `WgpuSharedBufferRing` owns three `WgpuSharedBuffer` slots and their release eventfds for a
+  producer that renders continuously. `begin()` hands out a free slot, `submit()` exports the frame,
+  and `present()` returns only a frame whose acquire fence has already signalled — or repeats the
+  last good one while a new frame is still running. GPUI therefore never polls a pending fence.
 
 ## Quick start
 

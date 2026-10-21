@@ -5,6 +5,19 @@ All notable changes to `gpui_interop` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 version may break the API; a patch does not.
 
+## [Unreleased]
+
+### Added
+
+- `WgpuSharedBufferRing` (Linux, `wgpu` feature): a ring of exportable frames
+  for a continuously rendering producer. `begin()`/`submit()` render into a
+  free slot; `present()` returns only a frame whose acquire fence has already
+  signalled, or repeats the last good frame while a new one is in flight, so
+  GPUI's 16 ms poll never drops a slow frame. Slots are recycled after the
+  consumer's release, with a timeout fallback.
+- `shared_buffer_ring` integration test: a deliberately long frame is never
+  presented with a pending fence.
+
 ## [0.1.1] - 2026-10-21
 
 A documentation and CI patch. No API changes.

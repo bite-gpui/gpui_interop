@@ -54,6 +54,10 @@
 //! acquire fence has not signalled within 16 ms, so a frame that runs long is safer presented one
 //! frame late than as a black frame.
 //!
+//! `WgpuSharedBufferRing` (Linux, `wgpu` feature) implements that shape: it owns the slots and
+//! release descriptors and only presents a frame whose fence has already signalled, repeating the
+//! last good frame while a new one is still running.
+//!
 //! # The other direction
 //!
 //! With the `guest` feature, [`Guest`] runs the inverse: headless GPUI on a worker thread for a host
@@ -105,6 +109,8 @@ mod linux;
 mod macos;
 #[cfg(all(target_os = "linux", feature = "wgpu"))]
 mod wgpu_dmabuf;
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+mod wgpu_dmabuf_ring;
 #[cfg(feature = "wgpu")]
 mod wgpu_surface;
 #[cfg(target_os = "windows")]
@@ -123,6 +129,8 @@ pub use linux::{
 };
 #[cfg(all(target_os = "linux", feature = "wgpu"))]
 pub use wgpu_dmabuf::WgpuSharedBuffer;
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+pub use wgpu_dmabuf_ring::{RingFrame, WgpuSharedBufferRing};
 #[cfg(feature = "wgpu")]
 pub use wgpu_surface::WgpuSurface;
 #[cfg(target_os = "windows")]

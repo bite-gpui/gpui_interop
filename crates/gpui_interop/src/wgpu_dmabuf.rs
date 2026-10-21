@@ -264,7 +264,8 @@ impl WgpuSharedBuffer {
     /// that wait is a heuristic, because a frame can stay in the consumer's queue for more
     /// submissions than the ring is deep. GPUI also drops a surface whose acquire fence has not
     /// signalled within 16 ms, so a producer that renders a frame this long should present the
-    /// previous completed frame instead of the one just submitted.
+    /// previous completed frame instead of the one just submitted. [`WgpuSharedBufferRing`] wraps
+    /// that rule for a producer that renders continuously.
     pub fn submit(
         &mut self,
         queue: &wgpu::Queue,

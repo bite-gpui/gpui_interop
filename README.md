@@ -170,6 +170,10 @@ Two more footguns:
   them, but GPUI then samples the *new* contents. Gate on the release, not on device identity.
 
 The safe shape is a ring plus one frame of lead plus a release wait for a frame that runs long.
+`WgpuSharedBufferRing` (Linux, `wgpu` feature) packages it: it owns the slots and their release
+eventfds, and `present()` returns only a frame whose acquire fence has **already** signalled — or the
+last good frame while a new one runs — so GPUI's 16 ms poll never drops a slow frame.
+
 `interop_wgpu` reuses one buffer and is safe only because it renders inside the paint and submits
 before GPUI's draw; it is a same-device shortcut, not a template for a free-running producer.
 

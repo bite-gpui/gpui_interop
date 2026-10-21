@@ -86,6 +86,12 @@ name = "wgpu_surface"
 path = "tests/wgpu_surface.rs"
 required-features = ["wgpu-test"]
 
+# The ring's test: a long frame must never be presented with a pending acquire fence.
+[[test]]
+name = "shared_buffer_ring"
+path = "tests/shared_buffer_ring.rs"
+required-features = ["wgpu-test"]
+
 # The Windows cross-device test imports the facade directly, so it needs the `gpui` feature;
 # without it Cargo would build the test with no `gpui` crate. The file itself is `#![cfg(windows)]`.
 [[test]]
@@ -162,6 +168,9 @@ gpui_engine.workspace = true
 ash = "0.38"
 # A `Tiling::Tiled` request the device cannot soundly honour is refused, not silently mistiled.
 log = "0.4.16"
+# The shared-buffer ring creates the release eventfd and polls acquire fences and
+# releases without blocking.
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The Windows transport (`SharedSurface`, `Fence`) is Direct3D 11 + 12. The workspace `windows`
@@ -187,6 +196,3 @@ gpui_wgpu = { workspace = true, features = ["headless"] }
 # `wgpu` itself uses -- so the demo needs no offline shader compiler (`glslc`, `glslangValidator`).
 # Dev-dependencies: only the example names a shader, and the shared `naga` picks the features up.
 naga = { version = "29.0.4", features = ["wgsl-in", "spv-out"] }
-# The cube example's zero-copy ring waits on the consumer's `eventfd` release with a non-blocking
-# `poll`, and makes that descriptor itself; `gpui_va` recycles its frames with the same two calls.
-libc = "0.2"
