@@ -136,6 +136,43 @@ returns the renderer's device, which `gpui_wgpu` creates with the first and four
 enables the middle two. A device from a plain `request_device` lacks the first and is refused with a
 message naming it.
 
+#### Lifetime: one buffer is not a ring
+
+`submit` only *starts* the write. The returned handle carries the producer's acquire fence, not
+permission to overwrite the image; GPUI samples the buffer later, on its own submission. Reusing the
+same `WgpuSharedBuffer` for the next frame while GPUI may still be sampling it is the defect behind
+intermittent black frames ([#1](https://github.com/bite-gpui/gpui_interop/issues/1)).
+
+- Keep at least two buffers and present one frame behind the one being rendered, or
+- attach a release descriptor and wait for it before writing the slot again. `DmaBufHandle::release`
+  is written from GPUI's `on_submitted_work_done` for the submission that sampled the surface;
+  `release_unpresented` covers a frame GPUI dropped. That is the only precise "consumer is done"
+  signal. A rule like "reuse after N submissions" is a heuristic: the consumer's queue can be deeper
+  than N, and a coalesced frame can delay the sample.
+
+```rust
+let release = eventfd(...); // an eventfd the producer owns
+let mut handle = buffer.submit(&queue, Some(commands))?;
+handle.release = Some(Arc::new(release));
+gpu.paint_surface(handle);
+// ...before the next write into this buffer, poll/read the eventfd
+```
+
+Two more footguns:
+
+- **GPUI waits at most 16 ms** for a surface's acquire fence (`gpui_wgpu`'s
+  `ACQUIRE_FENCE_TIMEOUT`). A producer frame longer than that is dropped, which shows as a black
+  viewport frame. A full-screen overlay is enough to cross it: FerroCAD's grid shader costs ~2.4 ms
+  at 1280×720 with 4× MSAA (~5–6 ms at 1080p) on an Intel HD 520. Present the previous completed
+  frame rather than the one just submitted.
+- **Same device does not mean same submission.** If the producer shares the renderer's device and
+  queue but can submit outside the paint, a write can be queued before GPUI's draw. The queue orders
+  them, but GPUI then samples the *new* contents. Gate on the release, not on device identity.
+
+The safe shape is a ring plus one frame of lead plus a release wait for a frame that runs long.
+`interop_wgpu` reuses one buffer and is safe only because it renders inside the paint and submits
+before GPUI's draw; it is a same-device shortcut, not a template for a free-running producer.
+
 #### The same-device view (fast path)
 
 Where the window renderer *is* wgpu — the Linux default, or a Windows window whose factory installed

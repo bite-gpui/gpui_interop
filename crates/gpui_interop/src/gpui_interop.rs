@@ -44,6 +44,16 @@
 //!   `DirectXSource::Shared` handles — which the renderer opens on its own Direct3D 11 device, with
 //!   the shared fence ordering the two queues.
 //!
+//! # Lifetime
+//!
+//! A hand-off is a pipeline, not a copy: the consumer samples the buffer after `paint_surface`
+//! returns. `WgpuSharedBuffer::submit` submits the write and returns immediately, so a producer that
+//! renders continuously must keep a ring and wait for `DmaBufHandle::release` before writing a slot
+//! again — or present one frame behind the one being rendered. A fixed "reuse after N submissions"
+//! rule is a heuristic and eventually races a deep consumer queue. GPUI also drops a surface whose
+//! acquire fence has not signalled within 16 ms, so a frame that runs long is safer presented one
+//! frame late than as a black frame.
+//!
 //! # The other direction
 //!
 //! With the `guest` feature, [`Guest`] runs the inverse: headless GPUI on a worker thread for a host

@@ -32,6 +32,19 @@
 //! `VK_KHR_external_semaphore_fd`, which `gpui_wgpu` enables on the renderer's device where the
 //! driver supports it; a device without it is refused at construction rather than handing over an
 //! unsynchronised buffer.
+//!
+//! # Lifetime
+//!
+//! [`WgpuSharedBuffer::submit`] submits the frame and returns; it does not wait for it to finish.
+//! The handle's acquire fence orders the consumer's sample *after* the write, but says nothing about
+//! the next write. A producer that renders continuously must keep a ring and, before reusing a slot,
+//! wait for the consumer's release ([`DmaBufHandle::release`], signalled by GPUI from the submission
+//! that sampled the surface). Reusing a single buffer, or reusing one after a fixed number of
+//! submissions, will eventually overwrite a frame the consumer is still sampling.
+//!
+//! GPUI polls the acquire fence for only 16 ms (`gpui_wgpu`'s `ACQUIRE_FENCE_TIMEOUT`); a frame that
+//! takes longer to finish is dropped and presents as black. Presenting the previous completed frame
+//! (one frame of lead) is the simple way to stay inside that budget.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -246,8 +259,12 @@ impl WgpuSharedBuffer {
     /// Add the commands that render into [`view`](Self::view) to `commands`, then submit them
     /// here: this registers the exportable semaphore on that submission, submits on `queue`, and
     /// exports the semaphore as the `sync_file` the renderer polls. The buffer must not be written
-    /// again until the renderer has sampled the frame (keep a ring of buffers for a producer that
-    /// renders continuously).
+    /// again until the renderer has sampled the frame. Attach a release descriptor to the returned
+    /// handle ([`DmaBufHandle::release`]) and wait for it before reusing the slot; a ring without
+    /// that wait is a heuristic, because a frame can stay in the consumer's queue for more
+    /// submissions than the ring is deep. GPUI also drops a surface whose acquire fence has not
+    /// signalled within 16 ms, so a producer that renders a frame this long should present the
+    /// previous completed frame instead of the one just submitted.
     pub fn submit(
         &mut self,
         queue: &wgpu::Queue,
