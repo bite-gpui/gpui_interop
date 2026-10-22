@@ -1166,7 +1166,7 @@ mod demo {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[vertex_layout, instance_layout],
+                    buffers: &[Some(vertex_layout), Some(instance_layout)],
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,

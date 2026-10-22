@@ -270,9 +270,9 @@ window loop. The consumer's half is a normal run's `paint` (import/composite) an
 an adapter's render ceiling from its display path.
 
 `interop_bevy --bench` is the same measurement for a full engine: headless Bevy, no window, its own
-`ScheduleRunnerPlugin` loop, and a device poll per frame. It is deliberately Bevy 0.19 rather than
-0.20: `bevy_render` 0.19 depends on `wgpu 29`, the version this workspace already has, so the
-producer cannot accidentally compile a second wgpu and split the texture types.
+`ScheduleRunnerPlugin` loop, and a device poll per frame. It tracks the Bevy release whose
+`bevy_render` depends on the core's `wgpu`: Bevy 0.20 uses `wgpu 30`, so the producer cannot
+accidentally compile a second wgpu and split the texture types.
 
 A Bevy PBR frame also exposed two limits in the window renderer's device that a hand-written
 pipeline never hits. Bevy's clustered-forward pass needs 5–8 storage buffers per stage and a
@@ -653,18 +653,18 @@ During development this workspace takes the core from the sibling checkout — `
 `gpui_wgpu` and `gpui_windows` are path dependencies on `../bite-gpui/crates/…` — so a fix in the
 renderer reaches this stack without a release. On release each path becomes the published package.
 
-The last published release is `1.24.401`. A consumer aliases the published packages back to their
+The last published release is `1.25.202`. A consumer aliases the published packages back to their
 standard crate names so imports like `use gpui::...` compile unchanged:
 
 ```toml
 [workspace.dependencies]
-gpui         = { package = "bite-gpui",       version = "1.24.401", default-features = false }
-gpui_engine  = { package = "bite-gp-engine",  version = "1.24.401" }
-gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.24.401" }
-gpui_windows = { package = "bite-gp-windows", version = "1.24.401" }
+gpui         = { package = "bite-gpui",       version = "1.25.202", default-features = false }
+gpui_engine  = { package = "bite-gp-engine",  version = "1.25.202" }
+gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.25.202" }
+gpui_windows = { package = "bite-gp-windows", version = "1.25.202" }
 ```
 
-The guest and same-device wgpu paths need the seams published across `1.23.305` and `1.24.400`: a
+The guest and same-device wgpu paths need the seams published since `1.23.305`: a
 public `Window::present`, the headless renderer factory, the offscreen surface handle, the dma-buf
 explicit-layout guard, and the transfer function. To test against a GPUI checkout or a custom
 branch, replace the versions above with `path` or `git`/`branch` sources.

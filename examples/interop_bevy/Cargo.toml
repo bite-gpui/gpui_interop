@@ -18,9 +18,9 @@ path = "src/main.rs"
 anyhow.workspace = true
 # Headless: no `bevy_winit`, no window, no event loop of its own. `bevy_log` surfaces renderer
 # validation errors; `multi_threaded` keeps the task pools and the pipelined render thread, so the
-# demo measures the engine as it normally runs. `bevy_render` 0.19 depends on `wgpu = "29.0.3"`,
-# which is the workspace's 29.0.4.
-bevy = { version = "0.19.0", default-features = false, features = [
+# demo measures the engine as it normally runs. `bevy_render` 0.20 depends on `wgpu = "30"`,
+# which is the workspace's 30.0.1.
+bevy = { version = "0.20.0", default-features = false, features = [
     "std",
     "multi_threaded",
     "bevy_asset",

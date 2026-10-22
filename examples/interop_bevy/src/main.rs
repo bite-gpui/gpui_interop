@@ -156,7 +156,7 @@ mod demo {
     use bevy::prelude::default;
     use bevy::render::render_asset::RenderAssets;
     use bevy::render::renderer::{
-        RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue, WgpuWrapper,
+        RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue,
     };
     use bevy::render::settings::{RenderCreation, WgpuSettings};
     use bevy::render::texture::{GpuImage, ManualTextureView, ManualTextureViews};
@@ -796,7 +796,7 @@ mod demo {
             })?;
             receiver.recv()??;
 
-            let data = slice.get_mapped_range();
+            let data = slice.get_mapped_range()?;
             let stride = padded as usize;
             let centre_offset = (height as usize / 2) * stride + (width as usize / 2) * 4;
             let centre = [
@@ -1010,7 +1010,7 @@ mod demo {
         session: Res<SessionTarget>,
         scene: Res<SceneKind>,
     ) {
-        let cube = meshes.add(bevy::math::primitives::Cuboid::new(1.0, 1.0, 1.0));
+        let cube = meshes.add(bevy::shape::Cuboid::new(1.0, 1.0, 1.0));
         let half = (GRID - 1) as f32 / 2.0;
         let (_, from, to) = PALETTES[0];
         let material = |t: f32| StandardMaterial {
@@ -1181,10 +1181,10 @@ mod demo {
 
         let creation = RenderCreation::manual(
             RenderDevice::from((**device).clone()),
-            RenderQueue(Arc::new(WgpuWrapper::new((**queue).clone()))),
-            RenderAdapterInfo(WgpuWrapper::new(info.clone())),
-            RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
-            RenderInstance(Arc::new(WgpuWrapper::new(instance))),
+            RenderQueue::new((**queue).clone()),
+            RenderAdapterInfo::new(info.clone()),
+            RenderAdapter::new(adapter),
+            RenderInstance::new(instance),
         );
         Ok((creation, info))
     }

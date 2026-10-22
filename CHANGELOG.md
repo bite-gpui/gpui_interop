@@ -9,10 +9,17 @@ version may break the API; a patch does not.
 
 ### Changed
 
-- Development and CI track `bite-gpui` **1.24.401** (was `1.24.400`). That release attaches
-  `WindowsPlatform`'s Direct3D devices when `open_window` is called on a platform constructed for
-  windows, so a direct caller no longer has to call `request_windowing` first
-  (bite-gpui/bite-gpui#13).
+- The crate now builds against **`bite-gpui` 1.25.202** (was `1.24.401`), and the workspace
+  follows the core to **`wgpu` 30.0.1** and **Bevy 0.20** (`bevy_render` 0.20). Two `wgpu` 30
+  changes reached this crate: `create_texture_from_hal` now takes the wrapped texture's initial
+  state (an imported dma-buf image is `UNINITIALIZED`, as in the core's own importer), and a
+  render pipeline's vertex layout list is a list of `Option`s.
+- The `wgpu` types in the public API (`Adapter::wgpu`, `WgpuSurface`, `WgpuSharedBuffer`) are now
+  wgpu 30's. A producer still on wgpu 29 must upgrade before it can hand this crate its device;
+  under the project's pre-1.0 rule that makes the next release a minor one.
+- The development and CI pin tracks published core releases. `1.24.401`, the last stop before
+  the 1.25 move, is the release that attaches `WindowsPlatform`'s Direct3D devices when
+  `open_window` is called on a platform constructed for windows (bite-gpui/bite-gpui#13).
 
 ### Removed
 
