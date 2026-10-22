@@ -27,19 +27,19 @@ ROOT = Path(__file__).resolve().parent.parent
 REPLACEMENTS = [
     (
         'gpui = { path = "../bite-gpui/crates/gpui", default-features = false }',
-        'gpui = { package = "bite-gpui", version = "1.23", default-features = false }',
+        'gpui = { package = "bite-gpui", version = "1.24", default-features = false }',
     ),
     (
         'gpui_engine = { path = "../bite-gpui/crates/gpui_engine" }',
-        'gpui_engine = { package = "bite-gp-engine", version = "1.23" }',
+        'gpui_engine = { package = "bite-gp-engine", version = "1.24" }',
     ),
     (
         'gpui_wgpu = { path = "../bite-gpui/crates/gpui_wgpu" }',
-        'gpui_wgpu = { package = "bite-gp-wgpu", version = "1.23" }',
+        'gpui_wgpu = { package = "bite-gp-wgpu", version = "1.24" }',
     ),
     (
         'gpui_windows = { path = "../bite-gpui/crates/gpui_windows" }',
-        'gpui_windows = { package = "bite-gp-windows", version = "1.23" }',
+        'gpui_windows = { package = "bite-gp-windows", version = "1.24" }',
     ),
 ]
 

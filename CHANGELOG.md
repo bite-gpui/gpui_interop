@@ -5,6 +5,20 @@ All notable changes to `gpui_interop` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 version may break the API; a patch does not.
 
+## [Unreleased]
+
+### Changed
+
+- The crate now builds against **`bite-gpui` 1.24.400** (was `1.23.305`). No
+  source changes were needed: the offscreen contract, `Window::present`, the
+  headless renderer factory, the dma-buf explicit-layout guard and the transfer
+  function all keep the shapes the crate already targets.
+- The 1.24 line carries the upstream platform/engine split and a leaner
+  dependency set, so the lockfile now resolves fewer crates (the Bevy example is
+  untouched).
+- CI and the release workflow clone `bite_1.24.400`, and the publish staging
+  script aliases the published packages at `1.24`.
+
 ## [0.1.2] - 2026-10-22
 
 A producer-side ring that makes slow frames safe. No breaking API changes.
@@ -78,6 +92,7 @@ First public release.
 - Examples: `interop_linux`, `interop_cube`, `interop_cube_drag`, plus the
   `interop_wgpu` and `interop_bevy` producer demos.
 
+[Unreleased]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.2...HEAD
 [0.1.2]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/bite-gpui/gpui_interop/releases/tag/v0.1.0

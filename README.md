@@ -630,8 +630,8 @@ The renderer is the caller's, so the sample above uses `gpui_wgpu`'s headless re
 `offscreen_surface_handle` works. `WgpuHeadlessRenderer::with_gpu_preference` pins the guest to a GPU,
 and the headless context is process-wide, so the host that samples joins the same device rather than
 opening a second one. The guest seam (`Window::present`, the headless window honouring a renderer
-factory) is newer than the last published core, so this feature currently needs the `bite_v1.23.x`
-working tree — see the next section.
+factory) is part of the published core since `1.24.400`, so this feature needs no working-tree
+checkout — see the next section.
 
 ## Cargo features
 
@@ -653,19 +653,19 @@ During development this workspace takes the core from the sibling checkout — `
 `gpui_wgpu` and `gpui_windows` are path dependencies on `../bite-gpui/crates/…` — so a fix in the
 renderer reaches this stack without a release. On release each path becomes the published package.
 
-The last published release is `1.23.305`. A consumer aliases the published packages back to their
+The last published release is `1.24.400`. A consumer aliases the published packages back to their
 standard crate names so imports like `use gpui::...` compile unchanged:
 
 ```toml
 [workspace.dependencies]
-gpui         = { package = "bite-gpui",       version = "1.23.305", default-features = false }
-gpui_engine  = { package = "bite-gp-engine",  version = "1.23.305" }
-gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.23.305" }
-gpui_windows = { package = "bite-gp-windows", version = "1.23.305" }
+gpui         = { package = "bite-gpui",       version = "1.24.400", default-features = false }
+gpui_engine  = { package = "bite-gp-engine",  version = "1.24.400" }
+gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.24.400" }
+gpui_windows = { package = "bite-gp-windows", version = "1.24.400" }
 ```
 
-The guest and same-device wgpu paths need the seams published in `1.23.305`: a public
-`Window::present`, the headless renderer factory, the offscreen surface handle, the dma-buf
+The guest and same-device wgpu paths need the seams published across `1.23.305` and `1.24.400`: a
+public `Window::present`, the headless renderer factory, the offscreen surface handle, the dma-buf
 explicit-layout guard, and the transfer function. To test against a GPUI checkout or a custom
 branch, replace the versions above with `path` or `git`/`branch` sources.
 
