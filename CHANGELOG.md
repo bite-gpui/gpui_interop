@@ -5,6 +5,16 @@ All notable changes to `gpui_interop` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 version may break the API; a patch does not.
 
+## [Unreleased]
+
+### Fixed
+
+- The Windows cross-device test asks the platform to become windowed before opening its hidden
+  window. `bite-gpui` 1.24 builds the DirectX devices on that transition, so constructing
+  `WindowsPlatform::new(false)` and calling `open_window` directly now refuses with "cannot open
+  windows while headless". The crate itself is unaffected: it opens windows through `Application`,
+  which makes the same transition on `run`.
+
 ## [0.1.3] - 2026-10-22
 
 A `bite-gpui` upgrade. No API changes.
@@ -94,6 +104,7 @@ First public release.
 - Examples: `interop_linux`, `interop_cube`, `interop_cube_drag`, plus the
   `interop_wgpu` and `interop_bevy` producer demos.
 
+[Unreleased]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.3...HEAD
 [0.1.3]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.0...v0.1.1
