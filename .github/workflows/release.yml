@@ -75,7 +75,7 @@ jobs:
 
       - name: Check out the core
         shell: bash
-        run: git clone --depth 1 --single-branch --branch bite_1.24.400 https://github.com/bite-gpui/bite-gpui.git ../bite-gpui
+        run: git clone --depth 1 --single-branch --branch bite_1.24.401 https://github.com/bite-gpui/bite-gpui.git ../bite-gpui
 
       - uses: ./.github/actions/linux-deps
 

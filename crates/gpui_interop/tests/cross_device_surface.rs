@@ -29,10 +29,9 @@ use std::mem::ManuallyDrop;
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    Bounds, ContentMask, DevicePixels, DirectXSource, GpuRenderer, GraphicalEnvironment,
-    PaintSurface, Platform, PlatformWindow, Point, Scene, SharedDirectXFence, SharedDirectXSurface,
-    Size, SurfaceSource, TitlebarOptions, WindowId, WindowKind, WindowParams, WindowingRequest,
-    point, px, size,
+    Bounds, ContentMask, DevicePixels, DirectXSource, GpuRenderer, PaintSurface, Platform,
+    PlatformWindow, Point, Scene, SharedDirectXFence, SharedDirectXSurface, Size, SurfaceSource,
+    TitlebarOptions, WindowId, WindowKind, WindowParams, point, px, size,
 };
 use gpui_interop::{Fence, SharedSurface};
 use gpui_windows::DirectXRenderer;
@@ -196,18 +195,6 @@ fn hidden_window() -> Option<Box<dyn PlatformWindow>> {
             return None;
         }
     };
-
-    // `new(false)` asks for a platform that *can* be windowed; 1.24 builds its DirectX devices
-    // when it becomes windowed, which an `Application` does in `run` (`connect_initially`). This
-    // test drives the platform directly, so it asks for the windowed mode itself. Without this,
-    // `open_window` refuses with "cannot open windows while headless" even though the platform was
-    // constructed for windows.
-    let request =
-        platform.request_windowing(WindowingRequest::Windowed(GraphicalEnvironment::detect()));
-    if let Err(error) = futures::executor::block_on(request) {
-        eprintln!("this session cannot show windows; skipping: {error:#}");
-        return None;
-    }
 
     // Never shown, never focused, never movable: the readback path is what makes the test
     // independent of a visible window, exactly as `gpui_windows`' own renderer tests are.

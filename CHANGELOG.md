@@ -7,13 +7,18 @@ version may break the API; a patch does not.
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- The Windows cross-device test asks the platform to become windowed before opening its hidden
-  window. `bite-gpui` 1.24 builds the DirectX devices on that transition, so constructing
-  `WindowsPlatform::new(false)` and calling `open_window` directly now refuses with "cannot open
-  windows while headless". The crate itself is unaffected: it opens windows through `Application`,
-  which makes the same transition on `run`.
+- Development and CI track `bite-gpui` **1.24.401** (was `1.24.400`). That release attaches
+  `WindowsPlatform`'s Direct3D devices when `open_window` is called on a platform constructed for
+  windows, so a direct caller no longer has to call `request_windowing` first
+  (bite-gpui/bite-gpui#13).
+
+### Removed
+
+- The Windows cross-device test's `request_windowing` workaround and the `futures` dev-dependency
+  it needed. The test opens its hidden window directly again, which exercises the core's lazy
+  attach.
 
 ## [0.1.3] - 2026-10-22
 

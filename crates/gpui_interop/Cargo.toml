@@ -185,10 +185,6 @@ windows = { workspace = true, features = ["Win32_Graphics_Direct3D12"] }
 # A dev-dependency and not a dependency: nothing in the library names it, and the facade's own
 # graph stays free of the backend crate.
 gpui_windows.workspace = true
-# The platform asks for windowed mode through `Platform::request_windowing`, which returns a
-# `Task`; the test is synchronous, so it blocks on the (already resolved) task to read the
-# reason if the session cannot show windows.
-futures.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The example names `gpui_wgpu::WgpuRenderer` and the read-back test `gpui_wgpu::WgpuHeadlessRenderer`;
