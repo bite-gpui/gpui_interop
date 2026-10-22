@@ -28,7 +28,7 @@ dependency. The published packages are aliased back to their standard crate name
 
 ```toml
 [dependencies]
-gpui_interop = { version = "0.1", features = ["gpui", "wgpu"] }
+gpui_interop = { version = "0.2", features = ["gpui", "wgpu"] }
 gpui         = { package = "bite-gpui",       version = "1.25", default-features = false, features = ["platform"] }
 gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.25" }
 ```

@@ -5,7 +5,10 @@ All notable changes to `gpui_interop` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 version may break the API; a patch does not.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-22
+
+A `bite-gpui` 1.25 upgrade. The public `wgpu` types move to 30, so this is a
+minor release.
 
 ### Changed
 
@@ -16,7 +19,7 @@ version may break the API; a patch does not.
   render pipeline's vertex layout list is a list of `Option`s.
 - The `wgpu` types in the public API (`Adapter::wgpu`, `WgpuSurface`, `WgpuSharedBuffer`) are now
   wgpu 30's. A producer still on wgpu 29 must upgrade before it can hand this crate its device;
-  under the project's pre-1.0 rule that makes the next release a minor one.
+  under the project's pre-1.0 rule that is what makes this a minor release.
 - The development and CI pin tracks published core releases. `1.24.401`, the last stop before
   the 1.25 move, is the release that attaches `WindowsPlatform`'s Direct3D devices when
   `open_window` is called on a platform constructed for windows (bite-gpui/bite-gpui#13).
@@ -116,7 +119,7 @@ First public release.
 - Examples: `interop_linux`, `interop_cube`, `interop_cube_drag`, plus the
   `interop_wgpu` and `interop_bevy` producer demos.
 
-[Unreleased]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.3...HEAD
+[0.2.0]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.0...v0.1.1
