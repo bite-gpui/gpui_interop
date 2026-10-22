@@ -78,7 +78,7 @@ encase = { opt-level = 3 }
 
 [workspace.dependencies]
 # This repo's own crates: a path for development, a version for release.
-gpui_interop = { version = "0.1.2", path = "crates/gpui_interop" }
+gpui_interop = { version = "0.1.3", path = "crates/gpui_interop" }
 # The chrome the two producer demos share (controls, histogram, metrics panel). Private: it is not
 # part of the published surface, only of the examples in this workspace.
 interop_demo = { path = "crates/interop_demo" }
