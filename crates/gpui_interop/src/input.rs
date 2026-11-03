@@ -138,6 +138,9 @@ pub enum SurfaceEvent {
     PointerDown {
         position: SurfacePoint,
         button: SurfaceButton,
+        /// How many clicks the platform counted in this press — 2 for the second click of a
+        /// double-click, as the platform's own time and distance rule decided it.
+        click_count: usize,
         modifiers: SurfaceModifiers,
     },
     /// The pointer moved over the surface — while a button is held (`pressed`) or merely hovering.
@@ -152,6 +155,8 @@ pub enum SurfaceEvent {
     PointerUp {
         position: SurfacePoint,
         button: SurfaceButton,
+        /// How many clicks the platform counted in the press this up completes.
+        click_count: usize,
         modifiers: SurfaceModifiers,
     },
     /// The wheel scrolled, or a touchpad reported a scroll gesture.
@@ -257,10 +262,12 @@ where
         let button = button(event.button);
         let modifiers = modifiers(event.modifiers);
         let position = local(window.scale_factor(), bounds.origin, event.position);
+        let click_count = event.click_count;
         deliver(&down, window, position, |position| {
             SurfaceEvent::PointerDown {
                 position,
                 button,
+                click_count,
                 modifiers,
             }
         });
@@ -365,11 +372,13 @@ where
             return;
         };
         let button = button(event.button);
+        let click_count = event.click_count;
         let modifiers = modifiers(event.modifiers);
         let position = local(window.scale_factor(), bounds.origin, event.position);
         deliver(&up, window, position, |position| SurfaceEvent::PointerUp {
             position,
             button,
+            click_count,
             modifiers,
         });
     });
@@ -393,12 +402,14 @@ where
                 return;
             };
             let button = button(event.button);
+            let click_count = event.click_count;
             let modifiers = modifiers(event.modifiers);
             let position = local(window.scale_factor(), bounds.origin, event.position);
             deliver(&released, window, position, |position| {
                 SurfaceEvent::PointerUp {
                     position,
                     button,
+                    click_count,
                     modifiers,
                 }
             });

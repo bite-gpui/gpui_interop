@@ -18,9 +18,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, Render, ScrollDelta,
-    ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, Window, div, point, prelude::*,
-    px,
+    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent, Render,
+    ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, Window, div, point,
+    prelude::*, px,
 };
 use gpui_interop::{
     SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, SurfaceScroll, surface_input,
@@ -664,6 +664,32 @@ fn a_scroll_is_surface_local_and_physical(cx: &mut TestAppContext) {
     assert!(
         (x - 4.0 * scale).abs() < 0.01 && (y.abs() - 6.0 * scale).abs() < 0.01,
         "the pixel delta is converted to physical pixels: ({x}, {y})",
+    );
+}
+
+#[gpui::test]
+fn a_double_click_keeps_the_platforms_click_count(cx: &mut TestAppContext) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recording = seen.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Recording { seen: recording }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.simulate_event(MouseDownEvent {
+        position: point(px(35.), px(35.)),
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+        first_mouse: false,
+    });
+
+    let seen = seen.borrow();
+    assert!(
+        seen.iter().any(|input| matches!(
+            input.event,
+            SurfaceEvent::PointerDown { click_count: 2, .. }
+        )),
+        "the platform's double-click count reaches the producer: {seen:?}",
     );
 }
 
