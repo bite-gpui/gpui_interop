@@ -18,9 +18,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent, Render,
-    ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, Window, div, point,
-    prelude::*, px,
+    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
+    Render, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, Window,
+    div, point, prelude::*, px,
 };
 use gpui_interop::{
     SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, SurfaceScroll, surface_input,
@@ -435,15 +435,21 @@ fn the_up_of_a_right_press_arrives_outside_the_surface(cx: &mut TestAppContext) 
     cx.simulate_mouse_up(beyond, MouseButton::Right, Modifiers::none());
 
     let events = events.borrow();
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            SurfaceEvent::PointerUp {
-                button: SurfaceButton::Right,
-                ..
-            }
-        )),
-        "the right press is released off the surface: {events:?}",
+    let releases = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerUp {
+                    button: SurfaceButton::Right,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        releases, 1,
+        "the right press is released off the surface exactly once: {events:?}",
     );
 }
 
@@ -463,16 +469,58 @@ fn the_up_of_a_sub_threshold_left_press_arrives_outside_the_surface(cx: &mut Tes
     cx.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::none());
 
     let events = events.borrow();
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            SurfaceEvent::PointerUp {
-                button: SurfaceButton::Left,
-                ..
-            }
-        )),
-        "the sub-threshold left press is released off the surface: {events:?}",
+    let releases = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerUp {
+                    button: SurfaceButton::Left,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        releases, 1,
+        "the sub-threshold left press is released off the surface exactly once: {events:?}",
     );
+}
+
+#[gpui::test]
+fn a_chord_keeps_each_buttons_press(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A CAD orbit: middle held while the left button is also pressed, both released outside.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Middle, Modifiers::none());
+    cx.simulate_mouse_move(beyond, MouseButton::Middle, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Middle, Modifiers::none());
+
+    let events = events.borrow();
+    for button in [SurfaceButton::Left, SurfaceButton::Middle] {
+        let releases = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SurfaceEvent::PointerUp {
+                        button: released,
+                        ..
+                    } if *released == button
+                )
+            })
+            .count();
+        assert_eq!(releases, 1, "{button:?} is released exactly once: {events:?}");
+    }
 }
 
 /// Two surfaces side by side, each named, so a drag started on one says which.
@@ -714,6 +762,49 @@ fn a_scroll_is_surface_local_and_physical(cx: &mut TestAppContext) {
         (x - 4.0 * scale).abs() < 0.01 && (y.abs() - 6.0 * scale).abs() < 0.01,
         "the pixel delta is converted to physical pixels: ({x}, {y})",
     );
+
+    // The harness's scale is 2, so the multiplication above is not a no-op.
+    assert_eq!(scale, 2.0, "the scroll test exercises a non-unit scale");
+}
+
+#[gpui::test]
+fn a_line_scroll_passes_through_unscaled(cx: &mut TestAppContext) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recording = seen.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Recording { seen: recording }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(px(35.), px(35.)),
+        delta: ScrollDelta::Lines(point(2.0, -3.0)),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+
+    let seen = seen.borrow();
+    let scrolls: Vec<SurfaceInput> = seen
+        .iter()
+        .filter(|input| matches!(input.event, SurfaceEvent::Scroll { .. }))
+        .cloned()
+        .collect();
+    let [SurfaceInput {
+        event:
+            SurfaceEvent::Scroll {
+                delta: SurfaceScroll::Lines { x, y },
+                ..
+            },
+        ..
+    }] = scrolls.as_slice()
+    else {
+        panic!("expected exactly one line scroll: {seen:?}");
+    };
+
+    assert_eq!(
+        (*x, *y),
+        (2.0, -3.0),
+        "a line delta passes through without the scale factor"
+    );
 }
 
 #[gpui::test]
@@ -731,6 +822,12 @@ fn a_double_click_keeps_the_platforms_click_count(cx: &mut TestAppContext) {
         click_count: 2,
         first_mouse: false,
     });
+    cx.simulate_event(MouseUpEvent {
+        position: point(px(35.), px(35.)),
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+    });
 
     let seen = seen.borrow();
     assert!(
@@ -738,7 +835,14 @@ fn a_double_click_keeps_the_platforms_click_count(cx: &mut TestAppContext) {
             input.event,
             SurfaceEvent::PointerDown { click_count: 2, .. }
         )),
-        "the platform's double-click count reaches the producer: {seen:?}",
+        "the platform's double-click count reaches the down: {seen:?}",
+    );
+    assert!(
+        seen.iter().any(|input| matches!(
+            input.event,
+            SurfaceEvent::PointerUp { click_count: 2, .. }
+        )),
+        "and the up it completes: {seen:?}",
     );
 }
 

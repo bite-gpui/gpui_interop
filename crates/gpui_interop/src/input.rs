@@ -55,13 +55,17 @@
 //!   surface's own drag reports the up wherever the pointer is (`on_mouse_up_out`), and an ordinary
 //!   gesture reports it from the hovered handler as before.
 //!
-//! # The one authoring consequence: an id
+//! # What the gateway takes from the element
 //!
 //! The drag model keys an element's state by an `ElementId`, so the surface element must have one.
 //! [`surface_input`] names an element the caller left unnamed, so a lone surface needs nothing — but
 //! two children of one parent may not share an id, so a caller with more than one surface under a
 //! parent names them (`gpu_canvas(..).id("pane-3")`), and the name is what picks that surface's drag
 //! out of the ones passing over it.
+//!
+//! The gateway also claims the element's `on_hover` and `on_drag` slots, each of which holds one
+//! listener. A caller that needs its own listener for either wraps the surface rather than adding one
+//! after [`surface_input`]. Hover *styles* (`.hover(..)`) are a separate mechanism and still work.
 //!
 //! # Pairing down and up is the producer's
 //!
@@ -79,7 +83,7 @@ use std::rc::Rc;
 use gpui::{
     App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, Global, GlobalElementId,
     Hitbox, InteractiveElement, IntoElement, LayoutId, Modifiers, MouseButton, Pixels, Point,
-    ScrollDelta, Stateful, StatefulInteractiveElement, Window,
+    ScrollDelta, Stateful, StatefulInteractiveElement, Window, WindowId,
 };
 
 /// The id a surface is named with when its element carried none.
@@ -121,9 +125,12 @@ pub struct SurfaceModifiers {
 }
 
 /// A scroll delta, in the units the platform reported it.
+///
+/// The sign is the engine's: a positive `y` is up, which is already the opposite of the browser's
+/// `deltaY`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SurfaceScroll {
-    /// A precise delta, in physical pixels from the surface's top-left corner.
+    /// A precise delta, in physical pixels.
     Pixels { x: f32, y: f32 },
     /// An inexact delta in lines, as the platform reported it.
     Lines { x: f32, y: f32 },
@@ -169,8 +176,9 @@ pub enum SurfaceEvent {
     PointerEnter { modifiers: SurfaceModifiers },
     /// The pointer left the surface's bounds.
     ///
-    /// This mirrors the engine's hover state, which is suppressed while a button is held or a drag
-    /// is in flight; a press therefore reports a leave even if the pointer has not moved.
+    /// This mirrors the engine's hover state: while a button is held it is false, so the first move
+    /// during a press reports a leave even though the pointer is still inside. Leaving the window is
+    /// the other way it fires.
     PointerLeave { modifiers: SurfaceModifiers },
     /// The wheel scrolled, or a touchpad reported a scroll gesture.
     Scroll {
@@ -242,20 +250,45 @@ fn drag(cx: &App) -> Option<&SurfaceDrag> {
     cx.active_drag_value::<SurfaceDrag>()
 }
 
-/// Which surface owns the pointer press currently in flight.
+/// The presses in flight, one entry per window, surface and button.
 ///
 /// Unlike the drag, a press exists before the engine has decided to found one. Remembering it is
 /// what lets the gateway report the up of a right/middle press, or of a left press that never moved
-/// past the drag threshold, when that up happens outside the surface.
+/// past the drag threshold, when that up happens outside the surface. A chord keeps one entry per
+/// button, so releasing one does not forget another, and the entry carries the window so two windows
+/// do not share a press.
 #[derive(Default)]
-struct PressedSurface(Option<ElementId>);
+struct PressedSurface(Vec<(WindowId, ElementId, MouseButton)>);
 
 impl Global for PressedSurface {}
 
-/// The surface that owns the press, if any.
-fn pressed_surface(cx: &App) -> Option<&ElementId> {
-    cx.try_global::<PressedSurface>()
-        .and_then(|pressed| pressed.0.as_ref())
+/// Whether `surface` owns `button` in `window`.
+fn surface_pressed(cx: &App, window: WindowId, surface: &ElementId, button: MouseButton) -> bool {
+    cx.try_global::<PressedSurface>().is_some_and(|pressed| {
+        pressed
+            .0
+            .iter()
+            .any(|(w, s, b)| *w == window && s == surface && *b == button)
+    })
+}
+
+/// Record that `surface` owns `button` in `window`.
+fn press_surface(cx: &mut App, window: WindowId, surface: ElementId, button: MouseButton) {
+    let pressed = cx.default_global::<PressedSurface>();
+    if !pressed
+        .0
+        .iter()
+        .any(|(w, s, b)| *w == window && s == &surface && *b == button)
+    {
+        pressed.0.push((window, surface, button));
+    }
+}
+
+/// Forget that `surface` owned `button` in `window`.
+fn release_surface(cx: &mut App, window: WindowId, surface: &ElementId, button: MouseButton) {
+    cx.default_global::<PressedSurface>()
+        .0
+        .retain(|(w, s, b)| !(*w == window && s == surface && *b == button));
 }
 
 /// Subscribe GPUI's pointer handlers on `element`, translating each to a [`SurfaceInput`] through
@@ -271,8 +304,8 @@ where
         let Some(bounds) = down.bounds.get() else {
             return;
         };
-        cx.set_global(PressedSurface(Some(pressed.clone())));
         let button = button(event.button);
+        press_surface(cx, window.window_handle().window_id(), pressed.clone(), event.button);
         let modifiers = modifiers(event.modifiers);
         let position = local(window.scale_factor(), bounds.origin, event.position);
         let click_count = event.click_count;
@@ -391,8 +424,8 @@ where
     let up = surface.clone();
     let own = id.clone();
     let element = element.capture_any_mouse_up(move |event, window, cx| {
-        if pressed_surface(cx) == Some(&own) {
-            cx.set_global(PressedSurface(None));
+        if surface_pressed(cx, window.window_handle().window_id(), &own, event.button) {
+            release_surface(cx, window.window_handle().window_id(), &own, event.button);
         }
         let Some(bounds) = up.bounds.get() else {
             return;
@@ -417,12 +450,12 @@ where
         let own = id.clone();
         element = element.on_mouse_up_out(released_button, move |event, window, cx| {
             let carried = drag(cx).is_some_and(|drag| drag.origin == own);
-            let owned = pressed_surface(cx) == Some(&own);
+            let owned = surface_pressed(cx, window.window_handle().window_id(), &own, event.button);
             if !carried && !owned {
                 return;
             }
             if owned {
-                cx.set_global(PressedSurface(None));
+                release_surface(cx, window.window_handle().window_id(), &own, event.button);
             }
             let Some(bounds) = released.bounds.get() else {
                 return;
