@@ -21,7 +21,8 @@
 //! - **Vocabulary.** [`SurfaceEvent`] and its parts are the crate's, mapped from GPUI's, so a producer
 //!   never names `MouseMoveEvent`. A precise scroll delta is converted to physical pixels like every
 //!   other distance; a line delta is passed through in lines, because a line has no pixel size until
-//!   the consumer chooses one.
+//!   the consumer chooses one. Hover has its own enter/leave events, so a producer can clear state
+//!   without waiting for a move it may never get.
 //!
 //! What it deliberately does **not** do:
 //!
@@ -159,6 +160,18 @@ pub enum SurfaceEvent {
         click_count: usize,
         modifiers: SurfaceModifiers,
     },
+    /// The pointer entered the surface's bounds.
+    ///
+    /// There is no position: the event says the pointer came, not where it is. A producer that needs
+    /// the position reads it from the next [`PointerMove`](Self::PointerMove). The transition is the
+    /// engine's hover state, so it also fires when a layout change moves the surface under a
+    /// stationary pointer.
+    PointerEnter { modifiers: SurfaceModifiers },
+    /// The pointer left the surface's bounds.
+    ///
+    /// This mirrors the engine's hover state, which is suppressed while a button is held or a drag
+    /// is in flight; a press therefore reports a leave even if the pointer has not moved.
+    PointerLeave { modifiers: SurfaceModifiers },
     /// The wheel scrolled, or a touchpad reported a scroll gesture.
     Scroll {
         /// Where the pointer was, so a zoom can stay anchored under it.
@@ -342,6 +355,19 @@ where
         },
     );
 
+    // Hover has both edges, including one caused by a layout change under a stationary pointer, which
+    // is what a producer needs to clear a highlight without waiting for a move it may never get.
+    let hovered = surface.clone();
+    let element = element.on_hover(move |is_hovered: &bool, window, _cx| {
+        let modifiers = modifiers(window.modifiers());
+        let event = if *is_hovered {
+            SurfaceEvent::PointerEnter { modifiers }
+        } else {
+            SurfaceEvent::PointerLeave { modifiers }
+        };
+        deliver_event(&hovered, window, event);
+    });
+
     // The wheel: the engine routes it to the surface's element like any other pointer event, so its
     // position is surface-local and its delta is all the gateway has to translate.
     let scrolled = surface.clone();
@@ -426,11 +452,13 @@ fn deliver(
     position: SurfacePoint,
     event: impl FnOnce(SurfacePoint) -> SurfaceEvent,
 ) {
+    deliver_event(surface, window, event(position));
+}
+
+/// Hand the producer an event that already carries everything it needs.
+fn deliver_event(surface: &Rc<Surface>, window: &mut Window, event: SurfaceEvent) {
     let scale = window.scale_factor();
-    (surface.handler)(SurfaceInput {
-        event: event(position),
-        scale,
-    });
+    (surface.handler)(SurfaceInput { event, scale });
     window.refresh();
 }
 

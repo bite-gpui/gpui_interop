@@ -30,6 +30,20 @@ use gpui_interop::{
 const EDGE: f32 = 50.0;
 const PAD: f32 = 10.0;
 
+/// The events that are not hover transitions, for tests whose subject is the pointer.
+fn pointer_events(events: &[SurfaceEvent]) -> Vec<SurfaceEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                SurfaceEvent::PointerEnter { .. } | SurfaceEvent::PointerLeave { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 /// A view whose handler records everything the gateway hands the producer.
 struct Recording {
     seen: Rc<RefCell<Vec<SurfaceInput>>>,
@@ -68,7 +82,7 @@ fn the_gateway_hands_a_producer_surface_local_physical_pixels(cx: &mut TestAppCo
     cx.simulate_mouse_up(dragged, MouseButton::Left, Modifiers::none());
 
     let seen = seen.borrow();
-    let events: Vec<SurfaceEvent> = seen.iter().map(|input| input.event).collect();
+    let events = pointer_events(&seen.iter().map(|input| input.event).collect::<Vec<_>>());
     assert!(
         seen.iter().all(|input| input.scale == scale),
         "every event carries the window's scale factor ({scale}), got {:?}",
@@ -213,10 +227,7 @@ fn a_caption_over_the_surface_does_not_claim_the_pointer(cx: &mut TestAppContext
     // under it is still what the pointer is over.
     cx.simulate_mouse_move(over_caption(), None::<MouseButton>, Modifiers::none());
     assert!(
-        matches!(
-            events.borrow().as_slice(),
-            [SurfaceEvent::PointerMove { .. }]
-        ),
+        matches!(pointer_events(&events.borrow()).as_slice(), [SurfaceEvent::PointerMove { .. }]),
         "a move over the caption reaches the surface: {:?}",
         events.borrow(),
     );
@@ -229,7 +240,7 @@ fn a_control_over_the_surface_takes_its_own_events(cx: &mut TestAppContext) {
     // A move over the button does not reach the surface — the button is in front of it.
     cx.simulate_mouse_move(over_button(), None::<MouseButton>, Modifiers::none());
     assert!(
-        events.borrow().is_empty(),
+        pointer_events(&events.borrow()).is_empty(),
         "the button is in front, so the surface sees nothing: {:?}",
         events.borrow(),
     );
@@ -370,6 +381,39 @@ fn the_up_of_a_drag_that_left_the_surface_arrives(cx: &mut TestAppContext) {
                     && (position.y - beyond.y.as_f32() * scale).abs() < 0.01
         )),
         "the up lands where the pointer was, off the surface: {events:?}",
+    );
+}
+
+#[gpui::test]
+fn hover_reports_enter_and_leave(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_move(beyond, None::<MouseButton>, Modifiers::none());
+
+    let edges: Vec<SurfaceEvent> = events
+        .borrow()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerEnter { .. } | SurfaceEvent::PointerLeave { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    assert!(
+        matches!(
+            edges.as_slice(),
+            [SurfaceEvent::PointerEnter { .. }, SurfaceEvent::PointerLeave { .. }]
+        ),
+        "hover reports both edges, in order: {edges:?}",
     );
 }
 
@@ -642,6 +686,11 @@ fn a_scroll_is_surface_local_and_physical(cx: &mut TestAppContext) {
         });
 
     let seen = seen.borrow();
+    let scrolls: Vec<SurfaceInput> = seen
+        .iter()
+        .filter(|input| matches!(input.event, SurfaceEvent::Scroll { .. }))
+        .cloned()
+        .collect();
     let [SurfaceInput {
         event:
             SurfaceEvent::Scroll {
@@ -650,7 +699,7 @@ fn a_scroll_is_surface_local_and_physical(cx: &mut TestAppContext) {
                 ..
             },
         scale: event_scale,
-    }] = seen.as_slice()
+    }] = scrolls.as_slice()
     else {
         panic!("expected exactly one pixel scroll: {seen:?}");
     };
