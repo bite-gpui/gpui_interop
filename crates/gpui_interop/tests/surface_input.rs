@@ -18,14 +18,31 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext,
-    VisualTestContext, Window, div, point, prelude::*, px,
+    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
+    Render, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, Window,
+    div, point, prelude::*, px,
 };
-use gpui_interop::{SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, surface_input};
+use gpui_interop::{
+    SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, SurfaceScroll, surface_input,
+};
 
 /// The surface's edge, and the padding that insets it in the window.
 const EDGE: f32 = 50.0;
 const PAD: f32 = 10.0;
+
+/// The events that are not hover transitions, for tests whose subject is the pointer.
+fn pointer_events(events: &[SurfaceEvent]) -> Vec<SurfaceEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                SurfaceEvent::PointerEnter { .. } | SurfaceEvent::PointerLeave { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
 
 /// A view whose handler records everything the gateway hands the producer.
 struct Recording {
@@ -65,7 +82,7 @@ fn the_gateway_hands_a_producer_surface_local_physical_pixels(cx: &mut TestAppCo
     cx.simulate_mouse_up(dragged, MouseButton::Left, Modifiers::none());
 
     let seen = seen.borrow();
-    let events: Vec<SurfaceEvent> = seen.iter().map(|input| input.event).collect();
+    let events = pointer_events(&seen.iter().map(|input| input.event).collect::<Vec<_>>());
     assert!(
         seen.iter().all(|input| input.scale == scale),
         "every event carries the window's scale factor ({scale}), got {:?}",
@@ -210,10 +227,7 @@ fn a_caption_over_the_surface_does_not_claim_the_pointer(cx: &mut TestAppContext
     // under it is still what the pointer is over.
     cx.simulate_mouse_move(over_caption(), None::<MouseButton>, Modifiers::none());
     assert!(
-        matches!(
-            events.borrow().as_slice(),
-            [SurfaceEvent::PointerMove { .. }]
-        ),
+        matches!(pointer_events(&events.borrow()).as_slice(), [SurfaceEvent::PointerMove { .. }]),
         "a move over the caption reaches the surface: {:?}",
         events.borrow(),
     );
@@ -226,7 +240,7 @@ fn a_control_over_the_surface_takes_its_own_events(cx: &mut TestAppContext) {
     // A move over the button does not reach the surface — the button is in front of it.
     cx.simulate_mouse_move(over_button(), None::<MouseButton>, Modifiers::none());
     assert!(
-        events.borrow().is_empty(),
+        pointer_events(&events.borrow()).is_empty(),
         "the button is in front, so the surface sees nothing: {:?}",
         events.borrow(),
     );
@@ -368,6 +382,145 @@ fn the_up_of_a_drag_that_left_the_surface_arrives(cx: &mut TestAppContext) {
         )),
         "the up lands where the pointer was, off the surface: {events:?}",
     );
+}
+
+#[gpui::test]
+fn hover_reports_enter_and_leave(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_move(beyond, None::<MouseButton>, Modifiers::none());
+
+    let edges: Vec<SurfaceEvent> = events
+        .borrow()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerEnter { .. } | SurfaceEvent::PointerLeave { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    assert!(
+        matches!(
+            edges.as_slice(),
+            [SurfaceEvent::PointerEnter { .. }, SurfaceEvent::PointerLeave { .. }]
+        ),
+        "hover reports both edges, in order: {edges:?}",
+    );
+}
+
+#[gpui::test]
+fn the_up_of_a_right_press_arrives_outside_the_surface(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A right press never founds a drag, so the engine has no gesture to release; without press
+    // ownership the producer would never see the up.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_move(beyond, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Right, Modifiers::none());
+
+    let events = events.borrow();
+    let releases = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerUp {
+                    button: SurfaceButton::Right,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        releases, 1,
+        "the right press is released off the surface exactly once: {events:?}",
+    );
+}
+
+#[gpui::test]
+fn the_up_of_a_sub_threshold_left_press_arrives_outside_the_surface(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A left press that never moves past the 2px drag threshold has no engine drag either.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    let releases = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SurfaceEvent::PointerUp {
+                    button: SurfaceButton::Left,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        releases, 1,
+        "the sub-threshold left press is released off the surface exactly once: {events:?}",
+    );
+}
+
+#[gpui::test]
+fn a_chord_keeps_each_buttons_press(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A CAD orbit: middle held while the left button is also pressed, both released outside.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Middle, Modifiers::none());
+    cx.simulate_mouse_move(beyond, MouseButton::Middle, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Middle, Modifiers::none());
+
+    let events = events.borrow();
+    for button in [SurfaceButton::Left, SurfaceButton::Middle] {
+        let releases = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SurfaceEvent::PointerUp {
+                        button: released,
+                        ..
+                    } if *released == button
+                )
+            })
+            .count();
+        assert_eq!(releases, 1, "{button:?} is released exactly once: {events:?}");
+    }
 }
 
 /// Two surfaces side by side, each named, so a drag started on one says which.
@@ -560,6 +713,137 @@ impl Render for Behind {
                 events.borrow_mut().push(input.event)
             }))
     }
+}
+
+#[gpui::test]
+fn a_scroll_is_surface_local_and_physical(cx: &mut TestAppContext) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recording = seen.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Recording { seen: recording }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let scale = cx.update(|window, _| window.scale_factor());
+
+    let at = point(px(35.), px(35.));
+    let delta = point(px(4.), px(-6.));
+    cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(delta),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+
+    let seen = seen.borrow();
+    let scrolls: Vec<SurfaceInput> = seen
+        .iter()
+        .filter(|input| matches!(input.event, SurfaceEvent::Scroll { .. }))
+        .cloned()
+        .collect();
+    let [SurfaceInput {
+        event:
+            SurfaceEvent::Scroll {
+                position,
+                delta: SurfaceScroll::Pixels { x, y },
+                ..
+            },
+        scale: event_scale,
+    }] = scrolls.as_slice()
+    else {
+        panic!("expected exactly one pixel scroll: {seen:?}");
+    };
+
+    assert_eq!(*event_scale, scale, "the scroll carries the window's scale");
+    assert!(
+        (position.x - (35.0 - PAD) * scale).abs() < 0.01
+            && (position.y - (35.0 - PAD) * scale).abs() < 0.01,
+        "the scroll position is surface-local physical pixels: {position:?}",
+    );
+    assert!(
+        (x - 4.0 * scale).abs() < 0.01 && (y.abs() - 6.0 * scale).abs() < 0.01,
+        "the pixel delta is converted to physical pixels: ({x}, {y})",
+    );
+
+    // The harness's scale is 2, so the multiplication above is not a no-op.
+    assert_eq!(scale, 2.0, "the scroll test exercises a non-unit scale");
+}
+
+#[gpui::test]
+fn a_line_scroll_passes_through_unscaled(cx: &mut TestAppContext) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recording = seen.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Recording { seen: recording }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(px(35.), px(35.)),
+        delta: ScrollDelta::Lines(point(2.0, -3.0)),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+
+    let seen = seen.borrow();
+    let scrolls: Vec<SurfaceInput> = seen
+        .iter()
+        .filter(|input| matches!(input.event, SurfaceEvent::Scroll { .. }))
+        .cloned()
+        .collect();
+    let [SurfaceInput {
+        event:
+            SurfaceEvent::Scroll {
+                delta: SurfaceScroll::Lines { x, y },
+                ..
+            },
+        ..
+    }] = scrolls.as_slice()
+    else {
+        panic!("expected exactly one line scroll: {seen:?}");
+    };
+
+    assert_eq!(
+        (*x, *y),
+        (2.0, -3.0),
+        "a line delta passes through without the scale factor"
+    );
+}
+
+#[gpui::test]
+fn a_double_click_keeps_the_platforms_click_count(cx: &mut TestAppContext) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recording = seen.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Recording { seen: recording }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    cx.simulate_event(MouseDownEvent {
+        position: point(px(35.), px(35.)),
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: point(px(35.), px(35.)),
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+    });
+
+    let seen = seen.borrow();
+    assert!(
+        seen.iter().any(|input| matches!(
+            input.event,
+            SurfaceEvent::PointerDown { click_count: 2, .. }
+        )),
+        "the platform's double-click count reaches the down: {seen:?}",
+    );
+    assert!(
+        seen.iter().any(|input| matches!(
+            input.event,
+            SurfaceEvent::PointerUp { click_count: 2, .. }
+        )),
+        "and the up it completes: {seen:?}",
+    );
 }
 
 #[gpui::test]

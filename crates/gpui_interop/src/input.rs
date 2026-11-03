@@ -19,7 +19,10 @@
 //!   window's device-pixel ratio). A producer that wants logical surface-local coordinates divides the
 //!   position by `scale`.
 //! - **Vocabulary.** [`SurfaceEvent`] and its parts are the crate's, mapped from GPUI's, so a producer
-//!   never names `MouseMoveEvent`.
+//!   never names `MouseMoveEvent`. A precise scroll delta is converted to physical pixels like every
+//!   other distance; a line delta is passed through in lines, because a line has no pixel size until
+//!   the consumer chooses one. Hover has its own enter/leave events, so a producer can clear state
+//!   without waiting for a move it may never get.
 //!
 //! What it deliberately does **not** do:
 //!
@@ -37,7 +40,9 @@
 //! once a pointer-down is followed by a move past the engine's threshold, held on the `App` rather
 //! than in any element so it survives the redraws it causes, and delivered to every
 //! [`InteractiveElement::on_drag_move`] whose type it matches. The gateway uses it rather than
-//! capturing the pointer itself, and so keeps no gesture state of its own across a frame:
+//! capturing the pointer itself; the only gesture state it keeps across a frame is which surface
+//! owns the current press, so that an up outside can be reported even when the engine never turned
+//! the press into a drag (a right or middle press, or a move short of the threshold):
 //!
 //! - It registers an `on_drag` on the wrapped element whose value is the surface's own, with an empty
 //!   preview — the producer paints the surface, so there is nothing to draw under the cursor.
@@ -50,7 +55,7 @@
 //!   surface's own drag reports the up wherever the pointer is (`on_mouse_up_out`), and an ordinary
 //!   gesture reports it from the hovered handler as before.
 //!
-//! # The one authoring consequence: an id
+//! # What the gateway takes from the element
 //!
 //! The drag model keys an element's state by an `ElementId`, so the surface element must have one.
 //! [`surface_input`] names an element the caller left unnamed, so a lone surface needs nothing — but
@@ -58,22 +63,27 @@
 //! parent names them (`gpu_canvas(..).id("pane-3")`), and the name is what picks that surface's drag
 //! out of the ones passing over it.
 //!
+//! The gateway also claims the element's `on_hover` and `on_drag` slots, each of which holds one
+//! listener. A caller that needs its own listener for either wraps the surface rather than adding one
+//! after [`surface_input`]. Hover *styles* (`.hover(..)`) are a separate mechanism and still work.
+//!
 //! # Pairing down and up is the producer's
 //!
 //! The gateway reports what GPUI routes to the surface's bounds: a move *over* the surface arrives
 //! even while another element holds the gesture, with `pressed` set. A producer that wants only its
-//! own gesture therefore tracks whether it saw the [`SurfaceEvent::PointerDown`] — the gateway does
-//! not, because it holds no state across a frame. The one asymmetry is the up of a gesture that began
-//! elsewhere and ended over the surface, which arrives without a matching down.
+//! own gesture therefore tracks whether it saw the [`SurfaceEvent::PointerDown`]. The gateway keeps
+//! only enough state to pair the *up*: it records which surface owned the press, so a release outside
+//! the surface still reaches that surface when no drag was founded. The one asymmetry is the up of a
+//! gesture that began elsewhere and ended over the surface, which arrives without a matching down.
 
 use std::cell::Cell;
 use std::panic::Location;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, GlobalElementId,
+    App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, Global, GlobalElementId,
     Hitbox, InteractiveElement, IntoElement, LayoutId, Modifiers, MouseButton, Pixels, Point,
-    Stateful, StatefulInteractiveElement, Window,
+    ScrollDelta, Stateful, StatefulInteractiveElement, Window, WindowId,
 };
 
 /// The id a surface is named with when its element carried none.
@@ -114,16 +124,31 @@ pub struct SurfaceModifiers {
     pub platform: bool,
 }
 
+/// A scroll delta, in the units the platform reported it.
+///
+/// The sign is the engine's: a positive `y` is up, which is already the opposite of the browser's
+/// `deltaY`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SurfaceScroll {
+    /// A precise delta, in physical pixels.
+    Pixels { x: f32, y: f32 },
+    /// An inexact delta in lines, as the platform reported it.
+    Lines { x: f32, y: f32 },
+}
+
 /// A producer-facing input event over a surface, in surface-local physical pixels.
 ///
-/// The event's own position is the pointer's; only a [`Scroll`](Self::Scroll) event, or a gesture a
-/// producer reads from absolute positions, needs it.
+/// The event's own position is the pointer's; a [`Scroll`](Self::Scroll) event carries the wheel's
+/// delta, while a gesture a producer reads from absolute positions needs the position alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SurfaceEvent {
     /// A pointer button went down over the surface.
     PointerDown {
         position: SurfacePoint,
         button: SurfaceButton,
+        /// How many clicks the platform counted in this press — 2 for the second click of a
+        /// double-click, as the platform's own time and distance rule decided it.
+        click_count: usize,
         modifiers: SurfaceModifiers,
     },
     /// The pointer moved over the surface — while a button is held (`pressed`) or merely hovering.
@@ -138,6 +163,28 @@ pub enum SurfaceEvent {
     PointerUp {
         position: SurfacePoint,
         button: SurfaceButton,
+        /// How many clicks the platform counted in the press this up completes.
+        click_count: usize,
+        modifiers: SurfaceModifiers,
+    },
+    /// The pointer entered the surface's bounds.
+    ///
+    /// There is no position: the event says the pointer came, not where it is. A producer that needs
+    /// the position reads it from the next [`PointerMove`](Self::PointerMove). The transition is the
+    /// engine's hover state, so it also fires when a layout change moves the surface under a
+    /// stationary pointer.
+    PointerEnter { modifiers: SurfaceModifiers },
+    /// The pointer left the surface's bounds.
+    ///
+    /// This mirrors the engine's hover state: while a button is held it is false, so the first move
+    /// during a press reports a leave even though the pointer is still inside. Leaving the window is
+    /// the other way it fires.
+    PointerLeave { modifiers: SurfaceModifiers },
+    /// The wheel scrolled, or a touchpad reported a scroll gesture.
+    Scroll {
+        /// Where the pointer was, so a zoom can stay anchored under it.
+        position: SurfacePoint,
+        delta: SurfaceScroll,
         modifiers: SurfaceModifiers,
     },
 }
@@ -203,6 +250,47 @@ fn drag(cx: &App) -> Option<&SurfaceDrag> {
     cx.active_drag_value::<SurfaceDrag>()
 }
 
+/// The presses in flight, one entry per window, surface and button.
+///
+/// Unlike the drag, a press exists before the engine has decided to found one. Remembering it is
+/// what lets the gateway report the up of a right/middle press, or of a left press that never moved
+/// past the drag threshold, when that up happens outside the surface. A chord keeps one entry per
+/// button, so releasing one does not forget another, and the entry carries the window so two windows
+/// do not share a press.
+#[derive(Default)]
+struct PressedSurface(Vec<(WindowId, ElementId, MouseButton)>);
+
+impl Global for PressedSurface {}
+
+/// Whether `surface` owns `button` in `window`.
+fn surface_pressed(cx: &App, window: WindowId, surface: &ElementId, button: MouseButton) -> bool {
+    cx.try_global::<PressedSurface>().is_some_and(|pressed| {
+        pressed
+            .0
+            .iter()
+            .any(|(w, s, b)| *w == window && s == surface && *b == button)
+    })
+}
+
+/// Record that `surface` owns `button` in `window`.
+fn press_surface(cx: &mut App, window: WindowId, surface: ElementId, button: MouseButton) {
+    let pressed = cx.default_global::<PressedSurface>();
+    if !pressed
+        .0
+        .iter()
+        .any(|(w, s, b)| *w == window && s == &surface && *b == button)
+    {
+        pressed.0.push((window, surface, button));
+    }
+}
+
+/// Forget that `surface` owned `button` in `window`.
+fn release_surface(cx: &mut App, window: WindowId, surface: &ElementId, button: MouseButton) {
+    cx.default_global::<PressedSurface>()
+        .0
+        .retain(|(w, s, b)| !(*w == window && s == surface && *b == button));
+}
+
 /// Subscribe GPUI's pointer handlers on `element`, translating each to a [`SurfaceInput`] through
 /// `surface`. `id` is the element's, which the surface's own drag carries so each surface forwards
 /// only its own.
@@ -211,17 +299,21 @@ where
     E: InteractiveElement + Element<PrepaintState = Option<Hitbox>> + 'static,
 {
     let down = surface.clone();
-    let element = element.on_any_mouse_down(move |event, window, _cx| {
+    let pressed = id.clone();
+    let element = element.on_any_mouse_down(move |event, window, cx| {
         let Some(bounds) = down.bounds.get() else {
             return;
         };
         let button = button(event.button);
+        press_surface(cx, window.window_handle().window_id(), pressed.clone(), event.button);
         let modifiers = modifiers(event.modifiers);
         let position = local(window.scale_factor(), bounds.origin, event.position);
+        let click_count = event.click_count;
         deliver(&down, window, position, |position| {
             SurfaceEvent::PointerDown {
                 position,
                 button,
+                click_count,
                 modifiers,
             }
         });
@@ -296,19 +388,56 @@ where
         },
     );
 
+    // Hover has both edges, including one caused by a layout change under a stationary pointer, which
+    // is what a producer needs to clear a highlight without waiting for a move it may never get.
+    let hovered = surface.clone();
+    let element = element.on_hover(move |is_hovered: &bool, window, _cx| {
+        let modifiers = modifiers(window.modifiers());
+        let event = if *is_hovered {
+            SurfaceEvent::PointerEnter { modifiers }
+        } else {
+            SurfaceEvent::PointerLeave { modifiers }
+        };
+        deliver_event(&hovered, window, event);
+    });
+
+    // The wheel: the engine routes it to the surface's element like any other pointer event, so its
+    // position is surface-local and its delta is all the gateway has to translate.
+    let scrolled = surface.clone();
+    let element = element.on_scroll_wheel(move |event, window, _cx| {
+        let Some(bounds) = scrolled.bounds.get() else {
+            return;
+        };
+        let scale = window.scale_factor();
+        let position = local(scale, bounds.origin, event.position);
+        let delta = scroll(event.delta, scale);
+        let modifiers = modifiers(event.modifiers);
+        deliver(&scrolled, window, position, |position| SurfaceEvent::Scroll {
+            position,
+            delta,
+            modifiers,
+        });
+    });
+
     // The up over the surface: the ordinary case, and a drag released where it began. Under capture
     // phase and hovered, so it is the one that reports a plain click.
     let up = surface.clone();
-    let element = element.capture_any_mouse_up(move |event, window, _cx| {
+    let own = id.clone();
+    let element = element.capture_any_mouse_up(move |event, window, cx| {
+        if surface_pressed(cx, window.window_handle().window_id(), &own, event.button) {
+            release_surface(cx, window.window_handle().window_id(), &own, event.button);
+        }
         let Some(bounds) = up.bounds.get() else {
             return;
         };
         let button = button(event.button);
+        let click_count = event.click_count;
         let modifiers = modifiers(event.modifiers);
         let position = local(window.scale_factor(), bounds.origin, event.position);
         deliver(&up, window, position, |position| SurfaceEvent::PointerUp {
             position,
             button,
+            click_count,
             modifiers,
         });
     });
@@ -320,19 +449,26 @@ where
         let released = surface.clone();
         let own = id.clone();
         element = element.on_mouse_up_out(released_button, move |event, window, cx| {
-            if drag(cx).is_none_or(|drag| drag.origin != own) {
+            let carried = drag(cx).is_some_and(|drag| drag.origin == own);
+            let owned = surface_pressed(cx, window.window_handle().window_id(), &own, event.button);
+            if !carried && !owned {
                 return;
+            }
+            if owned {
+                release_surface(cx, window.window_handle().window_id(), &own, event.button);
             }
             let Some(bounds) = released.bounds.get() else {
                 return;
             };
             let button = button(event.button);
+            let click_count = event.click_count;
             let modifiers = modifiers(event.modifiers);
             let position = local(window.scale_factor(), bounds.origin, event.position);
             deliver(&released, window, position, |position| {
                 SurfaceEvent::PointerUp {
                     position,
                     button,
+                    click_count,
                     modifiers,
                 }
             });
@@ -349,11 +485,13 @@ fn deliver(
     position: SurfacePoint,
     event: impl FnOnce(SurfacePoint) -> SurfaceEvent,
 ) {
+    deliver_event(surface, window, event(position));
+}
+
+/// Hand the producer an event that already carries everything it needs.
+fn deliver_event(surface: &Rc<Surface>, window: &mut Window, event: SurfaceEvent) {
     let scale = window.scale_factor();
-    (surface.handler)(SurfaceInput {
-        event: event(position),
-        scale,
-    });
+    (surface.handler)(SurfaceInput { event, scale });
     window.refresh();
 }
 
@@ -373,6 +511,20 @@ fn button(button: MouseButton) -> SurfaceButton {
         MouseButton::Right => SurfaceButton::Right,
         MouseButton::Middle => SurfaceButton::Middle,
         MouseButton::Navigate(_) => SurfaceButton::Other,
+    }
+}
+
+/// GPUI's scroll delta, as a producer-facing one.
+fn scroll(delta: ScrollDelta, scale: f32) -> SurfaceScroll {
+    match delta {
+        ScrollDelta::Pixels(delta) => SurfaceScroll::Pixels {
+            x: delta.x.as_f32() * scale,
+            y: delta.y.as_f32() * scale,
+        },
+        ScrollDelta::Lines(delta) => SurfaceScroll::Lines {
+            x: delta.x,
+            y: delta.y,
+        },
     }
 }
 
