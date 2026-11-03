@@ -121,7 +121,8 @@ pub use adapter::{Adapter, Unavailable};
 pub use guest::{Guest, GuestFrame, GuestOptions};
 #[cfg(feature = "gpui")]
 pub use input::{
-    SurfaceButton, SurfaceEvent, SurfaceInput, SurfaceModifiers, SurfacePoint, surface_input,
+    SurfaceButton, SurfaceEvent, SurfaceInput, SurfaceModifiers, SurfacePoint, SurfaceScroll,
+    surface_input,
 };
 #[cfg(target_os = "linux")]
 pub use linux::{

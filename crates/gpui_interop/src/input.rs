@@ -19,7 +19,9 @@
 //!   window's device-pixel ratio). A producer that wants logical surface-local coordinates divides the
 //!   position by `scale`.
 //! - **Vocabulary.** [`SurfaceEvent`] and its parts are the crate's, mapped from GPUI's, so a producer
-//!   never names `MouseMoveEvent`.
+//!   never names `MouseMoveEvent`. A precise scroll delta is converted to physical pixels like every
+//!   other distance; a line delta is passed through in lines, because a line has no pixel size until
+//!   the consumer chooses one.
 //!
 //! What it deliberately does **not** do:
 //!
@@ -73,7 +75,7 @@ use std::rc::Rc;
 use gpui::{
     App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, GlobalElementId,
     Hitbox, InteractiveElement, IntoElement, LayoutId, Modifiers, MouseButton, Pixels, Point,
-    Stateful, StatefulInteractiveElement, Window,
+    ScrollDelta, Stateful, StatefulInteractiveElement, Window,
 };
 
 /// The id a surface is named with when its element carried none.
@@ -114,10 +116,19 @@ pub struct SurfaceModifiers {
     pub platform: bool,
 }
 
+/// A scroll delta, in the units the platform reported it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SurfaceScroll {
+    /// A precise delta, in physical pixels from the surface's top-left corner.
+    Pixels { x: f32, y: f32 },
+    /// An inexact delta in lines, as the platform reported it.
+    Lines { x: f32, y: f32 },
+}
+
 /// A producer-facing input event over a surface, in surface-local physical pixels.
 ///
-/// The event's own position is the pointer's; only a [`Scroll`](Self::Scroll) event, or a gesture a
-/// producer reads from absolute positions, needs it.
+/// The event's own position is the pointer's; a [`Scroll`](Self::Scroll) event carries the wheel's
+/// delta, while a gesture a producer reads from absolute positions needs the position alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SurfaceEvent {
     /// A pointer button went down over the surface.
@@ -138,6 +149,13 @@ pub enum SurfaceEvent {
     PointerUp {
         position: SurfacePoint,
         button: SurfaceButton,
+        modifiers: SurfaceModifiers,
+    },
+    /// The wheel scrolled, or a touchpad reported a scroll gesture.
+    Scroll {
+        /// Where the pointer was, so a zoom can stay anchored under it.
+        position: SurfacePoint,
+        delta: SurfaceScroll,
         modifiers: SurfaceModifiers,
     },
 }
@@ -296,6 +314,24 @@ where
         },
     );
 
+    // The wheel: the engine routes it to the surface's element like any other pointer event, so its
+    // position is surface-local and its delta is all the gateway has to translate.
+    let scrolled = surface.clone();
+    let element = element.on_scroll_wheel(move |event, window, _cx| {
+        let Some(bounds) = scrolled.bounds.get() else {
+            return;
+        };
+        let scale = window.scale_factor();
+        let position = local(scale, bounds.origin, event.position);
+        let delta = scroll(event.delta, scale);
+        let modifiers = modifiers(event.modifiers);
+        deliver(&scrolled, window, position, |position| SurfaceEvent::Scroll {
+            position,
+            delta,
+            modifiers,
+        });
+    });
+
     // The up over the surface: the ordinary case, and a drag released where it began. Under capture
     // phase and hovered, so it is the one that reports a plain click.
     let up = surface.clone();
@@ -373,6 +409,20 @@ fn button(button: MouseButton) -> SurfaceButton {
         MouseButton::Right => SurfaceButton::Right,
         MouseButton::Middle => SurfaceButton::Middle,
         MouseButton::Navigate(_) => SurfaceButton::Other,
+    }
+}
+
+/// GPUI's scroll delta, as a producer-facing one.
+fn scroll(delta: ScrollDelta, scale: f32) -> SurfaceScroll {
+    match delta {
+        ScrollDelta::Pixels(delta) => SurfaceScroll::Pixels {
+            x: delta.x.as_f32() * scale,
+            y: delta.y.as_f32() * scale,
+        },
+        ScrollDelta::Lines(delta) => SurfaceScroll::Lines {
+            x: delta.x,
+            y: delta.y,
+        },
     }
 }
 

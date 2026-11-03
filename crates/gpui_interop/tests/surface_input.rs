@@ -18,10 +18,13 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext,
-    VisualTestContext, Window, div, point, prelude::*, px,
+    AnyWindowHandle, Context, IntoElement, Modifiers, MouseButton, Render, ScrollDelta,
+    ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, Window, div, point, prelude::*,
+    px,
 };
-use gpui_interop::{SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, surface_input};
+use gpui_interop::{
+    SurfaceButton, SurfaceEvent, SurfaceInput, SurfacePoint, SurfaceScroll, surface_input,
+};
 
 /// The surface's edge, and the padding that insets it in the window.
 const EDGE: f32 = 50.0;
@@ -560,6 +563,50 @@ impl Render for Behind {
                 events.borrow_mut().push(input.event)
             }))
     }
+}
+
+#[gpui::test]
+fn a_scroll_is_surface_local_and_physical(cx: &mut TestAppContext) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recording = seen.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Recording { seen: recording }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let scale = cx.update(|window, _| window.scale_factor());
+
+    let at = point(px(35.), px(35.));
+    let delta = point(px(4.), px(-6.));
+    cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(delta),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+
+    let seen = seen.borrow();
+    let [SurfaceInput {
+        event:
+            SurfaceEvent::Scroll {
+                position,
+                delta: SurfaceScroll::Pixels { x, y },
+                ..
+            },
+        scale: event_scale,
+    }] = seen.as_slice()
+    else {
+        panic!("expected exactly one pixel scroll: {seen:?}");
+    };
+
+    assert_eq!(*event_scale, scale, "the scroll carries the window's scale");
+    assert!(
+        (position.x - (35.0 - PAD) * scale).abs() < 0.01
+            && (position.y - (35.0 - PAD) * scale).abs() < 0.01,
+        "the scroll position is surface-local physical pixels: {position:?}",
+    );
+    assert!(
+        (x - 4.0 * scale).abs() < 0.01 && (y.abs() - 6.0 * scale).abs() < 0.01,
+        "the pixel delta is converted to physical pixels: ({x}, {y})",
+    );
 }
 
 #[gpui::test]
