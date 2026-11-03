@@ -653,15 +653,15 @@ During development this workspace takes the core from the sibling checkout — `
 `gpui_wgpu` and `gpui_windows` are path dependencies on `../bite-gpui/crates/…` — so a fix in the
 renderer reaches this stack without a release. On release each path becomes the published package.
 
-The last published release is `1.25.202`. A consumer aliases the published packages back to their
+The last published release is `1.25.203`. A consumer aliases the published packages back to their
 standard crate names so imports like `use gpui::...` compile unchanged:
 
 ```toml
 [workspace.dependencies]
-gpui         = { package = "bite-gpui",       version = "1.25.202", default-features = false }
-gpui_engine  = { package = "bite-gp-engine",  version = "1.25.202" }
-gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.25.202" }
-gpui_windows = { package = "bite-gp-windows", version = "1.25.202" }
+gpui         = { package = "bite-gpui",       version = "1.25.203", default-features = false }
+gpui_engine  = { package = "bite-gp-engine",  version = "1.25.203" }
+gpui_wgpu    = { package = "bite-gp-wgpu",    version = "1.25.203" }
+gpui_windows = { package = "bite-gp-windows", version = "1.25.203" }
 ```
 
 The guest and same-device wgpu paths need the seams published since `1.23.305`: a

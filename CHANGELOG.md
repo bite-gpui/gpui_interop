@@ -5,6 +5,31 @@ All notable changes to `gpui_interop` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 version may break the API; a patch does not.
 
+## [0.2.1] - 2026-11-03
+
+The input-gateway fixes reported downstream. No breaking API changes.
+
+### Added
+
+- `SurfaceEvent::Scroll` and `SurfaceScroll`: the gateway carries the wheel now, with a precise
+  delta converted to physical pixels and a line delta passed through. A producer no longer needs
+  its own `on_scroll_wheel`.
+- `SurfaceEvent::PointerEnter` and `PointerLeave`, taken from the engine hover edges.
+- The platform click count on `PointerDown` and `PointerUp`.
+
+### Fixed
+
+- `PointerUp` is reported when a right or middle press, or a left press that never crossed the
+  drag threshold, is released outside the surface.
+- Press ownership is kept per window, surface and button, so releasing one button in a chord does
+  not forget another.
+
+### Changed
+
+- The Linux examples handle scroll through the gateway; the package job checks examples with the
+  `example` feature, which no test job built before.
+- Development and CI track `bite-gpui` 1.25.203.
+
 ## [0.2.0] - 2026-10-22
 
 A `bite-gpui` 1.25 upgrade. The public `wgpu` types move to 30, so this is a
@@ -119,6 +144,7 @@ First public release.
 - Examples: `interop_linux`, `interop_cube`, `interop_cube_drag`, plus the
   `interop_wgpu` and `interop_bevy` producer demos.
 
+[0.2.1]: https://github.com/bite-gpui/gpui_interop/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/bite-gpui/gpui_interop/compare/v0.1.1...v0.1.2
