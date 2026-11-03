@@ -373,6 +373,64 @@ fn the_up_of_a_drag_that_left_the_surface_arrives(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn the_up_of_a_right_press_arrives_outside_the_surface(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A right press never founds a drag, so the engine has no gesture to release; without press
+    // ownership the producer would never see the up.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_move(beyond, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Right, Modifiers::none());
+
+    let events = events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerUp {
+                button: SurfaceButton::Right,
+                ..
+            }
+        )),
+        "the right press is released off the surface: {events:?}",
+    );
+}
+
+#[gpui::test]
+fn the_up_of_a_sub_threshold_left_press_arrives_outside_the_surface(cx: &mut TestAppContext) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let window = AnyWindowHandle::from(cx.add_window(move |_, _| Bounded { events: recorded }));
+    let mut cx = VisualTestContext::from_window(window, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A left press that never moves past the 2px drag threshold has no engine drag either.
+    let inside = point(px(100.), px(100.));
+    let beyond = point(px(300.), px(250.));
+    cx.simulate_mouse_move(inside, None::<MouseButton>, Modifiers::none());
+    cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::none());
+
+    let events = events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            SurfaceEvent::PointerUp {
+                button: SurfaceButton::Left,
+                ..
+            }
+        )),
+        "the sub-threshold left press is released off the surface: {events:?}",
+    );
+}
+
 /// Two surfaces side by side, each named, so a drag started on one says which.
 struct Pair {
     left: Rc<RefCell<Vec<SurfaceEvent>>>,

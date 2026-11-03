@@ -39,7 +39,9 @@
 //! once a pointer-down is followed by a move past the engine's threshold, held on the `App` rather
 //! than in any element so it survives the redraws it causes, and delivered to every
 //! [`InteractiveElement::on_drag_move`] whose type it matches. The gateway uses it rather than
-//! capturing the pointer itself, and so keeps no gesture state of its own across a frame:
+//! capturing the pointer itself; the only gesture state it keeps across a frame is which surface
+//! owns the current press, so that an up outside can be reported even when the engine never turned
+//! the press into a drag (a right or middle press, or a move short of the threshold):
 //!
 //! - It registers an `on_drag` on the wrapped element whose value is the surface's own, with an empty
 //!   preview — the producer paints the surface, so there is nothing to draw under the cursor.
@@ -64,16 +66,17 @@
 //!
 //! The gateway reports what GPUI routes to the surface's bounds: a move *over* the surface arrives
 //! even while another element holds the gesture, with `pressed` set. A producer that wants only its
-//! own gesture therefore tracks whether it saw the [`SurfaceEvent::PointerDown`] — the gateway does
-//! not, because it holds no state across a frame. The one asymmetry is the up of a gesture that began
-//! elsewhere and ended over the surface, which arrives without a matching down.
+//! own gesture therefore tracks whether it saw the [`SurfaceEvent::PointerDown`]. The gateway keeps
+//! only enough state to pair the *up*: it records which surface owned the press, so a release outside
+//! the surface still reaches that surface when no drag was founded. The one asymmetry is the up of a
+//! gesture that began elsewhere and ended over the surface, which arrives without a matching down.
 
 use std::cell::Cell;
 use std::panic::Location;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, GlobalElementId,
+    App, AppContext as _, Bounds, DragMoveEvent, Element, ElementId, Empty, Global, GlobalElementId,
     Hitbox, InteractiveElement, IntoElement, LayoutId, Modifiers, MouseButton, Pixels, Point,
     ScrollDelta, Stateful, StatefulInteractiveElement, Window,
 };
@@ -221,6 +224,22 @@ fn drag(cx: &App) -> Option<&SurfaceDrag> {
     cx.active_drag_value::<SurfaceDrag>()
 }
 
+/// Which surface owns the pointer press currently in flight.
+///
+/// Unlike the drag, a press exists before the engine has decided to found one. Remembering it is
+/// what lets the gateway report the up of a right/middle press, or of a left press that never moved
+/// past the drag threshold, when that up happens outside the surface.
+#[derive(Default)]
+struct PressedSurface(Option<ElementId>);
+
+impl Global for PressedSurface {}
+
+/// The surface that owns the press, if any.
+fn pressed_surface(cx: &App) -> Option<&ElementId> {
+    cx.try_global::<PressedSurface>()
+        .and_then(|pressed| pressed.0.as_ref())
+}
+
 /// Subscribe GPUI's pointer handlers on `element`, translating each to a [`SurfaceInput`] through
 /// `surface`. `id` is the element's, which the surface's own drag carries so each surface forwards
 /// only its own.
@@ -229,10 +248,12 @@ where
     E: InteractiveElement + Element<PrepaintState = Option<Hitbox>> + 'static,
 {
     let down = surface.clone();
-    let element = element.on_any_mouse_down(move |event, window, _cx| {
+    let pressed = id.clone();
+    let element = element.on_any_mouse_down(move |event, window, cx| {
         let Some(bounds) = down.bounds.get() else {
             return;
         };
+        cx.set_global(PressedSurface(Some(pressed.clone())));
         let button = button(event.button);
         let modifiers = modifiers(event.modifiers);
         let position = local(window.scale_factor(), bounds.origin, event.position);
@@ -335,7 +356,11 @@ where
     // The up over the surface: the ordinary case, and a drag released where it began. Under capture
     // phase and hovered, so it is the one that reports a plain click.
     let up = surface.clone();
-    let element = element.capture_any_mouse_up(move |event, window, _cx| {
+    let own = id.clone();
+    let element = element.capture_any_mouse_up(move |event, window, cx| {
+        if pressed_surface(cx) == Some(&own) {
+            cx.set_global(PressedSurface(None));
+        }
         let Some(bounds) = up.bounds.get() else {
             return;
         };
@@ -356,8 +381,13 @@ where
         let released = surface.clone();
         let own = id.clone();
         element = element.on_mouse_up_out(released_button, move |event, window, cx| {
-            if drag(cx).is_none_or(|drag| drag.origin != own) {
+            let carried = drag(cx).is_some_and(|drag| drag.origin == own);
+            let owned = pressed_surface(cx) == Some(&own);
+            if !carried && !owned {
                 return;
+            }
+            if owned {
+                cx.set_global(PressedSurface(None));
             }
             let Some(bounds) = released.bounds.get() else {
                 return;
